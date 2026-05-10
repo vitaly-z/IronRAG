@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.4.4 — 2026-05-10
+
+### Install: detect & explain sqlx migration checksum drift
+
+- `install.sh` now polls the backend health endpoint after `docker
+  compose up -d` and watches `ironrag-startup-1` for the canonical
+  sqlx error `migration N was previously applied but has been
+  modified`. If the recorded DB checksum diverges from the file
+  bundled in the new release image, the script prints the offending
+  migration version, the exact `sha384sum` and `UPDATE
+  _sqlx_migrations` commands needed to recover, stops the stack, and
+  exits non-zero — the previous behaviour left the operator staring
+  at an indefinite `Container ironrag-startup-1 Waiting`.
+
 ## 0.4.3 — 2026-05-10
 
 ### Embedded picture OCR via the active vision binding

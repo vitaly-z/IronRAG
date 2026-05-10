@@ -8,6 +8,17 @@
 //! `PATCH  /v1/webhooks/subscriptions/{id}`
 //! `DELETE /v1/webhooks/subscriptions/{id}`
 //! `GET    /v1/webhooks/subscriptions/{id}/attempts`
+//!
+//! ## Inbound receiver stub (placeholder — pending v0.5)
+//!
+//! `POST   /v1/webhooks/inbound/{connector_kind}`
+//!
+//! Always returns **501 Not Implemented**.  Connectors that need to push events
+//! into IronRAG must use the external connector middleware until v0.5 ships a
+//! real receiver pipeline.
+//!
+//! ### Valid `connector_kind` values (400 for anything else)
+//! `generic` | `filesystem` | `github` | `s3` | `web`
 
 use axum::{
     Json, Router,
@@ -40,6 +51,8 @@ pub fn router() -> Router<AppState> {
         .route("/webhooks/subscriptions/{id}", patch(update_subscription))
         .route("/webhooks/subscriptions/{id}", delete(delete_subscription))
         .route("/webhooks/subscriptions/{id}/attempts", get(list_delivery_attempts))
+        // Inbound receiver stub — always 501 until v0.5
+        .route("/webhooks/inbound/{connector_kind}", post(receive_inbound_webhook))
 }
 
 // ============================================================================
@@ -394,5 +407,151 @@ fn subscription_row_to_response(
         active: row.active,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    }
+}
+
+// ============================================================================
+// Inbound webhook receiver stub (placeholder — v0.5 feature)
+// ============================================================================
+
+/// Known connector kinds drawn from the `catalog_connector_kind` DB enum.
+/// Any path segment not in this set is rejected with 400 Bad Request.
+const KNOWN_CONNECTOR_KINDS: &[&str] = &["generic", "filesystem", "github", "s3", "web"];
+
+/// Response body returned by the 501 inbound stub.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundWebhookNotImplementedBody {
+    pub error: &'static str,
+    pub connector_kind: String,
+    pub message: &'static str,
+    pub docs: Option<String>,
+}
+
+/// Placeholder inbound webhook receiver.
+///
+/// IronRAG does not yet have a receiver-side ingestion pipeline.  Until v0.5,
+/// connectors that need to push events into IronRAG must use the external
+/// connector middleware.  This endpoint exists so future connectors get an
+/// explicit, documented error path instead of a generic 404.
+///
+/// Authentication is required so callers can distinguish "the endpoint exists
+/// but is not implemented" (501 with a valid token) from "unauthenticated" (401).
+///
+/// ### Valid `connector_kind` path values
+/// `generic` | `filesystem` | `github` | `s3` | `web`
+///
+/// Returns 400 for unrecognised connector kinds, 501 for known ones.
+#[utoipa::path(
+    post,
+    path = "/v1/webhooks/inbound/{connector_kind}",
+    tag = "webhooks",
+    operation_id = "receiveInboundWebhook",
+    params(("connector_kind" = String, Path, description = "Connector kind (generic | filesystem | github | s3 | web)")),
+    responses(
+        (status = 400, description = "Unrecognised connector_kind"),
+        (status = 401, description = "Caller is not authenticated"),
+        (status = 501, description = "Inbound webhook receiver not yet implemented", body = InboundWebhookNotImplementedBody),
+    ),
+)]
+pub async fn receive_inbound_webhook(
+    _auth: AuthContext,
+    Path(connector_kind): Path<String>,
+) -> Result<(StatusCode, Json<InboundWebhookNotImplementedBody>), ApiError> {
+    if !KNOWN_CONNECTOR_KINDS.contains(&connector_kind.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "unknown connector_kind '{connector_kind}'; valid values: {}",
+            KNOWN_CONNECTOR_KINDS.join(", ")
+        )));
+    }
+    Ok((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(InboundWebhookNotImplementedBody {
+            error: "inbound_webhook_not_implemented",
+            connector_kind,
+            message: "IronRAG inbound webhook receivers are pending \
+                      — push events through the external connector middleware until v0.5.",
+            docs: None,
+        }),
+    ))
+}
+
+// ============================================================================
+// Unit tests for the inbound stub (no database required)
+// ============================================================================
+
+#[cfg(test)]
+mod inbound_stub_tests {
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    /// Minimal stateless shadow router mirroring the inbound path.
+    ///
+    /// The real `webhook::router()` requires `AppState` (Postgres pool) which
+    /// has no `Default` impl, so unit tests cannot construct it.  Instead we
+    /// mount a cheap closure on the same path to verify route resolution.
+    ///
+    /// The 400 / 501 response shapes are verified in the integration test at
+    /// `tests/webhook_inbound_stub.rs` which provisions a real database.
+    fn shadow_app() -> Router {
+        Router::new().route(
+            "/webhooks/inbound/{connector_kind}",
+            axum::routing::post(|| async { StatusCode::IM_A_TEAPOT }),
+        )
+    }
+
+    #[tokio::test]
+    async fn inbound_route_resolves_for_known_kind() {
+        let resp = shadow_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/inbound/web")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND, "/webhooks/inbound/web must not be 404");
+    }
+
+    #[tokio::test]
+    async fn inbound_route_resolves_for_unknown_kind() {
+        // The path is a wildcard segment so even unknown kinds match the route —
+        // the 400 rejection happens inside the handler, not in the router.
+        let resp = shadow_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/inbound/totally_unknown_xyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "/webhooks/inbound/totally_unknown_xyz must not be 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_inbound_path_returns_404() {
+        let resp = shadow_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/outbound/web")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "/webhooks/outbound/web must be 404");
     }
 }

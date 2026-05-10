@@ -21,7 +21,6 @@
 use serde_json::{Value, json};
 
 use crate::{
-    domains::agent_runtime::RuntimeSurfaceKind,
     domains::query::{DEFAULT_TOP_K, MAX_TOP_K, QueryTurnKind, resolve_top_k},
     interfaces::http::{authorization::POLICY_QUERY_RUN, router_support::ApiError},
     services::{
@@ -166,7 +165,7 @@ async fn grounded_answer(context: ToolCallContext<'_>, arguments: &Value) -> Mcp
             ExecuteConversationTurnCommand {
                 conversation_id: conversation.id,
                 author_principal_id: Some(context.auth.principal_id),
-                surface_kind: RuntimeSurfaceKind::Mcp,
+                surface_kind: context.surface_kind,
                 content_text: parsed.query.clone(),
                 external_prior_turns,
                 top_k: resolve_grounded_answer_top_k(parsed.top_k),

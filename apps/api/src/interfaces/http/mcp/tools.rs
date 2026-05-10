@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
+    domains::agent_runtime::RuntimeSurfaceKind,
     interfaces::http::{
         auth::AuthContext,
         authorization::{
@@ -30,6 +31,7 @@ pub(crate) struct ToolCallContext<'a> {
     pub auth: &'a AuthContext,
     pub state: &'a AppState,
     pub request_id: &'a str,
+    pub surface_kind: RuntimeSurfaceKind,
 }
 
 pub(crate) fn visible_tool_names(auth: &AuthContext, surface: McpToolSurface) -> Vec<String> {
@@ -152,7 +154,7 @@ pub(super) async fn handle_tools_call(
         );
     }
 
-    let context = ToolCallContext { auth, state, request_id };
+    let context = ToolCallContext { auth, state, request_id, surface_kind: RuntimeSurfaceKind::Mcp };
     let result = if let Some(result) =
         catalog::call_tool(parsed.name.as_str(), context, &parsed.arguments).await
     {

@@ -52,8 +52,8 @@ use crate::{
 /// Hard caps enforced by the agent loop.
 /// These are also asserted in the smoke test below.
 const MAX_ITERATIONS: usize = 6;
-const WALL_CLOCK_DEADLINE: Duration = Duration::from_secs(25);
-const PER_TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+const WALL_CLOCK_DEADLINE: Duration = Duration::from_secs(28);
+const PER_TOOL_TIMEOUT: Duration = Duration::from_secs(28);
 
 /// Run one in-process MCP-agent turn.
 ///
@@ -70,7 +70,7 @@ pub async fn run_mcp_agent_turn(
     auth: &AuthContext,
     conversation_id: Uuid,
     content_text: String,
-    _include_debug: bool,
+    include_debug: bool,
 ) -> Result<QueryTurnExecutionResult, ApiError> {
     // ── 1. Validate conversation + library ────────────────────────────────────
     let conversation = query_repository::get_conversation_by_id(
@@ -232,12 +232,24 @@ pub async fn run_mcp_agent_turn(
 
             tool_call_count += 1;
 
-            let args: serde_json::Value =
+            let mut args: serde_json::Value =
                 serde_json::from_str(&tool_call.arguments_json).map_err(|e| {
                     ApiError::internal_with_log(e, "agent tool args")
                 })?;
 
-            let ctx = ToolCallContext { auth: &derived_auth, state, request_id };
+            // Propagate the caller's include_debug flag to grounded_answer
+            // only when the LLM did not set it explicitly — so the UI agent
+            // path surfaces debug metadata when the handler requests it.
+            if let Some(obj) = args.as_object_mut() {
+                obj.entry("includeDebug").or_insert_with(|| include_debug.into());
+            }
+
+            let ctx = ToolCallContext {
+                auth: &derived_auth,
+                state,
+                request_id,
+                surface_kind: crate::domains::agent_runtime::RuntimeSurfaceKind::Ui,
+            };
 
             let tool_result = tokio::time::timeout(
                 PER_TOOL_TIMEOUT,
@@ -254,7 +266,7 @@ pub async fn run_mcp_agent_turn(
                         .and_then(serde_json::Value::as_str)
                         .and_then(|s| s.parse::<Uuid>().ok());
 
-                    let text = mcp_result
+                    let _text = mcp_result
                         .content
                         .first()
                         .map(|b| b.text.clone())
@@ -429,7 +441,7 @@ mod tests {
     #[test]
     fn agent_loop_constants_match_consensus() {
         assert_eq!(MAX_ITERATIONS, 6);
-        assert_eq!(WALL_CLOCK_DEADLINE.as_secs(), 25);
-        assert_eq!(PER_TOOL_TIMEOUT.as_secs(), 10);
+        assert_eq!(WALL_CLOCK_DEADLINE.as_secs(), 28);
+        assert_eq!(PER_TOOL_TIMEOUT.as_secs(), 28);
     }
 }

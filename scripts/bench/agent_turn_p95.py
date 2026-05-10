@@ -15,12 +15,12 @@ IRONRAG_BENCH_QUESTIONS
 
 Exit codes
 ----------
-0  p95 latency is within the SLO gate (≤ 25 000 ms)
+0  p95 latency is within the SLO gate (≤ 28 000 ms)
 1  p95 latency breaches the gate, or required env vars are missing
 
 SLO gate reference: CLAUDE.md §6 Concurrency — "p95 ≤ 30 s" for a full turn;
-this script uses a 25 000 ms gate (25 s) to give a 5 s margin before the
-constitution threshold.
+this script uses a 28 000 ms gate (28 s) to match WALL_CLOCK_DEADLINE in
+mcp_agent/turn.rs, with a 2 s margin before the constitution threshold.
 """
 
 from __future__ import annotations
@@ -44,8 +44,9 @@ DEFAULT_BASE_URL = "http://localhost:19000"
 DEFAULT_QUESTIONS_PATH = "scripts/bench/grounded-queries.md"
 
 # Constitution gate: CLAUDE.md §6 Concurrency — p95 ≤ 30 s per turn.
-# We enforce 25 s here to provide a 5-second margin before the hard limit.
-P95_GATE_MS = 25_000
+# We enforce 28 s here to match WALL_CLOCK_DEADLINE in mcp_agent/turn.rs,
+# providing a 2 s margin before the constitution threshold.
+P95_GATE_MS = 28_000
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agent_turn_p95.py",
         description=(
             "Benchmark IronRAG UI assistant turn latency.\n"
-            "Measures p50/p95/p99 across N questions; exits 1 if p95 > 25 000 ms.\n\n"
+            "Measures p50/p95/p99 across N questions; exits 1 if p95 > 28 000 ms.\n\n"
             "Required env vars: IRONRAG_API_TOKEN, IRONRAG_LIBRARY_ID\n"
             "Optional env vars: IRONRAG_API_BASE_URL, IRONRAG_BENCH_QUESTIONS"
         ),

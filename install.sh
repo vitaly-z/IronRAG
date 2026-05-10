@@ -199,6 +199,83 @@ sync_frontend_origin_to_port "${INSTALL_DIR}/.env" "$published_port"
   docker compose up -d
 )
 
+# Watch the startup container for the canonical "migration N was
+# previously applied but has been modified" failure. sqlx refuses to
+# start until every applied migration's checksum matches the file
+# baked into the new image — older deployments often hit this when
+# they pull a release that contains touched migrations. Without this
+# guard, install.sh just leaves `ironrag-startup-1 Waiting` in
+# Restarting forever and the operator has no idea what went wrong.
+detect_migration_checksum_drift() {
+  local install_dir="$1"
+  local deadline=$(( $(date +%s) + 90 ))
+  local backend_id startup_id
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${published_port}/v1/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    backend_id="$(cd "$install_dir" && docker compose ps -q backend 2>/dev/null || true)"
+    startup_id="$(cd "$install_dir" && docker compose ps -q startup 2>/dev/null || true)"
+    if [ -n "$startup_id" ]; then
+      local startup_logs
+      startup_logs="$(docker logs "$startup_id" 2>&1 | tail -n 200)"
+      local drift_line
+      drift_line="$(printf '%s\n' "$startup_logs" | grep -m 1 -E 'migration [0-9]+ was previously applied but has been modified' || true)"
+      if [ -n "$drift_line" ]; then
+        local version
+        version="$(printf '%s\n' "$drift_line" | grep -oE '[0-9]+' | head -n 1)"
+        cat >&2 <<DRIFT_ERR
+ERROR: ironrag-startup-1 keeps restarting because the bundled
+       schema for migration ${version} doesn't match the one applied
+       to this database. sqlx refuses to start until the recorded
+       checksum is updated to the new file.
+       This happens when an existing deployment pulls a release that
+       touched a previously-applied migration.
+
+       Resolve in two steps:
+
+       1. Compute the new checksum for migration ${version} from the
+          running backend image:
+
+            docker compose -f ${install_dir}/docker-compose.yml run --rm \\
+              --entrypoint sha384sum backend \\
+              /app/migrations/000${version}_*.sql
+
+       2. Update the row in _sqlx_migrations:
+
+            docker compose -f ${install_dir}/docker-compose.yml exec \\
+              postgres psql -U postgres -d ironrag -c \\
+              "UPDATE _sqlx_migrations SET checksum = decode('<NEW_HEX>','hex') WHERE version = ${version};"
+
+       Then restart the stack:
+
+            docker compose -f ${install_dir}/docker-compose.yml restart \\
+              startup backend worker
+
+       Stack is stopped now to avoid a silent restart loop.
+DRIFT_ERR
+        (cd "$install_dir" && docker compose stop startup backend worker frontend >/dev/null 2>&1 || true)
+        return 1
+      fi
+    fi
+    if [ -n "$backend_id" ]; then
+      local backend_state
+      backend_state="$(docker inspect "$backend_id" -f '{{.State.Status}}' 2>/dev/null || echo unknown)"
+      if [ "$backend_state" = "running" ]; then
+        # Backend is up but health probe still says not-ok; give it
+        # a couple more cycles before bailing.
+        :
+      fi
+    fi
+    sleep 3
+  done
+  return 0
+}
+
+if ! detect_migration_checksum_drift "$INSTALL_DIR"; then
+  exit 1
+fi
+
 cat <<EOF
 IronRAG ${VERSION} is starting.
 Directory: ${INSTALL_DIR}
