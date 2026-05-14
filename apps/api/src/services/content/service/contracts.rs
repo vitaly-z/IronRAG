@@ -278,6 +278,9 @@ pub struct RevisionGraphCandidateMaterialization {
     /// Number of chunks whose extraction output was reused from the persistent
     /// graph extraction cache. These chunks did not trigger an LLM call.
     pub reused_chunks: usize,
+    /// Cached graph extractions reused from the same semantic extraction version
+    /// but produced with a different prompt hash.
+    pub reused_prompt_hash_mismatches: usize,
     /// Entities carried over from cached graph extraction output.
     pub reused_entities: usize,
     /// Relations carried over from cached graph extraction output.

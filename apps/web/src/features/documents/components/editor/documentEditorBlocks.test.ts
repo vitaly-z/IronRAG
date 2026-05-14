@@ -173,6 +173,94 @@ describe("documentEditorBlocks", () => {
     ]);
   });
 
+  it("removes embedded-image extraction scaffolding from non-image document views", () => {
+    const markdown = serializeEditorBlocks(
+      buildEditorBlocks(
+        [
+          {
+            segment: {
+              ordinal: 0,
+              blockKind: "heading",
+              headingTrail: ["Schema"],
+            },
+            text: "## Schema",
+          },
+          {
+            segment: {
+              ordinal: 1,
+              blockKind: "paragraph",
+            },
+            text: "<!-- image -->",
+          },
+          {
+            segment: {
+              ordinal: 2,
+              blockKind: "quote_block",
+            },
+            text: "> Image OCR: garbled mixed OCR text",
+          },
+          {
+            segment: {
+              ordinal: 3,
+              blockKind: "paragraph",
+            },
+            text: "--- Embedded image 1 (775x350) ---\nraw OCR fallback",
+          },
+          {
+            segment: {
+              ordinal: 4,
+              blockKind: "paragraph",
+            },
+            text: "Main document text.",
+          },
+        ],
+        "application/pdf",
+      ),
+    );
+
+    expect(markdown).toBe("## Schema\n\nMain document text.");
+  });
+
+  it("keeps OCR text for raster-image source documents", () => {
+    const markdown = serializeEditorBlocks(
+      buildEditorBlocks(
+        [
+          {
+            segment: {
+              ordinal: 0,
+              blockKind: "quote_block",
+            },
+            text: "> Image OCR: readable text from the image",
+          },
+        ],
+        "image/png",
+      ),
+    );
+
+    expect(markdown).toBe("> Image OCR: readable text from the image");
+  });
+
+  it("collapses excessive blank lines in prose blocks", () => {
+    const markdown = serializeEditorBlocks(
+      buildEditorBlocks(
+        [
+          {
+            segment: {
+              ordinal: 0,
+              blockKind: "paragraph",
+            },
+            text: "First paragraph\n\n\n\nSecond paragraph\n   \n\nThird paragraph",
+          },
+        ],
+        "pdf",
+      ),
+    );
+
+    expect(markdown).toBe(
+      "First paragraph\n\nSecond paragraph\n\nThird paragraph",
+    );
+  });
+
   it("preserves leading tabs in code-like source formats", () => {
     const blocks = buildEditorBlocks(
       [

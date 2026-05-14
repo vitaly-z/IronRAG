@@ -61,6 +61,8 @@ pub(super) async fn run_ingestion_worker_pool(
     // on an idle queue this loop makes sure the gap still closes on its own.
     let graph_backfill_handle =
         tokio::spawn(run_graph_backfill_loop(state.clone(), shutdown.resubscribe()));
+    let graph_maintenance_handle =
+        tokio::spawn(run_graph_maintenance_loop(state.clone(), shutdown.resubscribe()));
 
     // Canonical out-of-band stale-lease reaper. Unlike the in-tokio
     // recovery loop above, this runs on a dedicated OS thread with its
@@ -120,6 +122,9 @@ pub(super) async fn run_ingestion_worker_pool(
     }
     if let Err(error) = graph_backfill_handle.await {
         error!(?error, "graph backfill loop crashed");
+    }
+    if let Err(error) = graph_maintenance_handle.await {
+        error!(?error, "graph maintenance loop crashed");
     }
 }
 
@@ -314,6 +319,7 @@ async fn reclaim_orphaned_leases_on_startup(state: &Arc<AppState>) {
 /// per-job hook, while still catching up within a few minutes on an idle
 /// queue.
 const GRAPH_BACKFILL_TICK: std::time::Duration = std::time::Duration::from_secs(120);
+const GRAPH_MAINTENANCE_TICK: std::time::Duration = std::time::Duration::from_secs(300);
 
 async fn run_graph_backfill_loop(state: Arc<AppState>, mut shutdown: broadcast::Receiver<()>) {
     info!("starting graph backfill loop");
@@ -324,6 +330,9 @@ async fn run_graph_backfill_loop(state: Arc<AppState>, mut shutdown: broadcast::
                 break;
             }
             _ = time::sleep(GRAPH_BACKFILL_TICK) => {
+                if !ingest_queue_is_idle(&state).await {
+                    continue;
+                }
                 let libraries = match sqlx::query_scalar::<_, Uuid>(
                     "select id from catalog_library",
                 )
@@ -365,6 +374,75 @@ async fn run_graph_backfill_loop(state: Arc<AppState>, mut shutdown: broadcast::
                 }
             }
         }
+    }
+}
+
+async fn run_graph_maintenance_loop(state: Arc<AppState>, mut shutdown: broadcast::Receiver<()>) {
+    info!("starting graph maintenance loop");
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => {
+                info!("stopping graph maintenance loop");
+                break;
+            }
+            _ = time::sleep(GRAPH_MAINTENANCE_TICK) => {
+                if !ingest_queue_is_idle(&state).await {
+                    continue;
+                }
+                let libraries = match sqlx::query_scalar::<_, Uuid>(
+                    "select id from catalog_library",
+                )
+                .fetch_all(&state.persistence.postgres)
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        warn!(?error, "graph maintenance loop failed to list libraries");
+                        continue;
+                    }
+                };
+                for library_id in libraries {
+                    if crate::services::graph::maintenance::try_acquire_graph_maintenance_slot(library_id) {
+                        run_graph_maintenance_pass(&state, library_id).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn ingest_queue_is_idle(state: &AppState) -> bool {
+    if !state.worker_runtime.is_idle().await {
+        return false;
+    }
+
+    match sqlx::query_scalar::<_, i64>(
+        "select count(*)::bigint from ingest_job where queue_state in ('queued', 'leased')",
+    )
+    .fetch_one(&state.persistence.heartbeat_postgres)
+    .await
+    {
+        Ok(in_flight_jobs) => in_flight_jobs == 0,
+        Err(error) => {
+            warn!(?error, "failed to inspect ingest queue before idle graph tick");
+            false
+        }
+    }
+}
+
+async fn run_graph_maintenance_pass(state: &AppState, library_id: Uuid) {
+    if let Err(error) =
+        crate::services::graph::community_detection::detect_after_ingestion(state, library_id).await
+    {
+        warn!(%library_id, ?error, "community detection maintenance failed");
+        return;
+    }
+
+    if let Err(error) =
+        crate::services::graph::community_detection::generate_community_summaries(state, library_id)
+            .await
+    {
+        warn!(%library_id, ?error, "community summary maintenance failed");
     }
 }
 

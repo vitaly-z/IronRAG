@@ -1203,12 +1203,18 @@ fn preserves_provider_alpha_compatible_base_url_path() {
 }
 
 #[test]
-fn hosted_fixed_base_url_rejects_overrides_and_private_networks() {
+fn hosted_and_local_providers_accept_base_url_overrides() {
     let provider = sample_provider("provider-alpha");
-    let override_error =
+    let normalized =
         normalize_provider_base_url_input(&provider, Some("https://override.example/v1"))
-            .expect_err("hosted fixed providers should reject explicit baseUrl overrides");
-    assert!(matches!(override_error, ApiError::BadRequest(_)));
+            .expect("hosted providers should accept explicit baseUrl overrides");
+    assert_eq!(normalized.as_deref(), Some("https://override.example/v1"));
+
+    let local_provider = sample_provider("provider-beta");
+    let local_normalized =
+        normalize_provider_base_url_input(&local_provider, Some("http://localhost:11434/v1"))
+            .expect("local providers should still accept explicit baseUrl overrides");
+    assert_eq!(local_normalized.as_deref(), Some("http://localhost:11434/v1"));
 
     let mut private_provider = provider.clone();
     private_provider.base_url_policy.allow_override = true;
@@ -1228,7 +1234,18 @@ fn hosted_fixed_base_url_rejects_overrides_and_private_networks() {
 }
 
 #[test]
-fn hosted_fixed_base_url_clears_stale_credential_url_on_update_and_runtime() {
+fn openai_provider_accepts_base_url_override_for_compatible_gateways() {
+    let mut provider = sample_provider("provider-alpha");
+    provider.provider_kind = "openai".to_string();
+
+    let normalized =
+        normalize_provider_base_url_input(&provider, Some("https://openai.bothub.ru/v1"))
+            .expect("openai provider should accept explicit compatible baseUrl override");
+    assert_eq!(normalized.as_deref(), Some("https://openai.bothub.ru/v1"));
+}
+
+#[test]
+fn hosted_base_url_update_clears_empty_override_and_runtime_uses_stored_override() {
     let provider = sample_provider("provider-epsilon");
 
     let created = provider_credential_base_url_for_create(&provider, None)
@@ -1244,8 +1261,8 @@ fn hosted_fixed_base_url_clears_stale_credential_url_on_update_and_runtime() {
     assert_eq!(stored, None);
 
     let runtime = runtime_provider_base_url(&provider, Some("https://stale-host.example/v1"))
-        .expect("runtime should resolve fixed hosted providers from provider catalog policy");
-    assert_eq!(runtime, provider.default_base_url);
+        .expect("runtime should resolve stored credential baseUrl overrides");
+    assert_eq!(runtime.as_deref(), Some("https://stale-host.example/v1"));
 }
 
 #[test]

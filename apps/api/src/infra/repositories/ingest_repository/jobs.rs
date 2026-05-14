@@ -671,6 +671,7 @@ pub async fn recover_stale_canonical_leases(
              set attempt_state = 'failed',
                  failure_class = 'lease_expired',
                  failure_code = 'stale_heartbeat',
+                 failure_message = 'Attempt heartbeat expired before processing finished',
                  finished_at = now(),
                  retryable = true
              where id in (select attempt_id from stale_attempts)
@@ -734,6 +735,7 @@ where
              SET attempt_state = 'canceled',
                  failure_class = 'content_mutation',
                  failure_code = 'canceled_by_request',
+                 failure_message = 'Processing was canceled by request',
                  finished_at = now()
              WHERE job_id IN (SELECT id FROM target_jobs)
                AND attempt_state IN ('leased', 'running')

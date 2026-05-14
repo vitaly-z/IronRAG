@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useNavigate } from "react-router-dom";
 
 import { useApp } from "@/shared/contexts/app-context";
 
@@ -17,6 +18,7 @@ import { useWebIngestController } from "./useWebIngestController";
 
 export function DocumentsPage() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const { activeLibrary, activeWorkspace, locale } = useApp();
   const urlState = useDocumentsPageUrlState();
   const [activeTab, setActiveTab] = useState<DocumentsPageTab>("documents");
@@ -71,6 +73,8 @@ export function DocumentsPage() {
         setMaxDepth={webIngest.setMaxDepth} setMaxPages={webIngest.setMaxPages}
         setSeedUrl={webIngest.setSeedUrl} t={t}
         webRunsCount={webIngest.webRuns.length} webRunsRefreshing={webIngest.webRunsRefreshing}
+        ingestionReady={activeLibrary.ingestionReady}
+        onOpenAiSettings={() => navigate('/admin?tab=ai')}
       />
       <div className="flex-1 flex overflow-hidden">
         {activeTab === "documents" ? (
@@ -102,8 +106,7 @@ export function DocumentsPage() {
           activateListPollGrace={documents.activateListPollGrace}
           clearSelectedDoc={documents.clearSelectedDoc} errorMessage={documents.errorMessage}
           fetchSelectedDetail={documents.fetchSelectedDetail}
-          inspectorFacts={documents.inspectorFacts} inspectorLifecycle={documents.inspectorLifecycle}
-          inspectorSegments={documents.inspectorSegments} loadFirstPage={documents.loadFirstPage}
+          inspectorLifecycle={documents.inspectorLifecycle} loadFirstPage={documents.loadFirstPage}
           locale={locale} selectedDoc={documents.selectedDoc}
           selectionMode={selectionMode} selectDoc={documents.selectDoc} t={t}
           updateSearchParamState={urlState.updateSearchParamState}

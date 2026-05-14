@@ -273,6 +273,15 @@ pub(crate) async fn put_cached_execution_id(
     Ok(())
 }
 
+pub(crate) async fn delete_cached_execution_id(client: &redis::Client, key: &str) -> Result<()> {
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("connect to redis for query result cache delete")?;
+    let _: usize = conn.del(key).await.context("redis DEL query result cache")?;
+    Ok(())
+}
+
 pub(crate) async fn try_acquire_fill_guard(
     client: &redis::Client,
     key: &str,

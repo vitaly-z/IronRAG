@@ -1,7 +1,7 @@
 x-ironrag-runtime-env: &ironrag-runtime-env
   IRONRAG_BIND_ADDR: 0.0.0.0:8080
   IRONRAG_ENVIRONMENT: ${IRONRAG_ENVIRONMENT:-production}
-  IRONRAG_DATABASE_URL: ${IRONRAG_DATABASE_URL:-postgres://${IRONRAG_POSTGRES_USER:-postgres}:${IRONRAG_POSTGRES_PASSWORD:-postgres}@${IRONRAG_POSTGRES_HOST:-postgres}:5432/${IRONRAG_POSTGRES_DB:-ironrag}}
+  IRONRAG_DATABASE_URL: postgres://${IRONRAG_POSTGRES_USER:-postgres}:${IRONRAG_POSTGRES_PASSWORD:-postgres}@${IRONRAG_POSTGRES_HOST:-postgres}:5432/${IRONRAG_POSTGRES_DB:-ironrag}
   IRONRAG_DATABASE_MAX_CONNECTIONS: ${IRONRAG_DATABASE_MAX_CONNECTIONS:-20}
   IRONRAG_REDIS_URL: ${IRONRAG_REDIS_URL:-redis://redis:6379}
   IRONRAG_ARANGODB_URL: ${IRONRAG_ARANGODB_URL:-http://arangodb:8529}
@@ -15,7 +15,7 @@ x-ironrag-runtime-env: &ironrag-runtime-env
   IRONRAG_UI_BOOTSTRAP_ADMIN_PASSWORD: ${IRONRAG_UI_BOOTSTRAP_ADMIN_PASSWORD:-}
   IRONRAG_UI_BOOTSTRAP_ADMIN_API_TOKEN: ${IRONRAG_UI_BOOTSTRAP_ADMIN_API_TOKEN:-}
   IRONRAG_UI_BOOTSTRAP_EXTRACT_GRAPH_PROVIDER_KIND: ${IRONRAG_UI_BOOTSTRAP_EXTRACT_GRAPH_PROVIDER_KIND:-openai}
-  IRONRAG_UI_BOOTSTRAP_EXTRACT_GRAPH_MODEL_NAME: ${IRONRAG_UI_BOOTSTRAP_EXTRACT_GRAPH_MODEL_NAME:-gpt-5.4-nano}
+  IRONRAG_UI_BOOTSTRAP_EXTRACT_GRAPH_MODEL_NAME: ${IRONRAG_UI_BOOTSTRAP_EXTRACT_GRAPH_MODEL_NAME:-gpt-5.4-mini}
   IRONRAG_UI_BOOTSTRAP_EMBED_CHUNK_PROVIDER_KIND: ${IRONRAG_UI_BOOTSTRAP_EMBED_CHUNK_PROVIDER_KIND:-openai}
   IRONRAG_UI_BOOTSTRAP_EMBED_CHUNK_MODEL_NAME: ${IRONRAG_UI_BOOTSTRAP_EMBED_CHUNK_MODEL_NAME:-text-embedding-3-large}
   IRONRAG_UI_BOOTSTRAP_QUERY_ANSWER_PROVIDER_KIND: ${IRONRAG_UI_BOOTSTRAP_QUERY_ANSWER_PROVIDER_KIND:-openai}
@@ -25,9 +25,22 @@ x-ironrag-runtime-env: &ironrag-runtime-env
   IRONRAG_OPENAI_API_KEY: ${IRONRAG_OPENAI_API_KEY:-}
   IRONRAG_DEEPSEEK_API_KEY: ${IRONRAG_DEEPSEEK_API_KEY:-}
   IRONRAG_QWEN_API_KEY: ${IRONRAG_QWEN_API_KEY:-}
+  IRONRAG_OPENROUTER_API_KEY: ${IRONRAG_OPENROUTER_API_KEY:-}
+  IRONRAG_GPTUNNEL_API_KEY: ${IRONRAG_GPTUNNEL_API_KEY:-}
+  IRONRAG_ROUTERAI_API_KEY: ${IRONRAG_ROUTERAI_API_KEY:-}
   IRONRAG_RUNTIME_POLICY_REJECT_TASK_KINDS: ${IRONRAG_RUNTIME_POLICY_REJECT_TASK_KINDS:-}
   IRONRAG_RUNTIME_POLICY_REJECT_TARGET_KINDS: ${IRONRAG_RUNTIME_POLICY_REJECT_TARGET_KINDS:-}
   IRONRAG_UI_DEFAULT_LOCALE: ${IRONRAG_UI_DEFAULT_LOCALE:-ru}
+  TOKIO_WORKER_THREADS: ${TOKIO_WORKER_THREADS:-8}
+  IRONRAG_INGESTION_MAX_PARALLEL_JOBS_GLOBAL: ${IRONRAG_INGESTION_MAX_PARALLEL_JOBS_GLOBAL:-64}
+  IRONRAG_INGESTION_MAX_PARALLEL_JOBS_PER_WORKSPACE: ${IRONRAG_INGESTION_MAX_PARALLEL_JOBS_PER_WORKSPACE:-16}
+  IRONRAG_INGESTION_MAX_PARALLEL_JOBS_PER_LIBRARY: ${IRONRAG_INGESTION_MAX_PARALLEL_JOBS_PER_LIBRARY:-4}
+  IRONRAG_DOCLING_PAGE_BATCH_SIZE: ${IRONRAG_DOCLING_PAGE_BATCH_SIZE:-10}
+  IRONRAG_DOCLING_PAGE_STREAM_WINDOW_PAGES: ${IRONRAG_DOCLING_PAGE_STREAM_WINDOW_PAGES:-40}
+  IRONRAG_DOCLING_MAX_CONCURRENCY: ${IRONRAG_DOCLING_MAX_CONCURRENCY:-1}
+  IRONRAG_INGESTION_HEAVY_PIPELINE_PARALLELISM: ${IRONRAG_INGESTION_HEAVY_PIPELINE_PARALLELISM:-1}
+  IRONRAG_INGESTION_EMBEDDING_PARALLELISM: ${IRONRAG_INGESTION_EMBEDDING_PARALLELISM:-8}
+  IRONRAG_INGESTION_GRAPH_EXTRACT_PARALLELISM_PER_DOC: ${IRONRAG_INGESTION_GRAPH_EXTRACT_PARALLELISM_PER_DOC:-16}
   IRONRAG_STARTUP_AUTHORITY_MODE: compose_one_shot
   IRONRAG_DEPENDENCY_POSTGRES_MODE: bundled
   IRONRAG_DEPENDENCY_REDIS_MODE: bundled
@@ -43,6 +56,14 @@ x-ironrag-runtime-env: &ironrag-runtime-env
   IRONRAG_CONTENT_STORAGE_S3_SECRET_ACCESS_KEY: ${IRONRAG_CONTENT_STORAGE_S3_SECRET_ACCESS_KEY:-ironrag-dev-secret}
   IRONRAG_CONTENT_STORAGE_S3_SESSION_TOKEN: ${IRONRAG_CONTENT_STORAGE_S3_SESSION_TOKEN:-}
   IRONRAG_CONTENT_STORAGE_S3_FORCE_PATH_STYLE: "true"
+  IRONRAG_OTEL_ENABLED: ${IRONRAG_OTEL_ENABLED:-true}
+  OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-service.namespace=ironrag}
+  OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-otlp}
+  OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-otlp}
+  OTEL_LOGS_EXPORTER: ${OTEL_LOGS_EXPORTER:-otlp}
+  OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: ${OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE:-cumulative}
   RUST_BACKTRACE: full
 
 x-ironrag-app-env: &ironrag-app-env
@@ -126,11 +147,14 @@ services:
       # per-AQL-query memory limit is auto-sized to roughly half the host
       # RAM (~4.6 GB on an 8 GB box) and five parallel queries can reserve
       # 23 GB of virtual memory under concurrent load, enough to
-      # trigger the OOM killer on small hosts. 256 MB / query is
-      # ample for an ArangoSearch + vector-index workload; RocksDB buffers
+      # trigger the OOM killer on small hosts. 1 GB / query is
+      # the minimum that survives the retrieval workload on a large
+      # library: the vector-search + graph-traversal + full-scan diagnostic
+      # queries all materialize candidate sets big enough that 256 MB
+      # produced intermittent 500s on bench runs 2026-04-23. RocksDB buffers
       # and block cache are capped separately so ingest writes don't bloat
       # resident memory.
-      - --query.memory-limit=268435456
+      - --query.memory-limit=1073741824
       - --query.cache-mode=demand
       - --rocksdb.block-cache-size=536870912
       - --rocksdb.total-write-buffer-size=268435456
@@ -190,8 +214,7 @@ services:
       <<: *ironrag-app-env
       IRONRAG_SERVICE_ROLE: startup
       IRONRAG_SERVICE_NAME: ironrag-startup
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      OTEL_SERVICE_NAME: ironrag-startup
     deploy:
       resources:
         <<: *ironrag-resources-medium
@@ -208,6 +231,7 @@ services:
       <<: *ironrag-app-env
       IRONRAG_SERVICE_ROLE: api
       IRONRAG_SERVICE_NAME: ironrag-backend
+      OTEL_SERVICE_NAME: ironrag-backend
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/v1/ready"]
       interval: 10s
@@ -216,8 +240,6 @@ services:
       start_period: 15s
     expose:
       - "8080"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     deploy:
       resources:
         <<: *ironrag-resources-large
@@ -234,6 +256,7 @@ services:
       <<: *ironrag-app-env
       IRONRAG_SERVICE_ROLE: worker
       IRONRAG_SERVICE_NAME: ironrag-worker
+      OTEL_SERVICE_NAME: ironrag-worker
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/v1/ready"]
       interval: 10s
@@ -242,8 +265,6 @@ services:
       start_period: 15s
     expose:
       - "8080"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     deploy:
       resources:
         <<: *ironrag-resources-large

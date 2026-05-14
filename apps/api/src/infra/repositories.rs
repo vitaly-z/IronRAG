@@ -57,6 +57,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::shared::text_encoding::{
+    escape_json_transport_non_ascii, json_contains_repairable_utf8_latin1_mojibake,
+    repair_json_string_values, repair_utf8_latin1_mojibake,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct IngestionExecutionPayload {
     #[serde(alias = "project_id")]
@@ -104,6 +109,165 @@ pub struct IngestionExecutionPayload {
 
 fn default_json_object() -> serde_json::Value {
     serde_json::json!({})
+}
+
+/// PostgreSQL JSONB rejects lone surrogate code points (`\uD800`–`\uDFFF`)
+/// and other invalid Unicode escapes that some LLM providers emit.
+///
+/// Strategy: serialize the value to a JSON string, walk through it
+/// character by character replacing `\uXXXX` sequences that encode
+/// surrogate halves or noncharacters with `\uFFFD`, then re-parse.
+fn sanitize_json_for_postgres(value: serde_json::Value) -> serde_json::Value {
+    let text = value.to_string();
+    let sanitized = replace_surrogate_unicode_escapes(&text);
+    if sanitized == text {
+        return value;
+    }
+    serde_json::from_str(&sanitized).unwrap_or(value)
+}
+
+fn sanitize_runtime_graph_normalized_json(value: serde_json::Value) -> serde_json::Value {
+    let before_has_mojibake = json_contains_repairable_utf8_latin1_mojibake(&value);
+    let recursively_repaired = repair_json_string_values(value.clone());
+    let serialized = recursively_repaired.to_string();
+    let serialized_repaired = repair_utf8_latin1_mojibake(&serialized);
+    let repaired = if serialized_repaired == serialized {
+        recursively_repaired
+    } else {
+        serde_json::from_str(&serialized_repaired).unwrap_or(recursively_repaired)
+    };
+    let after_has_mojibake = json_contains_repairable_utf8_latin1_mojibake(&repaired);
+    let changed = repaired != value;
+    if before_has_mojibake || after_has_mojibake || changed {
+        tracing::warn!(
+            before_has_mojibake,
+            after_has_mojibake,
+            changed,
+            "runtime graph normalized JSON persistence encoding repair"
+        );
+    }
+    sanitize_json_for_postgres(repaired)
+}
+
+fn sanitized_runtime_graph_normalized_json_text(value: serde_json::Value) -> String {
+    escape_json_transport_non_ascii(&sanitize_runtime_graph_normalized_json(value).to_string())
+}
+
+fn sanitized_json_for_postgres_text(value: serde_json::Value) -> String {
+    escape_json_transport_non_ascii(&sanitize_json_for_postgres(value).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        replace_surrogate_unicode_escapes, sanitize_json_for_postgres,
+        sanitize_runtime_graph_normalized_json,
+    };
+    use crate::shared::text_encoding::repair_json_string_values;
+
+    #[test]
+    fn sanitizes_runtime_graph_normalized_json_encoding_damage() {
+        let value = serde_json::json!({
+            "entities": [
+                {
+                    "label": "\u{00d0}\u{00a1}\u{00d0}\u{00be}\u{00d0}\u{00be}\u{00d0}\u{00b1}\u{00d1}\u{0089}\u{00d0}\u{00b5}\u{00d0}\u{00bd}\u{00d0}\u{00b8}\u{00d0}\u{00b5} TransferCallReturned",
+                    "node_type": "artifact",
+                    "aliases": [],
+                    "sub_type": "message",
+                    "summary": "\u{00d0}\u{00a1}\u{00d0}\u{00be}\u{00d0}\u{00be}\u{00d0}\u{00b1}\u{00d1}\u{0089}\u{00d0}\u{00b5}\u{00d0}\u{00bd}\u{00d0}\u{00b8}\u{00d0}\u{00b5} TransferCallReturned."
+                }
+            ],
+            "relations": []
+        });
+
+        let direct_repaired = repair_json_string_values(value.clone());
+        assert_eq!(direct_repaired["entities"][0]["label"], "Сообщение TransferCallReturned");
+        let postgres_sanitized = sanitize_json_for_postgres(direct_repaired.clone());
+        assert_eq!(postgres_sanitized["entities"][0]["label"], "Сообщение TransferCallReturned");
+
+        let repaired = sanitize_runtime_graph_normalized_json(value);
+
+        assert_eq!(repaired["entities"][0]["label"], "Сообщение TransferCallReturned");
+        assert_eq!(repaired["entities"][0]["summary"], "Сообщение TransferCallReturned.");
+    }
+
+    #[test]
+    fn replaces_final_invalid_unicode_escape() {
+        assert_eq!(replace_surrogate_unicode_escapes(r#""\uFFFF""#), r#""\uFFFD""#);
+    }
+
+    #[test]
+    fn preserves_valid_surrogate_pair_escapes() {
+        let sanitized = replace_surrogate_unicode_escapes(r#"{"label":"\uD83D\uDE00"}"#);
+        let value: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+
+        assert_eq!(value["label"], "😀");
+    }
+}
+
+/// Replace `\uXXXX` escape sequences for surrogate code points
+/// (D800–DFFF) and noncharacters (FFFE–FFFF) with `\uFFFD`.
+fn replace_surrogate_unicode_escapes(json: &str) -> String {
+    let bytes = json.as_bytes();
+    let mut out = String::with_capacity(json.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for \uXXXX pattern
+        if i + 6 <= bytes.len() && bytes[i] == b'\\' && bytes[i + 1] == b'u' {
+            let hex = &bytes[i + 2..i + 6];
+            if let Some(cp) = decode_hex_u16(hex) {
+                if is_high_surrogate(cp)
+                    && i + 12 <= bytes.len()
+                    && bytes[i + 6] == b'\\'
+                    && bytes[i + 7] == b'u'
+                    && decode_hex_u16(&bytes[i + 8..i + 12]).is_some_and(is_low_surrogate)
+                {
+                    out.push_str(&json[i..i + 12]);
+                    i += 12;
+                    continue;
+                }
+                if is_surrogate_or_noncharacter(cp) {
+                    out.push_str(r"\uFFFD");
+                    i += 6;
+                    continue;
+                }
+            }
+        }
+        let Some(character) = json[i..].chars().next() else {
+            break;
+        };
+        out.push(character);
+        i += character.len_utf8();
+    }
+    out
+}
+
+fn decode_hex_u16(hex: &[u8]) -> Option<u16> {
+    if hex.len() < 4 {
+        return None;
+    }
+    let mut val: u16 = 0;
+    for &b in &hex[..4] {
+        val = val.wrapping_mul(16).wrapping_add(match b {
+            b'0'..=b'9' => u16::from(b - b'0'),
+            b'a'..=b'f' => u16::from(b - b'a' + 10),
+            b'A'..=b'F' => u16::from(b - b'A' + 10),
+            _ => return None,
+        });
+    }
+    Some(val)
+}
+
+fn is_surrogate_or_noncharacter(cp: u16) -> bool {
+    matches!(cp, 0xD800..=0xDFFF | 0xFFFE | 0xFFFF)
+}
+
+fn is_high_surrogate(cp: u16) -> bool {
+    matches!(cp, 0xD800..=0xDBFF)
+}
+
+fn is_low_surrogate(cp: u16) -> bool {
+    matches!(cp, 0xDC00..=0xDFFF)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
@@ -437,7 +601,7 @@ pub async fn create_runtime_graph_extraction_record(
             id, runtime_execution_id, library_id, document_id, chunk_id, provider_kind, model_name,
             extraction_version, prompt_hash, status, raw_output_json, normalized_output_json,
             glean_pass_count, error_message
-         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14)
          returning id, runtime_execution_id, library_id, document_id, chunk_id, provider_kind,
             model_name, extraction_version, prompt_hash, status, raw_output_json,
             normalized_output_json, glean_pass_count, error_message, created_at",
@@ -452,8 +616,8 @@ pub async fn create_runtime_graph_extraction_record(
     .bind(&input.extraction_version)
     .bind(&input.prompt_hash)
     .bind(&input.status)
-    .bind(input.raw_output_json.clone())
-    .bind(input.normalized_output_json.clone())
+    .bind(sanitized_json_for_postgres_text(input.raw_output_json.clone()))
+    .bind(sanitized_runtime_graph_normalized_json_text(input.normalized_output_json.clone()))
     .bind(input.glean_pass_count)
     .bind(input.error_message.as_deref())
     .fetch_one(pool)
@@ -475,8 +639,8 @@ pub async fn update_runtime_graph_extraction_record(
              model_name = $3,
              prompt_hash = $4,
              status = $5,
-             raw_output_json = $6,
-             normalized_output_json = $7,
+             raw_output_json = $6::jsonb,
+             normalized_output_json = $7::jsonb,
              glean_pass_count = $8,
              error_message = $9
          where id = $1
@@ -489,12 +653,96 @@ pub async fn update_runtime_graph_extraction_record(
     .bind(&input.model_name)
     .bind(&input.prompt_hash)
     .bind(&input.status)
-    .bind(input.raw_output_json.clone())
-    .bind(input.normalized_output_json.clone())
+    .bind(sanitized_json_for_postgres_text(input.raw_output_json.clone()))
+    .bind(sanitized_runtime_graph_normalized_json_text(input.normalized_output_json.clone()))
     .bind(input.glean_pass_count)
     .bind(input.error_message.as_deref())
     .fetch_optional(pool)
     .await
+}
+
+/// Returns `true` when `error` is a PostgreSQL Unicode escape rejection (22P05).
+fn is_unicode_escape_error(error: &sqlx::Error) -> bool {
+    let msg = error.to_string();
+    msg.contains("unsupported Unicode escape sequence") || msg.contains("invalid Unicode escape")
+}
+
+/// Same as [`update_runtime_graph_extraction_record`] but when the primary
+/// call fails with a Unicode escape error the update is retried with empty
+/// JSON objects so the chunk-level failure is recorded instead of aborting
+/// the entire document pipeline.
+pub async fn update_runtime_graph_extraction_record_safe(
+    pool: &PgPool,
+    id: Uuid,
+    input: &UpdateRuntimeGraphExtractionRecordInput,
+) -> Result<Option<RuntimeGraphExtractionRecordRow>, sqlx::Error> {
+    match update_runtime_graph_extraction_record(pool, id, input).await {
+        Ok(row) => Ok(row),
+        Err(e) if is_unicode_escape_error(&e) => {
+            tracing::warn!(
+                id = %id,
+                "retrying graph extraction update with empty JSON after Unicode escape error"
+            );
+            sqlx::query_as::<_, RuntimeGraphExtractionRecordRow>(
+                "update runtime_graph_extraction
+                 set provider_kind = $2,
+                     model_name = $3,
+                     prompt_hash = $4,
+                     status = $5,
+                     raw_output_json = $6::jsonb,
+                     normalized_output_json = $7::jsonb,
+                     glean_pass_count = $8,
+                     error_message = $9
+                 where id = $1
+                 returning id, runtime_execution_id, library_id, document_id, chunk_id, provider_kind,
+                    model_name, extraction_version, prompt_hash, status, raw_output_json,
+                    normalized_output_json, glean_pass_count, error_message, created_at",
+            )
+            .bind(id)
+            .bind(&input.provider_kind)
+            .bind(&input.model_name)
+            .bind(&input.prompt_hash)
+            .bind(&input.status)
+            .bind("{}".to_string())
+            .bind("{}".to_string())
+            .bind(input.glean_pass_count)
+            .bind(input.error_message.as_deref())
+            .fetch_optional(pool)
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Marks interrupted chunk-level graph extraction rows as canceled before a
+/// restarted revision run resumes from ready checkpoints.
+///
+/// # Errors
+/// Returns any `SQLx` error raised while updating graph extraction rows.
+pub async fn cancel_processing_runtime_graph_extractions_for_document(
+    pool: &PgPool,
+    library_id: Uuid,
+    document_id: Uuid,
+    reason: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "update runtime_graph_extraction
+         set status = 'canceled',
+             error_message = $3,
+             raw_output_json = case
+                 when raw_output_json = '{}'::jsonb then jsonb_build_object('canceled_reason', $3)
+                 else raw_output_json
+             end
+         where library_id = $1
+           and document_id = $2
+           and status = 'processing'",
+    )
+    .bind(library_id)
+    .bind(document_id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Upserts one bounded graph-progress checkpoint for the active extraction attempt.
@@ -644,6 +892,7 @@ pub async fn list_active_runtime_graph_progress_checkpoints_by_library(
 pub async fn list_runtime_graph_extraction_records_by_document(
     pool: &PgPool,
     document_id: Uuid,
+    extraction_version: &str,
 ) -> Result<Vec<RuntimeGraphExtractionRecordRow>, sqlx::Error> {
     sqlx::query_as::<_, RuntimeGraphExtractionRecordRow>(
         "select id, runtime_execution_id, library_id, document_id, chunk_id, provider_kind,
@@ -651,18 +900,25 @@ pub async fn list_runtime_graph_extraction_records_by_document(
             normalized_output_json, glean_pass_count, error_message, created_at
          from runtime_graph_extraction
          where document_id = $1
+           and extraction_version = $2
          order by created_at asc, id asc",
     )
     .bind(document_id)
+    .bind(extraction_version)
     .fetch_all(pool)
     .await
 }
 
-/// Loads the newest ready graph extraction that matches the canonical cache key.
+/// Loads the newest ready graph extraction that matches the canonical semantic cache key.
+///
+/// `prompt_hash` is provenance: `extraction_version` is the cache invalidation boundary for
+/// output semantics. Prefer a current-prompt match when present, then fall back to the newest
+/// compatible ready record so safe prompt wording changes do not force large documents through
+/// hours of duplicate provider work.
 ///
 /// # Errors
 /// Returns any `SQLx` error raised while querying graph extraction records.
-pub async fn find_ready_runtime_graph_extraction_record_by_cache_key(
+pub async fn find_ready_runtime_graph_extraction_record_by_semantic_cache_key(
     pool: &PgPool,
     library_id: Uuid,
     text_checksum: &str,
@@ -688,9 +944,10 @@ pub async fn find_ready_runtime_graph_extraction_record_by_cache_key(
            and extraction.extraction_version = $3
            and extraction.provider_kind = $4
            and extraction.model_name = $5
-           and extraction.prompt_hash = $6
            and extraction.status = 'ready'
-         order by extraction.created_at desc, extraction.id desc
+         order by (extraction.prompt_hash = $6) desc,
+            extraction.created_at desc,
+            extraction.id desc
          limit 1",
     )
     .bind(library_id)
@@ -730,6 +987,7 @@ pub async fn get_runtime_graph_extraction_record_by_id(
 pub async fn list_runtime_graph_extraction_records_by_library(
     pool: &PgPool,
     library_id: Uuid,
+    extraction_version: &str,
 ) -> Result<Vec<RuntimeGraphExtractionRecordRow>, sqlx::Error> {
     sqlx::query_as::<_, RuntimeGraphExtractionRecordRow>(
         "select id, runtime_execution_id, library_id, document_id, chunk_id, provider_kind,
@@ -737,9 +995,11 @@ pub async fn list_runtime_graph_extraction_records_by_library(
             normalized_output_json, glean_pass_count, error_message, created_at
          from runtime_graph_extraction
          where library_id = $1
+           and extraction_version = $2
          order by created_at asc, id asc",
     )
     .bind(library_id)
+    .bind(extraction_version)
     .fetch_all(pool)
     .await
 }
@@ -786,7 +1046,7 @@ pub async fn upsert_runtime_graph_extraction_resume_state(
             $1, $2, $3, $4, $5,
             $6, $7, $8, $9, $10,
             $11, $12, $13, $14,
-            $15, $16, $17, $18,
+            $15, $16::jsonb, $17::jsonb, $18::jsonb,
             $19
          )
          on conflict (ingestion_run_id, chunk_ordinal) do update
@@ -828,10 +1088,10 @@ pub async fn upsert_runtime_graph_extraction_resume_state(
     .bind(input.request_shape_key.as_deref())
     .bind(input.request_size_bytes)
     .bind(input.provider_failure_class.as_deref())
-    .bind(input.provider_failure_json.clone())
-    .bind(input.recovery_summary_json.clone())
-    .bind(input.raw_output_json.clone())
-    .bind(input.normalized_output_json.clone())
+    .bind(input.provider_failure_json.clone().map(sanitize_json_for_postgres))
+    .bind(sanitized_json_for_postgres_text(input.recovery_summary_json.clone()))
+    .bind(sanitized_json_for_postgres_text(input.raw_output_json.clone()))
+    .bind(sanitized_runtime_graph_normalized_json_text(input.normalized_output_json.clone()))
     .bind(input.last_successful_at)
     .fetch_one(pool)
     .await

@@ -1,6 +1,6 @@
 # Пайплайн IronRAG
 
-Документ описывает текущий канонический путь данных от admission источника до retrieval и выдачи ответа.
+Документ описывает текущий единый путь данных от admission источника до retrieval и выдачи ответа.
 
 ## 1. Точки входа
 
@@ -17,16 +17,16 @@ Query pipeline начинается с:
 
 - `POST /v1/query/sessions/{sessionId}/turns`
 
-Один и тот же набор canonical services обслуживает web UI, HTTP handlers и MCP tools. Отдельного ingestion или query stack для агентов нет.
+Один и тот же набор сервисов обслуживает web UI, HTTP handlers и MCP tools. Отдельного ingestion или query stack для агентов нет.
 
-## 2. Каноническая нормализация источников
+## 2. Единая нормализация источников
 
 Любой принятый source сначала нормализуется в structured blocks. Только после этого запускаются chunking, embedding, graph extraction и retrieval.
 
 ### Поддерживаемые семейства источников
 
 - Text-like файлы: markdown, text, JSON, YAML, source code
-- PDF через Docling-backed document-layout extraction
+- PDF через Docling-backed document-layout extraction с durable page-range checkpoints для stored revisions
 - Статические raster images через Docling OCR по умолчанию или через активный `vision` binding, если recognition policy библиотеки выбирает `vision`
 - DOCX и PPTX через Docling-backed structured block extraction
 - Таблицы (`csv`, `tsv`, `xls`, `xlsx`, `xlsb`, `ods`) через native row-oriented extraction
@@ -41,14 +41,25 @@ runtime fallback. Новые библиотеки наследуют
 `PUT /v1/catalog/libraries/{libraryId}/recognition-policy`.
 
 PDF, DOCX и PPTX layout extraction остаётся на embedded Docling CPU runtime.
-Таблицы остаются на native tabular parser. Static raster image OCR может идти
-через Docling или через активный `vision` binding. Если библиотека направляет
-image OCR в `vision`, но binding не настроен, ingest падает явно, без silent
-fallback. Video files в текущий ingest surface не входят.
+Таблицы остаются на native tabular parser. Static raster image OCR и embedded
+document-picture OCR идут через Docling, если библиотека явно не выбрала
+`vision` в recognition policy. Если библиотека направляет image OCR в `vision`,
+но binding не настроен, ingest падает явно, без silent fallback. Video files в
+текущий ingest surface не входят.
+
+Stored PDF revisions идут через restart-safe Docling path: worker сначала
+читает page count, затем извлекает bounded page ranges и сохраняет каждый
+завершённый range как ingest unit. `IRONRAG_DOCLING_PAGE_BATCH_SIZE` управляет
+размером persisted range, `IRONRAG_DOCLING_PAGE_STREAM_WINDOW_PAGES` управляет
+тем, сколько contiguous pages проходит через один Docling process (по умолчанию
+40 страниц), а
+`IRONRAG_DOCLING_MAX_CONCURRENCY` ограничивает локальные Docling процессы.
+Уже завершённые page ranges переиспользуются после worker restart, backend
+restart, потери lease или сетевого обрыва.
 
 ### Table contract
 
-У таблиц один канонический путь:
+У таблиц один стандартный путь:
 
 - spreadsheet rows,
 - extracted table blocks из office documents,
@@ -60,11 +71,11 @@ fallback. Video files в текущий ingest surface не входят.
 
 ### Postgres
 
-Postgres хранит канонический control и content metadata:
+Postgres хранит основной control и content metadata:
 
 - IAM, users, sessions, tokens, grants
 - workspaces и libraries
-- documents, revisions, heads, mutations и async operations
+- documents, revisions, heads, mutations, async operations и durable ingest units
 - costs, audit events, runtime execution metadata
 
 ### Blob storage
@@ -99,15 +110,21 @@ Chunking один для всех форматов:
 
 ### Контракт graph extraction
 
-- entity types идут из канонического словаря из 10 типов
-- relation types идут из канонического relation catalog
+- entity types идут из общего словаря из 10 типов
+- relation types идут из общего relation catalog
 - `sub_type` — это metadata, а не node identity
 - node identity строится из нормализованного `(node_type, label)`
 - support count накапливается по admitted evidence
+- provider JSON чинится только для однозначного UTF-8 transport damage, затем
+  валидируется до persistence; оставшиеся mojibake или control characters
+  явно валят chunk
 
-### Контракт entity resolution
+### Контракт graph key
 
-Entity resolution схлопывает alias и normalized duplicate в один runtime vocabulary. Результат должен быть согласован между:
+Runtime graph nodes пишутся по одному key: нормализованный
+`(node_type, label)`. Извлечённые aliases помогают lookup и relation endpoint
+matching, но отдельного full-library alias resolution pass, который после
+ingestion переписывает node identity, нет. Результат должен быть согласован между:
 
 - query retrieval,
 - graph topology,
@@ -116,12 +133,12 @@ Entity resolution схлопывает alias и normalized duplicate в один
 
 ## 6. Query и answer path
 
-Query path использует один канонический retrieval stack:
+Query path использует единый retrieval stack:
 
 - lexical retrieval
 - vector retrieval
 - evidence assembly
-- canonical preflight answer preparation
+- preflight answer preparation
 - answer generation
 - verification
 
@@ -129,11 +146,14 @@ Exact-literal technical вопросы используют тот же answer c
 
 ### Turn contract
 
-`POST /v1/query/sessions/{sessionId}/turns` — один JSON request/response turn.
-Ответ содержит завершённый grounded answer, evidence references, verifier state
-и runtime execution handle. Инкрементальный answer streaming не является
-отдельным путём UI assistant; MCP transport streaming остаётся изолированным в
-`/v1/mcp`.
+`POST /v1/query/sessions/{sessionId}/turns` создаёт один persisted assistant
+turn и query execution. UI callers могут запросить `text/event-stream`; stream
+несёт activity, failure и completion events для того же execution, а completion
+payload содержит grounded answer, evidence references, verifier state и runtime
+execution handle. Если transport падает после старта backend work, frontend
+восстанавливается чтением durable session result, созданного после request
+boundary, вместо повторной отправки turn. MCP transport streaming остаётся
+изолированным в `/v1/mcp`.
 
 ## 7. Worker model
 
@@ -149,7 +169,11 @@ Exact-literal technical вопросы используют тот же answer c
 - finalization
 - web discovery и page materialization
 
-Worker pool и HTTP API используют один и тот же canonical service layer и persistence model.
+Worker pool и HTTP API используют один и тот же service layer и persistence model.
+Каждый claimed job получает отдельный heartbeat observer, поэтому долгие
+provider или Docling calls не могут заморить lease renewal. Если lease ушёл
+другому worker'у, pipeline останавливается, job поднимается из durable state,
+а finalization проверяет active attempt lease вместо stale in-memory success flag.
 
 ## 8. Бэкап и восстановление библиотеки
 
@@ -184,8 +208,8 @@ Body: raw .tar.zst архив
 
 ## 9. Жесткие инварианты
 
-- Один канонический путь на каждое семейство источников; никаких alternate legacy branches.
-- Одно каноническое table representation для всех форматов.
-- Один канонический query pipeline для UI и MCP clients.
-- Один канонический graph vocabulary для search, topology и relation listing.
+- Один стандартный путь на каждое семейство источников; никаких alternate legacy branches.
+- Одно table representation для всех форматов.
+- Один общий query pipeline для UI и MCP clients.
+- Один общий graph vocabulary для search, topology и relation listing.
 - Никакой client-specific answer assembly логики вне query service.

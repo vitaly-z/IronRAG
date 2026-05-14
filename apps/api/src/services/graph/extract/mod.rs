@@ -8,6 +8,10 @@ mod types;
 mod tests;
 
 // Public re-exports used across the crate
+pub(crate) use parse::canonical_graph_extraction_normalized_json;
+pub(crate) use parse::repair_graph_extraction_candidate_set;
+pub(crate) use parse::repair_graph_extraction_normalized_json;
+pub(crate) use prompt::GRAPH_EXTRACTION_VERSION;
 pub use recovery::{extraction_lifecycle_from_record, extraction_recovery_summary_from_record};
 pub use types::{
     GraphEntityCandidate, GraphExtractionCandidateSet, GraphExtractionExecutionError,
@@ -182,7 +186,7 @@ pub async fn extract_chunk_graph_candidates(
     if cancellation_token.is_cancelled() {
         return Err(graph_extraction_cancelled_error(
             request,
-            "graph_extract_v8:cancelled",
+            format!("{}:cancelled", prompt::GRAPH_EXTRACTION_VERSION),
             request.chunk.content.len(),
         ));
     }
@@ -249,7 +253,7 @@ pub async fn extract_chunk_graph_candidates(
     .await;
 
     match execution_result {
-        Ok((runtime_outcome, extraction_outcome)) => {
+        Ok((runtime_outcome, mut extraction_outcome)) => {
             let runtime_result = state
                 .agent_runtime
                 .executor()
@@ -270,7 +274,54 @@ pub async fn extract_chunk_graph_candidates(
                     extraction_outcome.recovery_attempts.clone(),
                 )
             })?;
-            repositories::update_runtime_graph_extraction_record(
+            extraction_outcome.normalized =
+                parse::repair_graph_extraction_candidate_set(extraction_outcome.normalized);
+            if parse::graph_extraction_candidate_set_contains_encoding_damage(
+                &extraction_outcome.normalized,
+            ) {
+                let message =
+                    "graph extraction retained encoding damage after canonical repair".to_string();
+                tracing::error!(extraction_record_id = %extraction_record_id, "{}", message);
+                repositories::update_runtime_graph_extraction_record_safe(
+                    &state.persistence.postgres,
+                    extraction_record_id,
+                    &repositories::UpdateRuntimeGraphExtractionRecordInput {
+                        provider_kind: extraction_outcome.provider_kind.clone(),
+                        model_name: extraction_outcome.model_name.clone(),
+                        prompt_hash: extraction_outcome.prompt_hash.clone(),
+                        status: "failed".to_string(),
+                        raw_output_json: extraction_outcome.raw_output_json.clone(),
+                        normalized_output_json: serde_json::json!({
+                            "entities": [],
+                            "relations": []
+                        }),
+                        glean_pass_count: i32::try_from(extraction_outcome.usage_calls.len())
+                            .unwrap_or(i32::MAX),
+                        error_message: Some(message.clone()),
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    graph_extraction_execution_error(
+                        request,
+                        format!("failed to persist graph extraction encoding failure: {error:#}"),
+                        extraction_outcome.provider_failure.clone(),
+                        extraction_outcome.recovery_summary.clone(),
+                        extraction_outcome.recovery_attempts.clone(),
+                    )
+                })?;
+                return Err(graph_extraction_execution_error(
+                    request,
+                    message,
+                    extraction_outcome.provider_failure.clone(),
+                    extraction_outcome.recovery_summary.clone(),
+                    extraction_outcome.recovery_attempts.clone(),
+                ));
+            }
+            let normalized_output_json = parse::canonical_graph_extraction_normalized_json(
+                extraction_outcome.normalized.clone(),
+            );
+            repositories::update_runtime_graph_extraction_record_safe(
                 &state.persistence.postgres,
                 extraction_record_id,
                 &repositories::UpdateRuntimeGraphExtractionRecordInput {
@@ -279,8 +330,7 @@ pub async fn extract_chunk_graph_candidates(
                     prompt_hash: extraction_outcome.prompt_hash.clone(),
                     status: "ready".to_string(),
                     raw_output_json: extraction_outcome.raw_output_json.clone(),
-                    normalized_output_json: serde_json::to_value(&extraction_outcome.normalized)
-                        .unwrap_or_else(|_| serde_json::json!({})),
+                    normalized_output_json,
                     glean_pass_count: i32::try_from(extraction_outcome.usage_calls.len())
                         .unwrap_or(i32::MAX),
                     error_message: None,
@@ -338,7 +388,7 @@ pub async fn extract_chunk_graph_candidates(
                 resume_state: error.resume_state.clone(),
                 cancelled: error.cancelled,
             })?;
-            repositories::update_runtime_graph_extraction_record(
+            repositories::update_runtime_graph_extraction_record_safe(
                 &state.persistence.postgres,
                 extraction_record_id,
                 &repositories::UpdateRuntimeGraphExtractionRecordInput {
@@ -489,7 +539,7 @@ async fn run_graph_extraction_runtime(
     if cancellation_token.is_cancelled() {
         let error = graph_extraction_cancelled_error(
             request,
-            "graph_extract_v8:cancelled",
+            format!("{}:cancelled", prompt::GRAPH_EXTRACTION_VERSION),
             request.chunk.content.len(),
         );
         let failure = GraphExtractionTaskFailure {

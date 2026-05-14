@@ -381,6 +381,8 @@ impl OpsStateFixture {
                 finished_at: None,
                 failure_class: None,
                 failure_code: None,
+                failure_message: None,
+                progress_percent: 50,
                 retryable: false,
             },
         )
@@ -436,6 +438,8 @@ impl OpsStateFixture {
                 finished_at: Some(Utc::now()),
                 failure_class: Some("rebuild_failed".to_string()),
                 failure_code: Some("ingest rebuild failed".to_string()),
+                failure_message: Some("ingest rebuild failed".to_string()),
+                progress_percent: 60,
                 retryable: true,
             },
         )
@@ -596,6 +600,8 @@ impl OpsStateFixture {
                             finished_at: Some(Utc::now()),
                             failure_class: None,
                             failure_code: None,
+                            failure_message: None,
+                            progress_percent: 100,
                             retryable: false,
                         },
                     )

@@ -68,7 +68,7 @@ export function DocumentsTable({
     items.length > 0 && items.every((doc) => selectedIds.has(doc.id));
 
   return (
-    <table className="w-full min-w-[1020px] table-fixed text-sm">
+    <table className="w-full min-w-[1100px] table-fixed text-sm">
       <colgroup>
         {selectionMode && <col className="w-12" />}
         <col />
@@ -78,7 +78,7 @@ export function DocumentsTable({
         <col className="w-24" />
         <col className="w-24" />
         <col className="w-36" />
-        <col className="w-36" />
+        <col style={{ width: "13rem" }} />
       </colgroup>
       <thead
         className="sticky top-0 z-10"
@@ -202,15 +202,55 @@ export function DocumentsTable({
                 {doc.processingFinishedAt ? formatDate(doc.processingFinishedAt, locale) : "\u2014"}
               </td>
               <td className="px-4 py-3.5">
-                <span className={`status-badge ${statusBadgeConfig[doc.status].cls}`} title={doc.statusReason}>
-                  {statusBadgeConfig[doc.status].label}
-                </span>
+                <DocumentStatusBadge doc={doc} t={t} />
               </td>
             </tr>
           );
         })}
       </tbody>
     </table>
+  );
+}
+
+function DocumentStatusBadge({ doc, t }: { doc: DocumentItem; t: TFunction }) {
+  const statusBadgeConfig = buildDocumentStatusBadgeConfig(t);
+  const badge = statusBadgeConfig[doc.status];
+  const progress =
+    doc.status === "processing"
+      ? Math.max(0, Math.min(99, Math.round(doc.progressPercent ?? 0)))
+      : null;
+  const title =
+    progress != null
+      ? [badge.label, `${progress}%`, doc.statusReason].filter(Boolean).join(" · ")
+      : doc.statusReason;
+
+  if (progress == null) {
+    return (
+      <span className={`status-badge ${badge.cls} whitespace-nowrap`} title={title}>
+        {badge.label}
+      </span>
+    );
+  }
+
+  return (
+    <span
+      className={`status-badge ${badge.cls} relative isolate min-w-[9.25rem] justify-center overflow-hidden whitespace-nowrap`}
+      title={title}
+      aria-label={`${badge.label} ${progress}%`}
+    >
+      <span
+        aria-hidden="true"
+        className="absolute inset-y-0 left-0 rounded-full transition-all duration-500"
+        style={{
+          width: `${progress}%`,
+          background: "hsl(var(--status-processing-ring) / 0.95)",
+        }}
+      />
+      <span className="relative z-10 flex items-center justify-center gap-1.5 whitespace-nowrap">
+        <span>{badge.label}</span>
+        <span className="tabular-nums">{progress}%</span>
+      </span>
+    </span>
   );
 }
 

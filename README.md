@@ -21,13 +21,15 @@
 ## What IronRAG provides
 
 - **Typed knowledge graph.** Documents are decomposed into entities, typed relationships, and chunk-level evidence references. Retrieval combines vector, lexical, graph-traversal, and technical-fact lanes; the answer pipeline returns citations to the underlying chunks.
-- **Native MCP server.** 21 tools across documents, graph, web ingest, and grounded `ask`. Compatible with any MCP client (Claude Desktop, Claude Code, Cursor, VS Code, Continue, Cline, Hermes / Lobe agents, custom). Tools are scoped per IAM token.
+- **Native MCP server.** 21 tools across documents, graph, web ingest, and grounded `ask`. Connect it to MCP-compatible agents and clients such as Claude Desktop, Claude Code, Cursor, Codex, VS Code with Continue / Cline / Roo, Zed, OpenClaw, Hermes, Lobe-style chat agents, or a custom HTTP MCP client. Tools are scoped per IAM token.
 - **Provider-agnostic AI runtime.** Seven LLM providers ship in the catalog — OpenAI, DeepSeek, Qwen (DashScope-intl), GPTunnel, OpenRouter, RouterAI, Ollama. Each pipeline purpose (`extract_text`, `extract_graph`, `embed_chunk`, `query_compile`, `query_retrieve`, `query_answer`, `vision`) is bound independently and can use a different provider.
 - **USD cost catalog.** Every binding stores prices in USD. Per-call billing rows are written for every LLM request and rolled up per document and per query in the UI.
 - **Multi-tenant IAM.** Principals, scoped tokens (system / workspace / library), and permission groups gate every API surface. Audit log captures resource access.
 - **Self-hosted runtime.** Single `docker compose up -d` boots the full stack (PostgreSQL, ArangoDB, Redis, backend, worker, frontend). Helm chart available for Kubernetes.
 - **Code-aware ingest.** 15-language tree-sitter AST parsing. Native parsers for JSON / YAML / TOML / CSV / XLSX. Technical-fact extraction for paths, params, endpoints, env vars, and error codes.
-- **CPU-first recognition.** Docling CPU runtime is baked into the backend image; PDF / DOCX / PPTX layout extraction and raster-image OCR run without a GPU. Image OCR can be switched per library to an active vision binding.
+- **CPU-first recognition.** Docling CPU runtime is baked into the backend image; PDF / DOCX / PPTX layout extraction, raster-image OCR, and embedded document-picture OCR run without a GPU. Stored PDFs are extracted through resumable page-range checkpoints, and image OCR can be switched per library to an active vision binding.
+- **Restart-safe processing.** Long document jobs keep durable extraction units, reusable embedding / graph outputs, and lease-guarded finalization, so stack restarts or transient network breaks resume from the last completed unit instead of discarding hours of work.
+- **Durable assistant turns.** UI answer streaming is an activity channel over the same persisted query execution; if the browser or proxy drops the stream after work starts, the frontend reloads the completed session result instead of submitting the question again. LLM debug snapshots are stored per execution for post-reload inspection.
 - **Backup and restore.** Streaming `tar.zst` archive with selective sections (catalog only, with blobs, with graph). Restore to the same or a different deployment.
 
 ## Quick start
@@ -65,15 +67,17 @@ IRONRAG_ROUTERAI_API_KEY=...
 | Provider                  | Chat | Vision | Embedding | Notes                                                                |
 | ------------------------- | ---- | ------ | --------- | -------------------------------------------------------------------- |
 | **OpenAI**                | ✅    | ✅      | ✅         | Direct API                                                           |
-| **DeepSeek**              | ✅    | —      | —         | Best for reasoning, falls back to gptunnel for vision                |
-| **Qwen / DashScope-intl** | ✅    | ✅      | —         | qwen3-vl, falls back for embeddings (Arango index requires 3072-dim) |
-| **GPTunnel**              | ✅    | ✅      | ✅         | Reseller catalog: OpenAI, Anthropic, Gemini, DeepSeek                |
-| **OpenRouter**            | ✅    | ✅      | —         | 300+ models from one key                                             |
-| **RouterAI**              | ✅    | ✅      | ✅         | RU-side OpenRouter alternative                                       |
+| **DeepSeek**              | ✅    | —      | —         | Very low cost; may be slower than other APIs; no native vision/embeddings |
+| **Qwen / DashScope-intl** | ✅    | ✅      | ✅         | Cost is close to DeepSeek; API is often faster; strong chat/vision/embedding lane |
+| **GPTunnel**              | ✅    | ✅      | ✅         | Router provider: many upstream model families behind one key         |
+| **OpenRouter**            | ✅    | ✅      | —         | Router provider: many upstream model families behind one key         |
+| **RouterAI**              | ✅    | ✅      | ✅         | Router provider: many upstream model families behind one key         |
 | **Ollama**                | ✅    | ✅      | ✅         | Fully local, air-gapped, GPU optional                                |
 
 
 Bind any provider to any pipeline purpose under **Admin → AI → Bindings**: `extract_text`, `extract_graph`, `embed_chunk`, `query_compile`, `query_retrieve`, `query_answer`, `vision`. The bindings are scoped to instance, workspace, or library — a workspace can override the instance default for a single purpose.
+
+Optional bindings note: `vision` and `extract_text` are optional. Keep libraries on the Docling raster-image engine by default; switch a library to `vision` only when that library should use an active vision binding for image OCR. Selecting `vision` without a binding fails loudly.
 
 ## Common deployments
 
@@ -151,7 +155,7 @@ flowchart LR
 
 
 
-1. **Ingest.** Files, web pages, and API / MCP uploads enter the recognition router (`extract_text`), are split into structured chunks (`chunk_content` + structured-block preparation), and persisted to ArangoDB.
+1. **Ingest.** Files, web pages, and API / MCP uploads enter the recognition router (`extract_text`), stored PDFs are checkpointed by page range, source text is split into structured chunks (`chunk_content` + structured-block preparation), and persisted to ArangoDB.
 2. **Build memory.** Each chunk is embedded (`embed_chunk`), scanned for technical literals (`extract_technical_facts`), and processed by `extract_graph` to write entities, typed relations, and evidence references.
 3. **Query.** A query session compiles the user request into typed IR (`query_compile`); vector, lexical, graph-traversal, and technical-fact lanes retrieve concurrently; the answer router selects between a grounded answer (`query_answer`) and a clarification, runs the verifier, and persists citations to the response.
 4. **Provider routing.** Every LLM call resolves through the binding for its purpose. Switching `query_answer` from OpenAI to a local Ollama model is a binding change at the matching scope (instance / workspace / library).

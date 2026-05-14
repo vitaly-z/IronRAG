@@ -57,8 +57,8 @@ curl -sS -X POST http://127.0.0.1:19000/v1/mcp \
 
 `tools/list` фильтруется грантами. Если токену что-то нельзя, инструмент просто не будет рекламироваться.
 Каноническая JSON-RPC поверхность намеренно маленькая: `initialize`, `tools/list`, `tools/call` и `notifications/initialized`. Пустой surface `resources/*` IronRAG не рекламирует и не поддерживает.
-Аргументы инструментов принимаются только в каноническом camelCase-виде.
-Цели каталога задаются каноническими ref-ами вместо opaque UUID: `workspace` имеет вид `<workspace>`, а `library` — `<workspace>/<library>`. Discovery-ответы возвращают эти значения в поле `ref`.
+Аргументы инструментов принимаются только в camelCase-виде.
+Цели каталога задаются через стабильные ref-ы вместо opaque UUID: `workspace` имеет вид `<workspace>`, а `library` — `<workspace>/<library>`. Discovery-ответы возвращают эти значения в поле `ref`.
 
 ## Инструменты
 
@@ -66,7 +66,7 @@ curl -sS -X POST http://127.0.0.1:19000/v1/mcp \
 
 | Инструмент | Описание | Обязательные параметры |
 |------------|----------|----------------------|
-| `grounded_answer` | Задать вопрос естественным языком и получить grounded ответ с каноническими evidence references — **тот же самый pipeline, что использует встроенный UI-ассистент** (QueryCompiler → гибридный поиск → graph-aware context → answer generation → verifier). Предпочитайте этот инструмент `search_documents` + `read_document`, когда пользователю нужен ответ, а не список хитов. | `library`, `query` |
+| `grounded_answer` | Задать вопрос естественным языком и получить grounded ответ с evidence references — **тот же самый pipeline, что использует встроенный UI-ассистент** (QueryCompiler → гибридный поиск → graph-aware context → answer generation → verifier). Предпочитайте этот инструмент `search_documents` + `read_document`, когда пользователю нужен ответ, а не список хитов. | `library`, `query` |
 
 Response структура: текст tool-result содержит ответ; structured output содержит `executionDetail`, тот же assistant execution DTO, который потребляет UI, включая chunk, prepared-segment, technical-fact, graph-entity, graph-relation, verifier, runtime, request и response поля. Верхнеуровневые `runtimeExecutionId`, `executionId` и `conversationId` остаются короткими ссылками для trace lookup. MCP-клиент получает ровно тот ответ, который увидел бы пользователь в UI для того же вопроса и библиотеки — MCP и UI используют один и тот же пайплайн grounded Q&A, без параллельных реализаций.
 
@@ -81,14 +81,14 @@ Response структура: текст tool-result содержит ответ;
 
 | Инструмент | Описание | Обязательные параметры |
 |------------|----------|----------------------|
-| `create_workspace` | Создать workspace (только system admin). Запрос использует канонический ref workspace; `title` остаётся опциональным display name. | `workspace` |
-| `create_library` | Создать библиотеку внутри workspace. Запрос использует канонический ref библиотеки; `title` остаётся опциональным display name. | `library` |
+| `create_workspace` | Создать workspace (только system admin). Запрос использует стабильный ref workspace; `title` остаётся опциональным display name. | `workspace` |
+| `create_library` | Создать библиотеку внутри workspace. Запрос использует стабильный ref библиотеки; `title` остаётся опциональным display name. | `library` |
 
 ### Документы
 
 | Инструмент | Описание | Обязательные параметры |
 |------------|----------|----------------------|
-| `search_documents` | Поиск по библиотеке: гибридный BM25 + вектор. Возвращает хиты на уровне документов. Поиск можно сузить списком канонических ref-ов через `libraries`. | `query` |
+| `search_documents` | Поиск по библиотеке: гибридный BM25 + вектор. Возвращает хиты на уровне документов. Поиск можно сузить списком ref-ов через `libraries`. | `query` |
 | `read_document` | Прочитать документ полностью или частями (с continuation token). | `documentId` |
 | `list_documents` | Список документов в библиотеке с фильтрацией по статусу. | `library` (опц.) |
 | `upload_documents` | Загрузить один или несколько документов. Поддерживает base64 и inline-текст. | `library`, `documents` |
@@ -121,12 +121,12 @@ Response структура: текст tool-result содержит ответ;
 | `get_runtime_execution` | Загрузить summary жизненного цикла runtime-исполнения. | `runtimeExecutionId` |
 | `get_runtime_execution_trace` | Полная трассировка стадий, действий и policy-решений. | `runtimeExecutionId` |
 
-Под капотом MCP использует те же канонические сервисы, что и веб-приложение: Postgres для control state, ArangoDB для графа и документной истины, Redis-backed workers для ingestion.
+Под капотом MCP использует те же сервисы, что и веб-приложение: Postgres для control state, ArangoDB для графа и документной истины, Redis-backed workers для ingestion.
 
 ## Quality-контракт graph tools
 
 - `get_graph_topology` не отдаёт сырой full-graph dump. Если срабатывает `limit`, IronRAG сначала оставляет самые подтверждённые сущности, затем только те связи, у которых обе вершины остались видимыми, и только потом документные привязки и документы, которые реально поддерживают этот видимый срез.
-- `search_entities` читает тот же admitted runtime graph snapshot, что и `get_graph_topology`. Если сущность видна в текущем runtime graph, `search_entities` должен находить ту же каноническую vocabulary, а не опираться на параллельный stale index.
+- `search_entities` читает тот же admitted runtime graph snapshot, что и `get_graph_topology`. Если сущность видна в текущем runtime graph, `search_entities` должен находить тот же общий vocabulary, а не опираться на параллельный stale index.
 - `list_relations` ранжируется по `support_count`, а не по порядку вставки в таблицу.
 - Цель graph tools для агента — связный полезный subgraph, а не алфавитный или случайный фрагмент с orphaned edges и нерелевантными документами.
 - При проверке клиента оценивайте не только JSON shape, но и полезность результата: сильные сущности должны стабильно быть первыми, связи — идти по реальной поддержке, document links — указывать только на те узлы и рёбра, которые реально остались в ответе, а `list_relations` не должен деградировать до `unknown` labels.
@@ -138,7 +138,7 @@ Response структура: текст tool-result содержит ответ;
 - Read-only токены подходят для ассистентов, которым нужен только поиск, чтение и Q&A.
 - Write-enabled токены могут загружать, обновлять и удалять документы, если агенту нужно самому поддерживать knowledge base.
 - Видимость инструментов следует за грантами: клиент видит только то, что ему разрешено.
-- Если токен ограничен ровно одним workspace или library, MCP tools могут вывести канонический ref `workspace` или `library` из scope токена и не заставлять агента каждый раз передавать его явно.
+- Если токен ограничен ровно одним workspace или library, MCP tools могут вывести ref `workspace` или `library` из scope токена и не заставлять агента каждый раз передавать его явно.
 
 ## Что получает клиент
 
@@ -250,6 +250,23 @@ claude mcp add ironrag http://127.0.0.1:19000/v1/mcp \
 
 ```bash
 openclaw mcp set ironrag '{"url":"http://127.0.0.1:19000/v1/mcp","headers":{"Authorization":"Bearer irt_..."}}'
+```
+
+## Hermes
+
+`~/.hermes/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "ironrag": {
+      "url": "http://127.0.0.1:19000/v1/mcp",
+      "headers": {
+        "Authorization": "Bearer ${IRONRAG_MCP_TOKEN}"
+      }
+    }
+  }
+}
 ```
 
 Если клиент умеет принимать сырой HTTP MCP-конфиг, достаточно URL endpoint и bearer token header — Streamable HTTP transport стандартный, никаких адаптеров поверх не требуется.

@@ -112,12 +112,9 @@ pub async fn run_single_shot_turn(
         provider,
         usage_json: response.usage_json,
         iterations: 1,
-        // Single-shot did not observe any tool results — the grounding
-        // evidence the runtime collected is already baked into the
-        // verifier's `prompt_context`, so there is nothing to record
-        // here. The verifier still sees the same chunks / structured
-        // evidence it would have seen for a deterministic-preflight
-        // answer.
+        // Single-shot did not observe any tool results. The answer
+        // pipeline attaches the selected retrieval context as verifier
+        // grounding when it records the generation stage.
         assistant_grounding: AssistantGroundingEvidence::default(),
         debug_iterations: vec![debug_iteration],
     })

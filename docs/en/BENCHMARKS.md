@@ -60,3 +60,17 @@ Benchmark runs write to `tmp-grounded-benchmarks/` by default and include:
 - latency and evidence metadata for each case.
 
 The goal is not only pass/fail. The output should tell you whether a drop came from retrieval, answer assembly, evidence selection, or verification.
+
+## Large-document ingest smoke
+
+Large private ingest corpora are not stored in this public repository. When
+validating changes to Docling, chunking, embedding, graph extraction, or worker
+leases, run the private large-document smoke and record only sanitized evidence
+in public docs:
+
+- all files reached `ready`;
+- resumed jobs reused completed PDF page-range units;
+- graph topology was non-empty after finalization;
+- encoding scanners found no mojibake in persisted graph labels or page units;
+- document UI showed stage progress, model, duration, calls, and cost;
+- public `make check` passed.

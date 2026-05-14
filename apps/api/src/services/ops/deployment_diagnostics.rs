@@ -8,7 +8,10 @@ use tokio::sync::RwLock;
 use crate::{
     app::state::AppState,
     domains::deployment::{DependencyKind, DependencyMode, ServiceRole, StartupAuthorityMode},
-    infra::persistence::{canonical_baseline_present, validate_arango_bootstrap_state},
+    infra::persistence::{
+        canonical_baseline_present, validate_arango_bootstrap_state,
+        validate_postgres_migration_state,
+    },
     services::content::storage::types::ContentStorageProbeStatus,
 };
 
@@ -102,6 +105,10 @@ impl WorkerRuntimeState {
     pub async fn touch(&self) {
         let mut snapshot = self.snapshot.write().await;
         snapshot.last_heartbeat_at = Some(Utc::now());
+    }
+
+    pub async fn is_idle(&self) -> bool {
+        self.snapshot.read().await.status == WORKER_STATUS_IDLE
     }
 
     pub async fn snapshot(&self) -> WorkerRuntimeSnapshot {
@@ -330,6 +337,22 @@ impl DeploymentDiagnosticsService {
             .settings
             .startup_authority_mode_kind()
             .unwrap_or(StartupAuthorityMode::NotRequired);
+        if !canonical_baseline_present(&state.persistence.postgres).await.unwrap_or(false) {
+            return StartupAuthorityStatus {
+                mode: mode.as_str().to_string(),
+                state: StartupAuthorityState::Pending,
+                message: Some("postgres baseline has not been initialized yet".to_string()),
+            };
+        }
+        if let Err(error) = validate_postgres_migration_state(&state.persistence.postgres).await {
+            return StartupAuthorityStatus {
+                mode: mode.as_str().to_string(),
+                state: StartupAuthorityState::Pending,
+                message: Some(format!(
+                    "postgres migration state is not compatible with the current binary: {error}"
+                )),
+            };
+        }
         if matches!(mode, StartupAuthorityMode::NotRequired) {
             return StartupAuthorityStatus {
                 mode: mode.as_str().to_string(),
@@ -342,13 +365,6 @@ impl DeploymentDiagnosticsService {
                 mode: mode.as_str().to_string(),
                 state: StartupAuthorityState::Running,
                 message: Some("startup authority is executing".to_string()),
-            };
-        }
-        if !canonical_baseline_present(&state.persistence.postgres).await.unwrap_or(false) {
-            return StartupAuthorityStatus {
-                mode: mode.as_str().to_string(),
-                state: StartupAuthorityState::Pending,
-                message: Some("postgres baseline has not been initialized yet".to_string()),
             };
         }
         match validate_arango_bootstrap_state(&state.arango_client, &state.settings).await {

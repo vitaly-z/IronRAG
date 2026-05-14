@@ -1,6 +1,6 @@
 # IronRAG pipeline
 
-This document describes the current canonical data path from source admission to retrieval and answer delivery.
+This document describes the current end-to-end data path from source admission to retrieval and answer delivery.
 
 ## 1. Entry surfaces
 
@@ -17,16 +17,16 @@ The query pipeline starts from:
 
 - `POST /v1/query/sessions/{sessionId}/turns`
 
-The same canonical services back the web UI, HTTP handlers, and MCP tools. There is no separate ingestion or query stack for agents.
+The same core services back the web UI, HTTP handlers, and MCP tools. There is no separate ingestion or query stack for agents.
 
-## 2. Canonical source normalization
+## 2. Unified source normalization
 
 Every admitted source is normalized into structured blocks before chunking, embedding, graph extraction, or retrieval.
 
 ### Supported source families
 
 - Text-like files: markdown, text, JSON, YAML, source code
-- PDF through Docling-backed document-layout extraction
+- PDF through Docling-backed document-layout extraction with durable page-range checkpoints for stored revisions
 - Static raster images through Docling OCR by default, or through the active `vision` binding when the library recognition policy selects `vision`
 - DOCX and PPTX through Docling-backed structured block extraction
 - Spreadsheets (`csv`, `tsv`, `xls`, `xlsx`, `xlsb`, `ods`) through native row-oriented extraction
@@ -40,14 +40,24 @@ accepts `docling` or `vision` and defaults to `docling`. Per-library updates use
 `PUT /v1/catalog/libraries/{libraryId}/recognition-policy`.
 
 PDF, DOCX, and PPTX layout extraction stays on the embedded Docling CPU runtime.
-Spreadsheets stay on the native tabular parser. Static raster image OCR can use
-either Docling or the active `vision` binding. If a library routes image OCR to
-`vision` and no vision binding is configured, ingestion fails loudly instead of
-silently falling back. Video files are not part of the current ingest surface.
+Spreadsheets stay on the native tabular parser. Static raster image OCR and
+embedded document-picture OCR use Docling unless the library policy explicitly
+selects `vision`. If a library routes image OCR to `vision` and no vision
+binding is configured, ingestion fails loudly instead of silently falling back.
+Video files are not part of the current ingest surface.
+
+Stored PDF revisions use a restart-safe Docling path: the worker reads page
+count first, extracts bounded page ranges, and persists each completed range as
+an ingest unit. `IRONRAG_DOCLING_PAGE_BATCH_SIZE` controls the persisted range
+size, `IRONRAG_DOCLING_PAGE_STREAM_WINDOW_PAGES` controls how many contiguous
+pages are streamed through one Docling process (default: 40 pages), and
+`IRONRAG_DOCLING_MAX_CONCURRENCY` bounds local Docling processes. Already
+completed page ranges are reused after worker restart, backend restart, lease
+loss, or network interruption.
 
 ### Table contract
 
-Tables have one canonical path:
+Tables have one standard path:
 
 - spreadsheet rows,
 - extracted table blocks from office documents,
@@ -59,11 +69,11 @@ all converge to the same markdown-table representation plus row-oriented normali
 
 ### Postgres
 
-Postgres stores canonical control and content metadata:
+Postgres stores core control and content metadata:
 
 - IAM, users, sessions, tokens, grants
 - workspaces and libraries
-- documents, revisions, heads, mutations, and async operations
+- documents, revisions, heads, mutations, async operations, and durable ingest units
 - costs, audit events, runtime execution metadata
 
 ### Blob storage
@@ -76,7 +86,7 @@ Arango stores structured document and graph material used by ingestion, retrieva
 
 ## 4. Chunking
 
-Chunking is canonical and format-agnostic:
+Chunking is unified and format-agnostic:
 
 - target size: `2800` characters
 - overlap: `280` characters
@@ -98,15 +108,22 @@ After normalization and chunking, IronRAG runs these enrichment stages:
 
 ### Graph extraction contract
 
-- entity types come from the canonical 10-type vocabulary
-- relation types come from the canonical relation catalog
+- entity types come from the shared 10-type vocabulary
+- relation types come from the shared relation catalog
 - `sub_type` is metadata, not node identity
 - node identity is based on normalized `(node_type, label)`
 - support counts accumulate across admitted evidence
+- provider JSON is repaired only for unambiguous UTF-8 transport damage, then
+  validated before persistence; unrepaired mojibake or control characters fail
+  the chunk loudly
 
-### Entity resolution contract
+### Graph key contract
 
-Entity resolution merges aliases and normalized duplicates into one runtime vocabulary. The result must stay coherent across:
+Runtime graph nodes are written by one key:
+normalized `(node_type, label)`. Extracted aliases can support lookup and
+relation endpoint matching, but there is no separate full-library alias
+resolution pass that rewrites node identity after ingestion. The result must
+stay coherent across:
 
 - query retrieval,
 - graph topology,
@@ -115,12 +132,12 @@ Entity resolution merges aliases and normalized duplicates into one runtime voca
 
 ## 6. Query and answer path
 
-The query path uses one canonical retrieval stack:
+The query path uses one retrieval stack:
 
 - lexical retrieval
 - vector retrieval
 - evidence assembly
-- canonical preflight answer preparation
+- preflight answer preparation
 - answer generation
 - verification
 
@@ -128,11 +145,14 @@ Exact-literal technical questions use the same answer contract but may take a le
 
 ### Turn contract
 
-`POST /v1/query/sessions/{sessionId}/turns` is a single JSON request/response
-turn. The response contains the completed grounded answer, evidence references,
-verifier state, and runtime execution handle. Incremental answer streaming is
-not a separate UI assistant execution path; MCP transport streaming remains
-isolated under `/v1/mcp`.
+`POST /v1/query/sessions/{sessionId}/turns` creates one persisted assistant
+turn and query execution. UI callers may request `text/event-stream`; the
+stream carries activity, failure, and completion events for that same
+execution, and the completion payload contains the grounded answer, evidence
+references, verifier state, and runtime execution handle. If the transport
+drops after backend work starts, the frontend recovers by reading the durable
+session result created after the request boundary instead of submitting another
+turn. MCP transport streaming remains isolated under `/v1/mcp`.
 
 ## 7. Worker model
 
@@ -148,7 +168,11 @@ Background processing is lease-based and stage-driven. The worker is responsible
 - finalization
 - web discovery and page materialization
 
-The worker pool and the HTTP API use the same canonical services and persistence model.
+The worker pool and the HTTP API use the same services and persistence model.
+Each claimed job runs with an independent heartbeat observer, so long provider
+or Docling calls cannot starve lease renewal. If the lease moves away, the
+pipeline stops and the job is reclaimed from durable state; finalization uses
+the active attempt lease rather than a stale in-memory success flag.
 
 ## 8. Library backup and restore
 
@@ -183,8 +207,8 @@ The import reads the manifest from the archive to determine what was exported. `
 
 ## 9. Hard invariants
 
-- One canonical path per source family; no alternate legacy ingestion branches.
-- One canonical table representation across file types.
-- One canonical query pipeline for UI and MCP clients.
-- One canonical graph vocabulary used by search, topology, and relation listing.
+- One standard path per source family; no alternate legacy ingestion branches.
+- One table representation across file types.
+- One shared query pipeline for UI and MCP clients.
+- One shared graph vocabulary used by search, topology, and relation listing.
 - No client-specific answer assembly logic outside the query service.

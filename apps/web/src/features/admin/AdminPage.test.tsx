@@ -315,6 +315,8 @@ describe('AdminPage integration', () => {
 
     expect(queryApiMock.getAssistantSystemPrompt).toHaveBeenCalledWith('library-1');
     expect(container.textContent).toContain('MCP system prompt');
+    expect(container.textContent).toContain('OpenClaw');
+    expect(container.textContent).toContain('Hermes');
   });
 
   it('renders the access tab trigger and the operations tab trigger side by side', async () => {

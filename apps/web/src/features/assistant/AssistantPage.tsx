@@ -44,6 +44,14 @@ export default function AssistantPage() {
 
   const { openDebugFor, setDebugContext, debugContext, debugLoadingId } = assistant;
 
+  const handleOpenDebug = useCallback(
+    (executionId: string) => {
+      setShowMcpTools(false);
+      void openDebugFor(executionId);
+    },
+    [openDebugFor],
+  );
+
   useEffect(() => {
     if (!showMcpTools) {
       return;
@@ -130,7 +138,7 @@ export default function AssistantPage() {
             t={t}
             messages={assistant.messages}
             onStarterPromptSelect={setInputText}
-            onOpenDebug={assistant.openDebugFor}
+            onOpenDebug={handleOpenDebug}
           />
           <Composer
             t={t}
@@ -157,7 +165,11 @@ export default function AssistantPage() {
         t={t}
         loadingId={!showMcpTools ? assistant.debugLoadingId : null}
         snapshot={!showMcpTools ? assistant.debugContext : null}
-        onClose={() => assistant.setDebugContext(null)}
+        error={!showMcpTools ? assistant.debugError : null}
+        onClose={() => {
+          assistant.setDebugContext(null);
+          assistant.setDebugError(null);
+        }}
       />
     </div>
   );

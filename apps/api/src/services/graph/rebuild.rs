@@ -14,8 +14,9 @@ use crate::{
     services::{
         graph::error::GraphServiceError,
         graph::extract::{
-            GraphExtractionCandidateSet, extraction_lifecycle_from_record,
-            extraction_recovery_summary_from_record,
+            GRAPH_EXTRACTION_VERSION, GraphExtractionCandidateSet,
+            extraction_lifecycle_from_record, extraction_recovery_summary_from_record,
+            repair_graph_extraction_candidate_set, repair_graph_extraction_normalized_json,
         },
         graph::merge::{
             GraphMergeScope, merge_chunk_graph_candidates, reconcile_merge_support_counts,
@@ -25,10 +26,6 @@ use crate::{
             next_projection_version, project_canonical_graph,
         },
         ingest::cancellation::{StageError, ensure_not_cancelled},
-        ingest::runtime::{
-            RuntimeStageUsageSummary, embed_runtime_graph_edges, embed_runtime_graph_nodes,
-            resolve_effective_provider_profile,
-        },
     },
     shared::extraction::text_quality::is_graph_extraction_text_eligible,
 };
@@ -37,16 +34,15 @@ pub async fn rebuild_library_graph(
     state: &AppState,
     library_id: Uuid,
 ) -> Result<GraphProjectionOutcome, GraphServiceError> {
-    let cancellation_token = CancellationToken::new();
     let snapshot =
         repositories::get_runtime_graph_snapshot(&state.persistence.postgres, library_id)
             .await
             .context("failed to load graph snapshot while planning rebuild")?;
     let projection_version = next_projection_version(snapshot.as_ref());
-    let provider_profile = resolve_effective_provider_profile(state, library_id).await?;
     let extractions = repositories::list_runtime_graph_extraction_records_by_library(
         &state.persistence.postgres,
         library_id,
+        GRAPH_EXTRACTION_VERSION,
     )
     .await
     .context("failed to reload runtime graph extraction records for rebuild")?;
@@ -55,7 +51,6 @@ pub async fn rebuild_library_graph(
         return ensure_empty_graph_snapshot(state, library_id, projection_version).await;
     }
 
-    let mut merged_any = false;
     let mut changed_node_ids = BTreeSet::new();
     let mut changed_edge_ids = BTreeSet::new();
 
@@ -138,10 +133,8 @@ pub async fn rebuild_library_graph(
             }),
             created_at: revision.as_ref().map(|value| value.created_at).unwrap_or_else(Utc::now),
         };
-        let candidates = serde_json::from_value::<GraphExtractionCandidateSet>(
-            record.normalized_output_json.clone(),
-        )
-        .unwrap_or_default();
+        let candidates =
+            repaired_graph_extraction_candidates(record.normalized_output_json.clone());
         if candidates.entities.is_empty() && candidates.relations.is_empty() {
             continue;
         }
@@ -166,7 +159,6 @@ pub async fn rebuild_library_graph(
         })?;
         changed_node_ids.extend(merge_outcome.summary_refresh_node_ids());
         changed_edge_ids.extend(merge_outcome.summary_refresh_edge_ids());
-        merged_any = true;
     }
 
     reconcile_merge_support_counts(
@@ -197,21 +189,6 @@ pub async fn rebuild_library_graph(
         return ensure_empty_graph_snapshot(state, library_id, projection_version).await;
     }
 
-    if merged_any {
-        embed_runtime_graph_nodes(state, &provider_profile, &merged_nodes, &cancellation_token)
-            .await
-            .context("failed to embed rebuilt graph nodes")?;
-        embed_runtime_graph_edges(
-            state,
-            &provider_profile,
-            &merged_nodes,
-            &merged_edges,
-            &cancellation_token,
-        )
-        .await
-        .context("failed to embed rebuilt graph edges")?;
-    }
-
     let projection_scope = GraphProjectionScope::new(library_id, projection_version);
     run_rebuild_projection(state, &projection_scope, "failed to project rebuilt graph")
         .await
@@ -223,7 +200,6 @@ pub struct RevisionGraphReconcileOutcome {
     pub projection: GraphProjectionOutcome,
     pub graph_contribution_count: usize,
     pub graph_ready: bool,
-    pub embedding_usage: Option<RuntimeStageUsageSummary>,
 }
 
 pub async fn reconcile_revision_graph(
@@ -330,13 +306,13 @@ pub async fn reconcile_revision_graph(
             graph_ready: false,
             graph_contribution_count: 0,
             projection,
-            embedding_usage: None,
         });
     }
 
     let extraction_records = repositories::list_runtime_graph_extraction_records_by_document(
         &state.persistence.postgres,
         document_id,
+        GRAPH_EXTRACTION_VERSION,
     )
     .await
     .with_context(|| {
@@ -387,7 +363,6 @@ pub async fn reconcile_revision_graph(
     #[derive(Debug, Default)]
     struct ChunkMergeOutcome {
         contribution: usize,
-        follow_up: bool,
         node_ids: Vec<Uuid>,
         edge_ids: Vec<Uuid>,
     }
@@ -439,8 +414,7 @@ pub async fn reconcile_revision_graph(
             // blocking pool so the async runtime keeps servicing
             // control-plane traffic while the deserializer works.
             let candidates = tokio::task::spawn_blocking(move || {
-                serde_json::from_value::<GraphExtractionCandidateSet>(normalized)
-                    .unwrap_or_default()
+                repaired_graph_extraction_candidates(normalized)
             })
             .await
             .unwrap_or_default();
@@ -514,7 +488,6 @@ pub async fn reconcile_revision_graph(
             );
             Ok(ChunkMergeOutcome {
                 contribution: merge_outcome.nodes.len() + merge_outcome.edges.len(),
-                follow_up: merge_outcome.has_projection_follow_up(),
                 node_ids: merge_outcome.summary_refresh_node_ids().into_iter().collect(),
                 edge_ids: merge_outcome.summary_refresh_edge_ids().into_iter().collect(),
             })
@@ -525,13 +498,11 @@ pub async fn reconcile_revision_graph(
     .await?;
 
     let mut graph_contribution_count = 0usize;
-    let mut merge_follow_up_required = false;
     let mut changed_node_ids = BTreeSet::new();
     let mut changed_edge_ids = BTreeSet::new();
     for outcome in merge_results {
         ensure_not_cancelled(cancellation_token)?;
         graph_contribution_count = graph_contribution_count.saturating_add(outcome.contribution);
-        merge_follow_up_required |= outcome.follow_up;
         changed_node_ids.extend(outcome.node_ids);
         changed_edge_ids.extend(outcome.edge_ids);
     }
@@ -548,73 +519,6 @@ pub async fn reconcile_revision_graph(
 
     let changed_edge_ids = changed_edge_ids.into_iter().collect::<Vec<_>>();
     let changed_node_ids = changed_node_ids.into_iter().collect::<Vec<_>>();
-    ensure_not_cancelled(cancellation_token)?;
-    let changed_edge_rows = repositories::list_admitted_runtime_graph_edges_by_ids(
-        &state.persistence.postgres,
-        library_id,
-        projection_scope.projection_version,
-        &changed_edge_ids,
-    )
-    .await
-    .context("failed to load changed graph edges during revision graph reconcile")?;
-    ensure_not_cancelled(cancellation_token)?;
-    let changed_node_rows = repositories::list_admitted_runtime_graph_nodes_by_ids(
-        &state.persistence.postgres,
-        library_id,
-        projection_scope.projection_version,
-        &changed_node_ids,
-    )
-    .await
-    .context("failed to load changed graph nodes during revision graph reconcile")?;
-    ensure_not_cancelled(cancellation_token)?;
-
-    let mut embedding_usage: Option<RuntimeStageUsageSummary> = None;
-    if merge_follow_up_required {
-        ensure_not_cancelled(cancellation_token)?;
-        let provider_profile = resolve_effective_provider_profile(state, library_id).await?;
-        let supporting_node_rows = if changed_edge_rows.is_empty() {
-            Vec::new()
-        } else {
-            let supporting_node_ids =
-                collect_supporting_node_ids(&changed_node_ids, &changed_edge_rows);
-            repositories::list_admitted_runtime_graph_nodes_by_ids(
-                &state.persistence.postgres,
-                library_id,
-                projection_scope.projection_version,
-                &supporting_node_ids,
-            )
-            .await
-            .context("failed to load supporting graph nodes during revision graph reconcile")?
-        };
-        if !changed_node_rows.is_empty() {
-            let node_usage = embed_runtime_graph_nodes(
-                state,
-                &provider_profile,
-                &changed_node_rows,
-                cancellation_token,
-            )
-            .await
-            .context("failed to embed changed graph nodes during revision graph reconcile")?;
-            embedding_usage = Some(node_usage);
-        }
-        if !changed_edge_rows.is_empty() {
-            let edge_usage = embed_runtime_graph_edges(
-                state,
-                &provider_profile,
-                &supporting_node_rows,
-                &changed_edge_rows,
-                cancellation_token,
-            )
-            .await
-            .context("failed to embed changed graph edges during revision graph reconcile")?;
-            if let Some(ref mut existing) = embedding_usage {
-                existing.merge(&edge_usage);
-            } else {
-                embedding_usage = Some(edge_usage);
-            }
-        }
-    }
-
     let source_truth_version =
         crate::services::query::support::invalidate_library_source_truth(state, library_id)
             .await
@@ -666,12 +570,21 @@ pub async fn reconcile_revision_graph(
         graph_ready: graph_contribution_count > 0 && projection.graph_status == GRAPH_STATUS_READY,
         graph_contribution_count,
         projection,
-        embedding_usage,
     })
 }
 
 fn is_graph_reconcile_chunk_text_eligible(text: &str) -> bool {
     is_graph_extraction_text_eligible(text)
+}
+
+fn repaired_graph_extraction_candidates(
+    normalized_output_json: serde_json::Value,
+) -> GraphExtractionCandidateSet {
+    serde_json::from_value::<GraphExtractionCandidateSet>(repair_graph_extraction_normalized_json(
+        normalized_output_json,
+    ))
+    .map(repair_graph_extraction_candidate_set)
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -766,18 +679,6 @@ fn synthesize_chunk_row(
     }
 }
 
-fn collect_supporting_node_ids(
-    changed_node_ids: &[Uuid],
-    changed_edges: &[repositories::RuntimeGraphEdgeRow],
-) -> Vec<Uuid> {
-    let mut node_ids = changed_node_ids.iter().copied().collect::<BTreeSet<_>>();
-    for edge in changed_edges {
-        node_ids.insert(edge.from_node_id);
-        node_ids.insert(edge.to_node_id);
-    }
-    node_ids.into_iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,7 +698,7 @@ mod tests {
                 chunk_id: Uuid::now_v7(),
                 provider_kind: "openai".to_string(),
                 model_name: "gpt-5.4-mini".to_string(),
-                extraction_version: "graph_extract_v1".to_string(),
+                extraction_version: "graph_extract".to_string(),
                 prompt_hash: "a".to_string(),
                 status: "completed".to_string(),
                 raw_output_json: serde_json::json!({}),
@@ -814,7 +715,7 @@ mod tests {
                 chunk_id: Uuid::now_v7(),
                 provider_kind: "openai".to_string(),
                 model_name: "gpt-5.4-mini".to_string(),
-                extraction_version: "graph_extract_v1".to_string(),
+                extraction_version: "graph_extract".to_string(),
                 prompt_hash: "b".to_string(),
                 status: "completed".to_string(),
                 raw_output_json: serde_json::json!({}),
@@ -831,7 +732,7 @@ mod tests {
                 chunk_id: Uuid::now_v7(),
                 provider_kind: "openai".to_string(),
                 model_name: "gpt-5.4-mini".to_string(),
-                extraction_version: "graph_extract_v1".to_string(),
+                extraction_version: "graph_extract".to_string(),
                 prompt_hash: "c".to_string(),
                 status: "completed".to_string(),
                 raw_output_json: serde_json::json!({}),

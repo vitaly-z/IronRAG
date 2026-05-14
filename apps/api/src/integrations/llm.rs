@@ -258,10 +258,8 @@ pub struct ToolUseRequest {
     pub extra_parameters_json: serde_json::Value,
     /// When true, the gateway sends `tool_choice="required"` so the
     /// provider must invoke at least one declared tool on this turn.
-    /// The MCP-agent loop sets this on the first iteration to satisfy
-    /// the constitution §16 requirement that UI answers stay grounded.
-    /// Default `false` keeps the existing `tool_choice="auto"` behavior
-    /// for callers that do not need a forced tool call.
+    /// Default `false` keeps normal `tool_choice="auto"` behavior for
+    /// callers that want the model to decide whether tools are useful.
     #[serde(default)]
     pub require_tool_call: bool,
 }
@@ -409,6 +407,43 @@ pub struct UnifiedGateway {
     client: Client,
 }
 
+async fn read_provider_response_body(
+    response: reqwest::Response,
+    provider_kind: &str,
+    operation: &str,
+) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, Vec<u8>), ProviderCallError> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body_bytes = response
+        .bytes()
+        .await
+        .map_err(|source| {
+            ProviderCallError::response_body(
+                format!("failed to read {operation} response body: provider={provider_kind}"),
+                source,
+            )
+        })?
+        .to_vec();
+    Ok((status, headers, body_bytes))
+}
+
+fn provider_response_body_text(body_bytes: &[u8]) -> String {
+    String::from_utf8_lossy(body_bytes).into_owned()
+}
+
+fn parse_provider_json_body(
+    body_bytes: &[u8],
+    provider_kind: &str,
+    operation: &str,
+) -> Result<serde_json::Value, ProviderCallError> {
+    serde_json::from_slice::<serde_json::Value>(body_bytes).map_err(|source| {
+        ProviderCallError::json(
+            format!("failed to parse {operation} response from provider {provider_kind}"),
+            source,
+        )
+    })
+}
+
 impl UnifiedGateway {
     #[must_use]
     pub fn from_settings(settings: &Settings) -> Self {
@@ -450,19 +485,11 @@ impl UnifiedGateway {
                         )
                     })?;
 
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body_text = response.text().await.map_err(|source| {
-                    ProviderCallError::response_body(
-                        format!(
-                            "failed to read provider response body: provider={}",
-                            request.provider_kind
-                        ),
-                        source,
-                    )
-                })?;
+                let (status, headers, body_bytes) =
+                    read_provider_response_body(response, request.provider_kind, "chat").await?;
 
                 if !status.is_success() {
+                    let body_text = provider_response_body_text(&body_bytes);
                     return Err(provider_http_status_error(
                         request.provider_kind,
                         status,
@@ -471,8 +498,7 @@ impl UnifiedGateway {
                     ));
                 }
 
-                let body = serde_json::from_str::<serde_json::Value>(&body_text)
-                    .unwrap_or_else(|_| serde_json::json!({ "raw_body": body_text }));
+                let body = parse_provider_json_body(&body_bytes, request.provider_kind, "chat")?;
 
                 let output_text = body
                     .get("choices")
@@ -530,7 +556,9 @@ impl UnifiedGateway {
                 }
 
                 let headers = response.headers().clone();
-                let body_text = response.text().await.unwrap_or_default();
+                let body_bytes =
+                    response.bytes().await.map(|bytes| bytes.to_vec()).unwrap_or_default();
+                let body_text = provider_response_body_text(&body_bytes);
                 Err(provider_http_status_error(request.provider_kind, status, &headers, &body_text))
             },
             RetryPolicy::default(),
@@ -1067,18 +1095,11 @@ impl LlmGateway for UnifiedGateway {
                         )
                     })?;
 
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body_text = response.text().await.map_err(|source| {
-                    ProviderCallError::response_body(
-                        format!(
-                            "failed to read tool-use response body: provider={}",
-                            request.provider_kind
-                        ),
-                        source,
-                    )
-                })?;
+                let (status, headers, body_bytes) =
+                    read_provider_response_body(response, &request.provider_kind, "tool-use")
+                        .await?;
                 if !status.is_success() {
+                    let body_text = provider_response_body_text(&body_bytes);
                     return Err(provider_http_status_error(
                         &request.provider_kind,
                         status,
@@ -1088,15 +1109,7 @@ impl LlmGateway for UnifiedGateway {
                 }
 
                 let body =
-                    serde_json::from_str::<serde_json::Value>(&body_text).map_err(|source| {
-                        ProviderCallError::json(
-                            format!(
-                                "failed to parse tool-use response from provider {}",
-                                request.provider_kind
-                            ),
-                            source,
-                        )
-                    })?;
+                    parse_provider_json_body(&body_bytes, &request.provider_kind, "tool-use")?;
 
                 parse_tool_use_response(&body)
             },
@@ -1214,7 +1227,9 @@ impl LlmGateway for UnifiedGateway {
                 }
 
                 let headers = response.headers().clone();
-                let body_text = response.text().await.unwrap_or_default();
+                let body_bytes =
+                    response.bytes().await.map(|bytes| bytes.to_vec()).unwrap_or_default();
+                let body_text = provider_response_body_text(&body_bytes);
                 Err(provider_http_status_error(
                     &request.provider_kind,
                     status,
@@ -1236,10 +1251,9 @@ impl LlmGateway for UnifiedGateway {
             finish_reason,
             usage_json,
             // Streaming path does not yet capture `reasoning_content`.
-            // The non-streaming gateway is the canonical path for the
-            // UI MCP-agent loop (run_mcp_agent_turn → generate_with_tools),
-            // and streaming is reserved for direct provider passthroughs
-            // that do not echo reasoning back to the model.
+            // The non-streaming gateway is the canonical tool-use path; streaming
+            // is reserved for direct provider passthroughs that do not echo
+            // reasoning back to the model.
             reasoning_content: None,
         })
     }
@@ -1285,18 +1299,11 @@ impl LlmGateway for UnifiedGateway {
                         )
                     })?;
 
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body_text = response.text().await.map_err(|source| {
-                    ProviderCallError::response_body(
-                        format!(
-                            "failed to read embedding response body: provider={}",
-                            request.provider_kind
-                        ),
-                        source,
-                    )
-                })?;
+                let (status, headers, body_bytes) =
+                    read_provider_response_body(response, &request.provider_kind, "embedding")
+                        .await?;
                 if !status.is_success() {
+                    let body_text = provider_response_body_text(&body_bytes);
                     return Err(provider_http_status_error(
                         &request.provider_kind,
                         status,
@@ -1304,15 +1311,7 @@ impl LlmGateway for UnifiedGateway {
                         &body_text,
                     ));
                 }
-                serde_json::from_str::<serde_json::Value>(&body_text).map_err(|source| {
-                    ProviderCallError::json(
-                        format!(
-                            "failed to parse embedding response from provider {}",
-                            request.provider_kind
-                        ),
-                        source,
-                    )
-                })
+                parse_provider_json_body(&body_bytes, &request.provider_kind, "embedding")
             },
             RetryPolicy::default(),
         )
@@ -1407,18 +1406,14 @@ impl LlmGateway for UnifiedGateway {
                         )
                     })?;
 
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body_text = response.text().await.map_err(|source| {
-                    ProviderCallError::response_body(
-                        format!(
-                            "failed to read embedding batch response body: provider={}",
-                            request.provider_kind
-                        ),
-                        source,
-                    )
-                })?;
+                let (status, headers, body_bytes) = read_provider_response_body(
+                    response,
+                    &request.provider_kind,
+                    "embedding batch",
+                )
+                .await?;
                 if !status.is_success() {
+                    let body_text = provider_response_body_text(&body_bytes);
                     return Err(provider_http_status_error(
                         &request.provider_kind,
                         status,
@@ -1426,15 +1421,7 @@ impl LlmGateway for UnifiedGateway {
                         &body_text,
                     ));
                 }
-                serde_json::from_str::<serde_json::Value>(&body_text).map_err(|source| {
-                    ProviderCallError::json(
-                        format!(
-                            "failed to parse embedding batch response from provider {}",
-                            request.provider_kind
-                        ),
-                        source,
-                    )
-                })
+                parse_provider_json_body(&body_bytes, &request.provider_kind, "embedding batch")
             },
             RetryPolicy::default(),
         )
@@ -1521,7 +1508,7 @@ mod tests {
         OpenAiCompatibleRequest, OpenAiCompatibleToolDef, OpenAiCompatibleToolUseChatRequest,
         ProviderAuthScheme, ProviderStructuredOutputMode, ProviderTokenLimitParameter,
         UnifiedGateway, consume_openai_compatible_stream_frame, extract_message_content_text,
-        provider_response_format, provider_system_prompt,
+        parse_provider_json_body, provider_response_format, provider_system_prompt,
     };
 
     #[test]
@@ -1537,6 +1524,18 @@ mod tests {
             {"type": "text", "text": {"value": "world"}}
         ]);
         assert_eq!(extract_message_content_text(&value), "hello\nworld");
+    }
+
+    #[test]
+    fn parses_provider_json_from_utf8_bytes_without_charset_roundtrip() {
+        let body = b"{\"value\":\"\xd0\xa1\xd1\x82\xd1\x80\xd0\xbe\xd0\xba\xd0\xb0\"}";
+        let latin1_misdecoded = body.iter().map(|byte| char::from(*byte)).collect::<String>();
+        assert!(latin1_misdecoded.contains('\u{00d0}'));
+
+        let parsed =
+            parse_provider_json_body(body, "provider-alpha", "chat").expect("body is UTF-8 JSON");
+
+        assert_eq!(parsed["value"], "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}");
     }
 
     #[test]

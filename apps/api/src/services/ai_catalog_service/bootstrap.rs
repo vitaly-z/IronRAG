@@ -222,11 +222,10 @@ fn bootstrap_provider_preset_profile(
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
 
-    // Agent purpose drives the in-process MCP-agent loop and shadows the
-    // QueryAnswer profile (same chat model, same provider). Provider metadata
-    // declares only QueryAnswer; we synthesize the Agent twin so bootstrap
-    // can seed an Agent preset+binding without each provider declaring it
-    // twice.
+    // Agent purpose shadows the QueryAnswer profile (same chat model, same
+    // provider). Provider metadata declares only QueryAnswer; we synthesize the
+    // Agent twin so bootstrap can seed an Agent preset+binding without each
+    // provider declaring it twice.
     if !profiles.iter().any(|profile| profile.purpose == AiBindingPurpose::Agent)
         && let Some(answer) =
             profiles.iter().find(|profile| profile.purpose == AiBindingPurpose::QueryAnswer)

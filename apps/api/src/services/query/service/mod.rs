@@ -14,8 +14,6 @@ mod formatting;
 mod session;
 mod turn;
 
-pub(crate) use session::{map_conversation_row, normalize_required_text};
-
 #[cfg(test)]
 mod tests;
 

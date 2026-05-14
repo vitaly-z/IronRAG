@@ -1,18 +1,27 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::get,
 };
 use chrono::Utc;
+use futures::stream;
 use ironrag_contracts;
 use serde::{Deserialize, Serialize};
+use std::{convert::Infallible, time::Duration};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::{
     app::state::AppState,
     domains::agent_runtime::{
         RuntimeExecutionSummary, RuntimePolicyDecisionSummary, RuntimePolicySummary,
+        RuntimeSurfaceKind,
     },
     domains::query::{
         PreparedSegmentReference, QueryChunkReference, QueryConversation, QueryConversationDetail,
@@ -32,7 +41,7 @@ use crate::{
     services::{
         iam::audit::{AppendAuditEventCommand, AppendQueryExecutionAuditCommand},
         mcp::access::library_catalog_ref,
-        query::service::CreateConversationCommand,
+        query::service::{CreateConversationCommand, ExecuteConversationTurnCommand},
     },
 };
 
@@ -57,7 +66,40 @@ pub struct CreateSessionRequest {
 pub struct CreateSessionTurnRequest {
     content_text: String,
     include_debug: Option<bool>,
+    top_k: Option<usize>,
 }
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AssistantTurnStreamEvent {
+    Activity { event: AssistantActivityEvent },
+    Completed { detail: ironrag_contracts::assistant::AssistantExecutionDetail },
+    Failed { message: String },
+}
+
+#[derive(Debug, Serialize)]
+struct AssistantActivityEvent {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deadline_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_execution_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_preview: Option<String>,
+}
+
+const ASSISTANT_TURN_STREAM_DEADLINE_MS: u64 = 240_000;
+const ASSISTANT_TURN_ACTIVITY_INTERVAL: Duration = Duration::from_secs(5);
+const ASSISTANT_TURN_ACTIVITY_TOOL: &str = "grounded_answer";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -316,25 +358,236 @@ pub async fn create_session_turn(
     auth: AuthContext,
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
+    headers: HeaderMap,
     Json(payload): Json<CreateSessionTurnRequest>,
 ) -> Result<Response, ApiError> {
     let started_at = std::time::Instant::now();
     let span = tracing::Span::current();
-    let _ = load_query_session_and_authorize(&auth, &state, session_id, POLICY_QUERY_RUN).await?;
-    // TODO(observability): thread request_id from middleware instead of generating here
-    let request_id = Uuid::new_v4().to_string();
-    let outcome = crate::services::query::mcp_agent::turn::run_mcp_agent_turn(
-        &state,
-        &request_id,
-        &auth,
-        session_id,
-        payload.content_text,
-        payload.include_debug.unwrap_or(false),
-    )
-    .await?;
+    if accepts_event_stream(&headers) {
+        let stream = create_session_turn_event_stream(auth, state, session_id, payload).await?;
+        return Ok(stream.into_response());
+    }
+    let outcome = execute_ui_session_turn(&state, &auth, session_id, payload).await?;
     append_query_execution_audit(state.clone(), auth.principal_id, "ui", &outcome).await;
     span.record("elapsed_ms", started_at.elapsed().as_millis() as u64);
     Ok(Json(map_turn_execution_response(outcome)).into_response())
+}
+
+#[tracing::instrument(
+    level = "info",
+    name = "http.create_session_turn_event_stream",
+    skip_all,
+    fields(session_id = %session_id)
+)]
+async fn create_session_turn_event_stream(
+    auth: AuthContext,
+    state: AppState,
+    session_id: Uuid,
+    payload: CreateSessionTurnRequest,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let _ = load_query_session_and_authorize(&auth, &state, session_id, POLICY_QUERY_RUN).await?;
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<AssistantTurnStreamEvent>();
+    let state_for_task = state.clone();
+    let auth_for_task = auth.clone();
+
+    tokio::spawn(async move {
+        send_assistant_activity(
+            &sender,
+            AssistantActivityEvent {
+                event_type: "started",
+                deadline_ms: Some(ASSISTANT_TURN_STREAM_DEADLINE_MS),
+                iteration: None,
+                tool_name: None,
+                elapsed_ms: None,
+                is_error: None,
+                child_execution_id: None,
+                result_preview: None,
+            },
+        );
+        send_assistant_activity(
+            &sender,
+            AssistantActivityEvent {
+                event_type: "tool_call_started",
+                deadline_ms: None,
+                iteration: Some(1),
+                tool_name: Some(ASSISTANT_TURN_ACTIVITY_TOOL),
+                elapsed_ms: None,
+                is_error: None,
+                child_execution_id: None,
+                result_preview: None,
+            },
+        );
+
+        let progress_started_at = Instant::now();
+        let progress_sender = sender.clone();
+        let progress_task = tokio::spawn(async move {
+            loop {
+                sleep(ASSISTANT_TURN_ACTIVITY_INTERVAL).await;
+                send_assistant_activity(
+                    &progress_sender,
+                    AssistantActivityEvent {
+                        event_type: "tool_call_progress",
+                        deadline_ms: None,
+                        iteration: Some(1),
+                        tool_name: Some(ASSISTANT_TURN_ACTIVITY_TOOL),
+                        elapsed_ms: Some(progress_started_at.elapsed().as_millis() as u64),
+                        is_error: None,
+                        child_execution_id: None,
+                        result_preview: None,
+                    },
+                );
+            }
+        });
+
+        let result =
+            execute_ui_session_turn(&state_for_task, &auth_for_task, session_id, payload).await;
+        progress_task.abort();
+
+        match result {
+            Ok(outcome) => {
+                send_assistant_activity(
+                    &sender,
+                    AssistantActivityEvent {
+                        event_type: "tool_call_finished",
+                        deadline_ms: None,
+                        iteration: Some(1),
+                        tool_name: Some(ASSISTANT_TURN_ACTIVITY_TOOL),
+                        elapsed_ms: Some(progress_started_at.elapsed().as_millis() as u64),
+                        is_error: Some(false),
+                        child_execution_id: Some(outcome.execution.id),
+                        result_preview: Some(format!(
+                            "verification={}",
+                            verification_state_stream_label(&outcome.verification_state)
+                        )),
+                    },
+                );
+                append_query_execution_audit(
+                    state_for_task.clone(),
+                    auth_for_task.principal_id,
+                    "ui",
+                    &outcome,
+                )
+                .await;
+                send_assistant_activity(
+                    &sender,
+                    AssistantActivityEvent {
+                        event_type: "persisting",
+                        deadline_ms: None,
+                        iteration: None,
+                        tool_name: None,
+                        elapsed_ms: None,
+                        is_error: None,
+                        child_execution_id: None,
+                        result_preview: None,
+                    },
+                );
+                send_turn_stream_event(
+                    &sender,
+                    AssistantTurnStreamEvent::Completed {
+                        detail: map_turn_execution_response(outcome),
+                    },
+                );
+            }
+            Err(error) => {
+                send_assistant_activity(
+                    &sender,
+                    AssistantActivityEvent {
+                        event_type: "tool_call_finished",
+                        deadline_ms: None,
+                        iteration: Some(1),
+                        tool_name: Some(ASSISTANT_TURN_ACTIVITY_TOOL),
+                        elapsed_ms: Some(progress_started_at.elapsed().as_millis() as u64),
+                        is_error: Some(true),
+                        child_execution_id: None,
+                        result_preview: Some(error.to_string()),
+                    },
+                );
+                send_turn_stream_event(
+                    &sender,
+                    AssistantTurnStreamEvent::Failed { message: error.to_string() },
+                );
+            }
+        }
+    });
+
+    let stream = stream::unfold(receiver, |mut receiver| async {
+        receiver.recv().await.map(|payload| {
+            let event = Event::default()
+                .event("assistant_turn")
+                .json_data(payload)
+                .unwrap_or_else(|error| {
+                    Event::default()
+                        .event("assistant_turn")
+                        .data(format!(
+                            r#"{{"type":"failed","message":"failed to serialize stream event: {error}"}}"#
+                        ))
+                });
+            (Ok(event), receiver)
+        })
+    });
+
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(10)).text("keep-alive")))
+}
+
+async fn execute_ui_session_turn(
+    state: &AppState,
+    auth: &AuthContext,
+    session_id: Uuid,
+    payload: CreateSessionTurnRequest,
+) -> Result<crate::services::query::service::QueryTurnExecutionResult, ApiError> {
+    let _ = load_query_session_and_authorize(auth, state, session_id, POLICY_QUERY_RUN).await?;
+    state
+        .canonical_services
+        .query
+        .execute_turn(
+            state,
+            ExecuteConversationTurnCommand {
+                conversation_id: session_id,
+                author_principal_id: Some(auth.principal_id),
+                surface_kind: RuntimeSurfaceKind::Ui,
+                content_text: payload.content_text,
+                external_prior_turns: Vec::new(),
+                top_k: resolve_query_turn_top_k(payload.top_k),
+                include_debug: payload.include_debug.unwrap_or(false),
+            },
+        )
+        .await
+}
+
+fn send_turn_stream_event(
+    sender: &UnboundedSender<AssistantTurnStreamEvent>,
+    event: AssistantTurnStreamEvent,
+) {
+    let _ = sender.send(event);
+}
+
+fn send_assistant_activity(
+    sender: &UnboundedSender<AssistantTurnStreamEvent>,
+    event: AssistantActivityEvent,
+) {
+    send_turn_stream_event(sender, AssistantTurnStreamEvent::Activity { event });
+}
+
+const fn verification_state_stream_label(state: &QueryVerificationState) -> &'static str {
+    match state {
+        QueryVerificationState::NotRun => "not_run",
+        QueryVerificationState::Verified => "verified",
+        QueryVerificationState::PartiallySupported => "partially_supported",
+        QueryVerificationState::Conflicting => "conflicting",
+        QueryVerificationState::InsufficientEvidence => "insufficient_evidence",
+        QueryVerificationState::Failed => "failed",
+    }
+}
+
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value.split(',').any(|segment| segment.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+        .unwrap_or(false)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -373,10 +626,7 @@ pub async fn get_execution(
 }
 
 /// Returns the raw LLM request/response chain that was sent to the
-/// provider for this assistant execution, if it is still in the
-/// in-memory debug cache. The cache is volatile (bounded FIFO) so old
-/// executions return 404 — that is by design, not an error the UI
-/// should treat as fatal.
+/// provider for this assistant execution.
 #[tracing::instrument(
     level = "info",
     name = "http.query.get_execution_llm_context",
@@ -390,10 +640,10 @@ pub async fn get_execution(
     operation_id = "getQueryExecutionLlmContext",
     params(("executionId" = uuid::Uuid, Path, description = "Query execution identifier")),
     responses(
-        (status = 200, description = "Volatile in-memory LLM request/response capture for the execution", body = crate::services::query::llm_context_debug::LlmContextSnapshot),
+        (status = 200, description = "Durable LLM request/response capture for the execution", body = crate::services::query::llm_context_debug::LlmContextSnapshot),
         (status = 401, description = "Caller is not authenticated"),
         (status = 403, description = "Caller is not authorized for the execution"),
-        (status = 404, description = "Execution not found or no longer in the debug cache"),
+        (status = 404, description = "Execution not found or no LLM context snapshot was recorded"),
     ),
 )]
 pub async fn get_execution_llm_context(
@@ -403,11 +653,14 @@ pub async fn get_execution_llm_context(
 ) -> Result<Json<crate::services::query::llm_context_debug::LlmContextSnapshot>, ApiError> {
     let _ =
         load_query_execution_and_authorize(&auth, &state, execution_id, POLICY_QUERY_READ).await?;
-    state
-        .llm_context_debug
-        .get(execution_id)
-        .map(Json)
-        .ok_or_else(|| ApiError::resource_not_found("llm_context_snapshot", execution_id))
+    crate::services::query::llm_context_debug::load_snapshot(
+        &state.persistence.postgres,
+        execution_id,
+    )
+    .await
+    .map_err(|error| ApiError::internal_with_log(error, "internal"))?
+    .map(Json)
+    .ok_or_else(|| ApiError::resource_not_found("llm_context_snapshot", execution_id))
 }
 
 fn map_session_list_item_with_defaults(

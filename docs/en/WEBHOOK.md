@@ -10,7 +10,7 @@
 
 ## Overview
 
-IronRAG sends outbound webhooks to notify external systems about state changes. Inbound processing of vendor events (Confluence, MediaWiki, Notion, etc.) is the responsibility of an external middleware layer that calls IronRAG's existing canonical upload/replace/delete HTTP API directly.
+IronRAG sends outbound webhooks to notify external systems about state changes. Inbound processing of vendor events (Confluence, MediaWiki, Notion, etc.) is the responsibility of an external middleware layer that calls IronRAG's existing upload/replace/delete HTTP API directly.
 
 **Outbound** — `webhook_subscription` registers HTTPS endpoints that receive HMAC-signed events about IronRAG state changes (`revision.ready`, `document.deleted`). Delivery is durable: every send is an `ingest_job` with `job_kind=webhook_delivery`, and the existing worker pool handles lease/heartbeat/retry semantics. Failures are retried with exponential backoff up to 8 attempts (cap 6 hours), then marked `abandoned`.
 
@@ -40,7 +40,7 @@ Content-Type: application/json
 |-------|-------|
 | `workspace_id` | Scope. Only events from this workspace are dispatched |
 | `library_id` | Optional. If set, only events from this library; null = all libraries in the workspace |
-| `event_types` | Non-empty array of canonical event names |
+| `event_types` | Non-empty array of event names |
 | `secret` | HMAC-SHA256 key for outgoing signatures |
 | `custom_headers` | Free-form HTTP headers added to every delivery |
 | `active` | Defaults to `true`; set `false` to pause |
@@ -135,7 +135,7 @@ Replay protection: receivers SHOULD reject deliveries whose `t=` is outside ±5 
 
 ## Image-only change detection
 
-When a PDF, DOCX, or PPTX swaps an embedded picture without changing OCR-extractable text, the existing `text_checksum` would be unchanged and the canonical chunk-reuse plan would skip re-embedding. To correct this, IronRAG also computes a revision-level `image_checksum` (canonical sort of all extracted image bytes, then SHA-256). When `parent.image_checksum != new.image_checksum`, the chunk-reuse plan is bypassed and embeddings + graph extraction recompute fully for that revision. `text_checksum` semantics are preserved (text-only).
+When a PDF, DOCX, or PPTX swaps an embedded picture without changing OCR-extractable text, the existing `text_checksum` would be unchanged and the standard chunk-reuse plan would skip re-embedding. To correct this, IronRAG also computes a revision-level `image_checksum` (sorted extracted image bytes, then SHA-256). When `parent.image_checksum != new.image_checksum`, the chunk-reuse plan is bypassed and embeddings + graph extraction recompute fully for that revision. `text_checksum` semantics are preserved (text-only).
 
 ## Operational notes
 
@@ -167,4 +167,4 @@ def verify_and_forward(secret: bytes, header: str, body: bytes):
         )
 ```
 
-For vendor inbound (Confluence page updated → IronRAG document replaced), see the external middleware project — IronRAG's upload/replace/delete API is the canonical entry point.
+For vendor inbound (Confluence page updated → IronRAG document replaced), see the external middleware project — IronRAG's upload/replace/delete API is the entry point.

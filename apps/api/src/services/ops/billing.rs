@@ -54,6 +54,7 @@ pub struct CaptureQueryExecutionBillingCommand {
     pub binding_id: Option<Uuid>,
     pub provider_kind: String,
     pub model_name: String,
+    pub call_kind: String,
     pub usage_json: Value,
 }
 
@@ -340,7 +341,7 @@ impl BillingService {
                 binding_id: command.binding_id,
                 provider_kind: command.provider_kind,
                 model_name: command.model_name,
-                call_kind: "query_answer".to_string(),
+                call_kind: command.call_kind,
                 usage_json: command.usage_json,
             },
         )
@@ -450,10 +451,12 @@ impl BillingService {
         else {
             return Ok(None);
         };
-        let Some(model_catalog) = ai_repository::get_model_catalog_by_provider_and_name(
+        let model_capability_kind = billing_model_capability_kind(&command.call_kind);
+        let Some(model_catalog) = ai_repository::get_model_catalog_by_provider_name_and_capability(
             &state.persistence.postgres,
             &command.provider_kind,
             &command.model_name,
+            model_capability_kind,
         )
         .await
         .map_err(|e| ApiError::internal_with_log(e, "internal"))?
@@ -819,6 +822,13 @@ fn extract_price_variant_key(usage_json: &Value) -> String {
         .to_string()
 }
 
+fn billing_model_capability_kind(call_kind: &str) -> &'static str {
+    match call_kind {
+        "embed_chunk" | "query_retrieve" => "embedding",
+        _ => "chat",
+    }
+}
+
 fn map_provider_call_row(
     row: billing_repository::BillingProviderCallRow,
 ) -> Result<BillingProviderCall, String> {
@@ -878,5 +888,24 @@ const fn execution_owner_kind_key(value: BillingExecutionOwnerKind) -> &'static 
         BillingExecutionOwnerKind::QueryExecution => "query_execution",
         BillingExecutionOwnerKind::GraphExtractionAttempt => "graph_extraction_attempt",
         BillingExecutionOwnerKind::IngestAttempt => "ingest_attempt",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::billing_model_capability_kind;
+
+    #[test]
+    fn embedding_billing_call_kinds_resolve_embedding_models() {
+        for call_kind in ["embed_chunk", "query_retrieve"] {
+            assert_eq!(billing_model_capability_kind(call_kind), "embedding");
+        }
+    }
+
+    #[test]
+    fn non_embedding_billing_call_kinds_resolve_chat_models() {
+        for call_kind in ["graph_extract", "query_answer", "query_compile", "vision_extract"] {
+            assert_eq!(billing_model_capability_kind(call_kind), "chat");
+        }
     }
 }

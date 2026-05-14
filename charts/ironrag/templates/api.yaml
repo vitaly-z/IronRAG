@@ -48,6 +48,8 @@ spec:
               value: api
             - name: IRONRAG_SERVICE_NAME
               value: ironrag-api
+            - name: OTEL_SERVICE_NAME
+              value: ironrag-api
           readinessProbe:
             httpGet:
               path: /v1/ready

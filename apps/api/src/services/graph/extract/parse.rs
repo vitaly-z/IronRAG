@@ -5,6 +5,11 @@ use crate::services::graph::error::GraphServiceError;
 use crate::shared::extraction::text_quality::{
     is_low_confidence_text, is_structurally_unstable_fragment,
 };
+use crate::shared::text_encoding::{
+    contains_disallowed_controls, contains_repairable_utf8_latin1_mojibake,
+    json_contains_repairable_utf8_latin1_mojibake, repair_json_string_values,
+    repair_utf8_latin1_mojibake,
+};
 
 use super::types::{
     FailedNormalizationAttempt, GraphEntityCandidate, GraphExtractionCandidateSet,
@@ -61,6 +66,7 @@ pub fn sanitize_graph_extraction_candidate_set(
         return GraphExtractionCandidateSet::default();
     }
 
+    let candidate_set = repair_graph_extraction_candidate_set(candidate_set);
     let entities = candidate_set
         .entities
         .into_iter()
@@ -92,6 +98,117 @@ pub fn sanitize_graph_extraction_candidate_set(
         .collect::<Vec<_>>();
 
     GraphExtractionCandidateSet { entities, relations }
+}
+
+pub(crate) fn repair_graph_extraction_candidate_set(
+    candidate_set: GraphExtractionCandidateSet,
+) -> GraphExtractionCandidateSet {
+    let entities = candidate_set
+        .entities
+        .into_iter()
+        .filter_map(|entity| {
+            let label = repair_extracted_text(&entity.label);
+            if label.is_empty() || contains_control_or_mojibake(&label) {
+                return None;
+            }
+            let aliases = entity
+                .aliases
+                .into_iter()
+                .map(|alias| repair_extracted_text(&alias))
+                .filter(|alias| !alias.is_empty() && !contains_control_or_mojibake(alias))
+                .collect::<Vec<_>>();
+            let sub_type = entity
+                .sub_type
+                .as_deref()
+                .map(repair_extracted_text)
+                .filter(|value| !value.is_empty() && !contains_control_or_mojibake(value));
+            let summary = entity
+                .summary
+                .as_deref()
+                .map(repair_extracted_text)
+                .filter(|value| !value.is_empty() && !contains_control_or_mojibake(value));
+            Some(GraphEntityCandidate { label, aliases, sub_type, summary, ..entity })
+        })
+        .collect::<Vec<_>>();
+
+    let relations = candidate_set
+        .relations
+        .into_iter()
+        .filter_map(|relation| {
+            let source_label = repair_extracted_text(&relation.source_label);
+            let target_label = repair_extracted_text(&relation.target_label);
+            if source_label.is_empty()
+                || target_label.is_empty()
+                || contains_control_or_mojibake(&source_label)
+                || contains_control_or_mojibake(&target_label)
+            {
+                return None;
+            }
+            let summary = relation
+                .summary
+                .as_deref()
+                .map(repair_extracted_text)
+                .filter(|value| !value.is_empty() && !contains_control_or_mojibake(value));
+            Some(GraphRelationCandidate { source_label, target_label, summary, ..relation })
+        })
+        .collect::<Vec<_>>();
+
+    GraphExtractionCandidateSet { entities, relations }
+}
+
+pub(crate) fn graph_extraction_candidate_set_contains_encoding_damage(
+    candidate_set: &GraphExtractionCandidateSet,
+) -> bool {
+    candidate_set.entities.iter().any(|entity| {
+        contains_control_or_mojibake(&entity.label)
+            || entity.aliases.iter().any(|alias| contains_control_or_mojibake(alias))
+            || entity.sub_type.as_deref().is_some_and(contains_control_or_mojibake)
+            || entity.summary.as_deref().is_some_and(contains_control_or_mojibake)
+    }) || candidate_set.relations.iter().any(|relation| {
+        contains_control_or_mojibake(&relation.source_label)
+            || contains_control_or_mojibake(&relation.target_label)
+            || relation.summary.as_deref().is_some_and(contains_control_or_mojibake)
+    })
+}
+
+pub(crate) fn canonical_graph_extraction_normalized_json(
+    candidate_set: GraphExtractionCandidateSet,
+) -> serde_json::Value {
+    let repaired = repair_graph_extraction_candidate_set(candidate_set);
+    let value = serde_json::to_value(&repaired)
+        .unwrap_or_else(|_| serde_json::json!({ "entities": [], "relations": [] }));
+    let repaired = repair_graph_extraction_normalized_json(value);
+    if json_contains_repairable_utf8_latin1_mojibake(&repaired) {
+        tracing::error!(
+            "graph extraction normalized output still contains encoding damage after canonical repair"
+        );
+        return serde_json::json!({ "entities": [], "relations": [] });
+    }
+    repaired
+}
+
+pub(crate) fn repair_graph_extraction_normalized_json(
+    value: serde_json::Value,
+) -> serde_json::Value {
+    let repaired = repair_json_string_values(value);
+    match serde_json::from_value::<GraphExtractionCandidateSet>(repaired.clone()) {
+        Ok(candidate_set) => {
+            serde_json::to_value(repair_graph_extraction_candidate_set(candidate_set))
+                .unwrap_or_else(|_| serde_json::json!({ "entities": [], "relations": [] }))
+        }
+        Err(_) => repaired,
+    }
+}
+
+/// Reject labels that contain C0/C1 control characters or look like
+/// double-encoded UTF-8 (mojibake). LLM providers occasionally emit
+/// `\u0090` etc. which cascade into garbled graph labels.
+fn contains_control_or_mojibake(label: &str) -> bool {
+    contains_disallowed_controls(label) || contains_repairable_utf8_latin1_mojibake(label)
+}
+
+fn repair_extracted_text(value: &str) -> String {
+    repair_utf8_latin1_mojibake(value.trim()).trim().to_string()
 }
 
 fn is_unstable_graph_label(value: &str) -> bool {
@@ -198,8 +315,8 @@ fn refine_entity_type(label: &str, current_type: RuntimeNodeType) -> RuntimeNode
 }
 
 fn parse_entity_candidate(value: &serde_json::Value) -> Option<GraphEntityCandidate> {
-    let label = value.get("label").and_then(serde_json::Value::as_str)?.trim();
-    if label.is_empty() {
+    let label = repair_extracted_text(value.get("label").and_then(serde_json::Value::as_str)?);
+    if label.is_empty() || contains_control_or_mojibake(&label) {
         return None;
     }
     let node_type = parse_canonical_node_type(value.get("node_type")?.as_str()?.trim())?;
@@ -210,40 +327,42 @@ fn parse_entity_candidate(value: &serde_json::Value) -> Option<GraphEntityCandid
             items
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .map(str::trim)
+                .map(repair_extracted_text)
                 .filter(|item| !item.is_empty())
-                .map(std::string::ToString::to_string)
+                .filter(|item| !contains_control_or_mojibake(item))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
-    let node_type = refine_entity_type(label, node_type);
+    let node_type = refine_entity_type(&label, node_type);
     let sub_type = value
         .get("sub_type")
         .and_then(serde_json::Value::as_str)
-        .map(str::trim)
+        .map(repair_extracted_text)
         .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
+        .filter(|s| !contains_control_or_mojibake(s));
+    let summary = value
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(repair_extracted_text)
+        .filter(|item| !item.is_empty())
+        .filter(|item| !contains_control_or_mojibake(item));
 
-    Some(GraphEntityCandidate {
-        label: label.to_string(),
-        node_type,
-        sub_type,
-        aliases,
-        summary: value
-            .get("summary")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(std::string::ToString::to_string),
-    })
+    Some(GraphEntityCandidate { label, node_type, sub_type, aliases, summary })
 }
 
 fn parse_relation_candidate(value: &serde_json::Value) -> Option<GraphRelationCandidate> {
-    let source_label = value.get("source_label").and_then(serde_json::Value::as_str)?.trim();
-    let target_label = value.get("target_label").and_then(serde_json::Value::as_str)?.trim();
+    let source_label =
+        repair_extracted_text(value.get("source_label").and_then(serde_json::Value::as_str)?);
+    let target_label =
+        repair_extracted_text(value.get("target_label").and_then(serde_json::Value::as_str)?);
     let relation_type = value.get("relation_type").and_then(serde_json::Value::as_str)?.trim();
-    if source_label.is_empty() || target_label.is_empty() || relation_type.is_empty() {
+    if source_label.is_empty()
+        || target_label.is_empty()
+        || relation_type.is_empty()
+        || contains_control_or_mojibake(&source_label)
+        || contains_control_or_mojibake(&target_label)
+    {
         return None;
     }
     let relation_slug =
@@ -254,15 +373,15 @@ fn parse_relation_candidate(value: &serde_json::Value) -> Option<GraphRelationCa
     let normalized_relation_type = canonical_relation_candidate_type(relation_type)?;
 
     Some(GraphRelationCandidate {
-        source_label: source_label.to_string(),
-        target_label: target_label.to_string(),
+        source_label,
+        target_label,
         relation_type: normalized_relation_type,
         summary: value
             .get("summary")
             .and_then(serde_json::Value::as_str)
-            .map(str::trim)
+            .map(repair_extracted_text)
             .filter(|item| !item.is_empty())
-            .map(std::string::ToString::to_string),
+            .filter(|item| !contains_control_or_mojibake(item)),
     })
 }
 
@@ -297,7 +416,15 @@ fn parse_canonical_node_type(raw: &str) -> Option<RuntimeNodeType> {
 }
 
 fn extract_json_payload(output_text: &str) -> AnyhowResult<serde_json::Value> {
-    let trimmed = output_text.trim();
+    let repaired_output = repair_utf8_latin1_mojibake(output_text);
+    if repaired_output != output_text {
+        tracing::warn!(
+            original_chars = output_text.chars().count(),
+            repaired_chars = repaired_output.chars().count(),
+            "graph extraction provider output encoding repaired before JSON parse"
+        );
+    }
+    let trimmed = repaired_output.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("graph extraction output is empty"));
     }

@@ -49,8 +49,8 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 export function McpToolsPanel({ t, snapshot, loading, evidence }: McpToolsPanelProps) {
-  const stagesRaw = evidence?.runtimeSummary?.stages ?? [];
   const stagesAggregated = useMemo(() => {
+    const stagesRaw = evidence?.runtimeSummary?.stages ?? [];
     const map = new Map<string, { stage: string; durationMs: number; itemCount: number; calls: number }>();
     for (const stage of stagesRaw) {
       const existing = map.get(stage.stage);
@@ -68,7 +68,7 @@ export function McpToolsPanel({ t, snapshot, loading, evidence }: McpToolsPanelP
       }
     }
     return Array.from(map.values());
-  }, [stagesRaw]);
+  }, [evidence?.runtimeSummary?.stages]);
   const totalStageMs = stagesAggregated.reduce((sum, stage) => sum + stage.durationMs, 0);
 
   const iterations = (snapshot?.iterations ?? []).map((iter, index) => ({

@@ -1,6 +1,6 @@
 import { useEffect, type ChangeEvent, type RefObject } from "react";
 import type { TFunction } from "i18next";
-import { FolderOpen, Link as LinkIcon, Loader2, RotateCw, Upload } from "lucide-react";
+import { FolderOpen, Link as LinkIcon, Loader2, RotateCw, Upload, AlertTriangle, Settings } from "lucide-react";
 
 import { Button } from "@/shared/components/ui/button";
 import type { WebBoundaryPolicy, WebIngestMode } from "@/shared/api";
@@ -26,6 +26,8 @@ type DocumentsPageHeaderProps = {
   t: TFunction;
   webRunsRefreshing: boolean;
   webRunsCount: number;
+  ingestionReady: boolean;
+  onOpenAiSettings: () => void;
 };
 
 export function DocumentsPageHeader({
@@ -47,6 +49,8 @@ export function DocumentsPageHeader({
   t,
   webRunsRefreshing,
   webRunsCount,
+  ingestionReady,
+  onOpenAiSettings,
 }: DocumentsPageHeaderProps) {
   useEffect(() => {
     const folderInput = folderInputRef.current;
@@ -59,6 +63,23 @@ export function DocumentsPageHeader({
 
   return (
     <div className="page-header">
+      {!ingestionReady && (
+        <div className="mb-4 rounded-lg border border-status-warning/40 bg-status-warning/8 p-3 flex items-start gap-3">
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-bold text-status-warning">
+              {t("documents.ingestionNotReady")}
+            </p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {t("documents.ingestionNotReadyDetail")}
+            </p>
+          </div>
+          <Button size="sm" variant="outline" onClick={onOpenAiSettings} className="shrink-0">
+            <Settings className="h-3.5 w-3.5 mr-1.5" />
+            {t("documents.ingestionNotReadyAction")}
+          </Button>
+        </div>
+      )}
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div>
           <h1 className="text-lg font-bold tracking-tight">
@@ -105,13 +126,14 @@ export function DocumentsPageHeader({
         <div className="flex gap-2">
           {activeTab === "documents" && (
             <>
-              <Button size="sm" onClick={() => fileInputRef.current?.click()}>
+              <Button size="sm" disabled={!ingestionReady} onClick={() => fileInputRef.current?.click()}>
                 <Upload className="h-3.5 w-3.5 mr-1.5" />{" "}
                 {t("documents.uploadFiles")}
               </Button>
               <Button
                 size="sm"
                 variant="outline"
+                disabled={!ingestionReady}
                 onClick={() => folderInputRef.current?.click()}
               >
                 <FolderOpen className="h-3.5 w-3.5 mr-1.5" />{" "}

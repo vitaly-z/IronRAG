@@ -55,6 +55,21 @@ function getMcpConfigs(origin: string): McpClientConfig[] {
       icon: Terminal,
       config: `openclaw mcp set ironrag '{"url":"${mcpUrl}","headers":{"Authorization":"Bearer $IRONRAG_MCP_TOKEN"}}'`,
     },
+    {
+      name: 'Hermes',
+      icon: Brain,
+      config: `// ~/.hermes/mcp.json
+{
+  "mcpServers": {
+    "ironrag": {
+      "url": "${mcpUrl}",
+      "headers": {
+        "Authorization": "Bearer \${IRONRAG_MCP_TOKEN}"
+      }
+    }
+  }
+}`,
+    },
   ];
 }
 

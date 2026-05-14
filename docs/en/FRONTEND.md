@@ -37,16 +37,19 @@ apps/web/src/
 ### Documents
 
 - Owns the keyset-paginated document list, uploads, batch actions, inspector, web-run list, and editor entry.
-- Uses canonical list pagination via `/v1/content/documents`.
+- Uses standard list pagination via `/v1/content/documents`.
+- Rows render active ingest progress from the document list payload; the UI does not need a second polling lane for per-row percentages.
 - Inspector detail, prepared segments, technical facts, revisions, and source download all load from dedicated endpoints.
+- Inspector pipeline state renders from stage read-model data: stage status, progress, duration, model, cost, provider-call count, and extraction/chunk details.
 - Batch rerun progress polls `/v1/ops/operations/{operationId}`.
 
 ### Assistant
 
 - Owns session list, active session, message history, pending-turn state, and debug context.
 - Uses `/v1/query/sessions/*` for session CRUD and turn execution.
-- Turn execution is one JSON `POST /v1/query/sessions/{sessionId}/turns` request; no UI SSE fallback or recovery lane exists.
-- Only the pending assistant bubble should be replaced when the completed turn arrives.
+- Turn execution uses one canonical `POST /v1/query/sessions/{sessionId}/turns` request. The UI requests `text/event-stream` so activity, failure, and completion events can update the pending answer bubble while the completed answer remains the persisted session/execution record.
+- If the browser or proxy drops the stream after backend work has started, the client reloads the durable session result created after the request boundary instead of submitting another turn. Backend `failed` events remain terminal errors.
+- LLM context debug loads persisted execution snapshots, not process-local cache, so reloads and cached answer replays remain inspectable when a snapshot exists.
 
 ### Graph
 
@@ -63,6 +66,11 @@ apps/web/src/
 - Uses `/v1/admin/surface` as the shell bootstrap.
 - Access, AI, pricing, audit, MCP prompt, snapshot, and catalog operations each own their own fetch path.
 - Tabs mount lazily; inactive tabs must not keep refetching.
+
+### Swagger
+
+- The `/swagger` route embeds `/swagger.html` in an iframe.
+- Swagger UI vendor CSS is isolated from the Tailwind app shell; the page loads the generated OpenAPI JSON through the frontend origin.
 
 ## Frontend quality gates
 
@@ -100,7 +108,7 @@ Verify these behaviors:
 
 - Dashboard refresh does not rebuild the whole page.
 - Documents table remains usable on narrow widths and web-run rows expand inline.
-- Assistant streaming updates only the active answer bubble and keeps scroll behavior stable.
+- Assistant streaming updates only the active answer bubble, keeps scroll behavior stable, and does not duplicate a turn during transport recovery.
 - Graph selection changes inspector state without refetching the topology stream.
 - Admin tabs fetch only their own data and remain usable on narrow widths.
 

@@ -1,5 +1,6 @@
 use crate::shared::extraction::{
-    text_quality::assess_text_quality, text_render::normalize_for_structured_preparation,
+    build_text_layout_from_content, text_quality::assess_text_quality,
+    text_render::normalize_for_structured_preparation,
 };
 
 use super::*;
@@ -19,11 +20,19 @@ pub(super) fn normalize_extracted_content(
     content_text: &str,
     structure_hints: &ExtractionStructureHints,
 ) -> NormalizedExtractedContent {
+    let scaffold_normalization = strip_docling_image_scaffold_lines(content_text);
     let source_text = match file_kind {
-        UploadFileKind::Image => normalize_image_ocr_text(content_text),
-        _ => content_text.to_string(),
+        UploadFileKind::Image => normalize_image_ocr_text(&scaffold_normalization.text),
+        _ => scaffold_normalization.text,
     };
-    let pre_structuring = normalize_for_structured_preparation(&source_text, Some(structure_hints));
+    let source_changed = source_text.trim() != content_text.trim();
+    let normalized_structure_hints = if source_changed {
+        build_text_layout_from_content(&source_text).structure_hints
+    } else {
+        structure_hints.clone()
+    };
+    let pre_structuring =
+        normalize_for_structured_preparation(&source_text, Some(&normalized_structure_hints));
     let normalized_text = pre_structuring.normalized_text;
     let normalization_status = if normalized_text.trim() == content_text.trim() {
         ExtractionNormalizationStatus::Verbatim
@@ -34,6 +43,12 @@ pub(super) fn normalize_extracted_content(
         "verbatim_v1".to_string()
     } else if file_kind == UploadFileKind::Image {
         "image_ocr_pre_structuring_v1".to_string()
+    } else if scaffold_normalization.applied
+        && pre_structuring.normalization_profile == "pre_structuring_verbatim_v1"
+    {
+        "docling_image_scaffold_strip_v1".to_string()
+    } else if scaffold_normalization.applied {
+        format!("docling_image_scaffold_strip_{}", pre_structuring.normalization_profile)
     } else {
         pre_structuring.normalization_profile
     };
@@ -83,6 +98,76 @@ pub(super) fn with_extraction_quality_markers(
         }),
     );
     with_recognition_source_map(serde_json::Value::Object(source_map), recognition_profile)
+}
+
+struct DoclingImageScaffoldNormalization {
+    text: String,
+    applied: bool,
+}
+
+fn strip_docling_image_scaffold_lines(content_text: &str) -> DoclingImageScaffoldNormalization {
+    let normalized_newlines = content_text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = Vec::<String>::new();
+    let mut applied = false;
+    for line in normalized_newlines.lines() {
+        let trimmed = line.trim();
+        if trimmed == "<!-- image -->" {
+            applied = true;
+            continue;
+        }
+        if let Some(ocr_text) = strip_docling_image_ocr_prefix(trimmed) {
+            applied = true;
+            if !ocr_text.is_empty() {
+                lines.push(ocr_text);
+            }
+            continue;
+        }
+        lines.push(line.trim_end().to_string());
+    }
+
+    if applied {
+        DoclingImageScaffoldNormalization {
+            text: collapse_excess_blank_lines(lines).trim().to_string(),
+            applied,
+        }
+    } else {
+        DoclingImageScaffoldNormalization { text: content_text.to_string(), applied }
+    }
+}
+
+fn strip_docling_image_ocr_prefix(line: &str) -> Option<String> {
+    let prefix = "> Image OCR:";
+    if !line.starts_with(prefix) {
+        return None;
+    }
+    let ocr_text = line[prefix.len()..].trim();
+    if is_useful_inline_image_ocr_text(ocr_text) {
+        Some(ocr_text.to_string())
+    } else {
+        Some(String::new())
+    }
+}
+
+fn is_useful_inline_image_ocr_text(text: &str) -> bool {
+    text.chars().filter(|ch| ch.is_alphanumeric()).count() >= 8
+        || text.split_whitespace().count() >= 3
+}
+
+fn collapse_excess_blank_lines(lines: Vec<String>) -> String {
+    let mut collapsed = Vec::<String>::new();
+    let mut blank_run = 0usize;
+    for line in lines {
+        if line.trim().is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 {
+                collapsed.push(String::new());
+            }
+        } else {
+            blank_run = 0;
+            collapsed.push(line);
+        }
+    }
+    collapsed.join("\n")
 }
 
 fn normalize_image_ocr_text(content_text: &str) -> String {
@@ -156,4 +241,46 @@ fn strip_wrapper_label_prefix(line: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::shared::extraction::{
+        build_text_layout_from_content,
+        file_extract::{UploadFileKind, normalization::normalize_extracted_content},
+    };
+
+    #[test]
+    fn pdf_normalization_strips_docling_image_scaffold_from_text_and_hints() {
+        let content = "<!-- image -->\n\n> Image OCR: AL\n\n# Product Manual\n\nGET /v1/status";
+        let hints = build_text_layout_from_content(content).structure_hints;
+
+        let normalized = normalize_extracted_content(UploadFileKind::Pdf, content, &hints);
+
+        assert!(!normalized.source_text.contains("<!-- image -->"));
+        assert!(!normalized.source_text.contains("Image OCR:"));
+        assert!(normalized.normalized_text.contains("# Product Manual"));
+        assert!(
+            normalized
+                .structure_hints
+                .lines
+                .iter()
+                .all(|line| !line.text.contains("<!-- image -->")
+                    && !line.text.contains("Image OCR:")),
+            "structure hints must be rebuilt from the cleaned source text"
+        );
+    }
+
+    #[test]
+    fn image_normalization_rebuilds_hints_after_ocr_wrapper_cleanup() {
+        let content = "OCR text:\n\nVisible marker 42\n\n<!-- image -->";
+        let hints = build_text_layout_from_content(content).structure_hints;
+
+        let normalized = normalize_extracted_content(UploadFileKind::Image, content, &hints);
+
+        assert_eq!(normalized.source_text, "Visible marker 42");
+        assert_eq!(normalized.normalized_text, "Visible marker 42");
+        assert_eq!(normalized.structure_hints.lines.len(), 1);
+        assert_eq!(normalized.structure_hints.lines[0].text, "Visible marker 42");
+    }
 }

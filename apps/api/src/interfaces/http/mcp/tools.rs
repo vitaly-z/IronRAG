@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    McpJsonRpcResponse, McpToolCallParams, McpToolDescriptor, McpToolSurface,
-    audit::record_canonical_mcp_audit, success_response, tool_error_result,
+    MCP_ANSWER_TOOL_NAMES, McpJsonRpcResponse, McpToolCallParams, McpToolDescriptor, McpToolResult,
+    McpToolSurface, audit::record_canonical_mcp_audit, success_response, tool_error_result,
 };
 use documents::{READ_DOCUMENT_TOOL_NAME, SEARCH_DOCUMENTS_TOOL_NAME};
 
@@ -46,6 +46,26 @@ fn visible_answer_tool_names(auth: &AuthContext) -> Vec<String> {
     if auth.can_read_any_library_memory(POLICY_QUERY_RUN) {
         tools.push("grounded_answer".to_string());
     }
+    if auth.can_read_any_library_memory(POLICY_MCP_MEMORY_READ) {
+        tools.push(SEARCH_DOCUMENTS_TOOL_NAME.to_string());
+        tools.push("list_documents".to_string());
+        tools.push("search_entities".to_string());
+        tools.push("get_graph_topology".to_string());
+        tools.push("list_relations".to_string());
+        tools.push("get_communities".to_string());
+    }
+    if auth.can_read_any_document_memory(POLICY_MCP_MEMORY_READ) {
+        tools.push(READ_DOCUMENT_TOOL_NAME.to_string());
+    }
+    if auth.can_read_any_document_memory(POLICY_RUNTIME_READ) {
+        tools.push("get_runtime_execution".to_string());
+        tools.push("get_runtime_execution_trace".to_string());
+    }
+    if auth.can_read_any_library_memory(POLICY_LIBRARY_READ) {
+        tools.push("get_web_ingest_run".to_string());
+        tools.push("list_web_ingest_run_pages".to_string());
+    }
+    tools.retain(|tool| MCP_ANSWER_TOOL_NAMES.contains(&tool.as_str()));
     tools
 }
 
@@ -157,27 +177,7 @@ pub(super) async fn handle_tools_call(
     let context =
         ToolCallContext { auth, state, request_id, surface_kind: RuntimeSurfaceKind::Mcp };
     let result = if let Some(result) =
-        catalog::call_tool(parsed.name.as_str(), context, &parsed.arguments).await
-    {
-        result
-    } else if let Some(result) =
-        documents::call_tool(parsed.name.as_str(), context, &parsed.arguments).await
-    {
-        result
-    } else if let Some(result) =
-        grounded::call_tool(parsed.name.as_str(), context, &parsed.arguments).await
-    {
-        result
-    } else if let Some(result) =
-        runtime::call_tool(parsed.name.as_str(), context, &parsed.arguments).await
-    {
-        result
-    } else if let Some(result) =
-        web_ingest::call_tool(parsed.name.as_str(), context, &parsed.arguments).await
-    {
-        result
-    } else if let Some(result) =
-        graph::call_tool(parsed.name.as_str(), context, &parsed.arguments).await
+        call_named_tool(parsed.name.as_str(), context, &parsed.arguments).await
     {
         result
     } else {
@@ -190,13 +190,33 @@ pub(super) async fn handle_tools_call(
     success_response(id, json!(result))
 }
 
-fn descriptor_for(name: &str) -> Option<McpToolDescriptor> {
+pub(crate) fn descriptor_for(name: &str) -> Option<McpToolDescriptor> {
     catalog::descriptor(name)
         .or_else(|| documents::descriptor(name))
         .or_else(|| grounded::descriptor(name))
         .or_else(|| runtime::descriptor(name))
         .or_else(|| web_ingest::descriptor(name))
         .or_else(|| graph::descriptor(name))
+}
+
+pub(crate) async fn call_named_tool(
+    name: &str,
+    context: ToolCallContext<'_>,
+    arguments: &Value,
+) -> Option<McpToolResult> {
+    if let Some(result) = catalog::call_tool(name, context, arguments).await {
+        Some(result)
+    } else if let Some(result) = documents::call_tool(name, context, arguments).await {
+        Some(result)
+    } else if let Some(result) = grounded::call_tool(name, context, arguments).await {
+        Some(result)
+    } else if let Some(result) = runtime::call_tool(name, context, arguments).await {
+        Some(result)
+    } else if let Some(result) = web_ingest::call_tool(name, context, arguments).await {
+        Some(result)
+    } else {
+        graph::call_tool(name, context, arguments).await
+    }
 }
 
 #[cfg(test)]
@@ -209,7 +229,9 @@ mod tests {
         domains::iam::PrincipalKind,
         interfaces::http::{
             auth::{AuthContext, AuthGrant, AuthTokenKind},
-            authorization::{POLICY_MCP_MEMORY_READ, POLICY_QUERY_RUN},
+            authorization::{
+                POLICY_LIBRARY_READ, POLICY_MCP_MEMORY_READ, POLICY_QUERY_RUN, POLICY_RUNTIME_READ,
+            },
             mcp::{
                 McpToolSurface,
                 tools::{READ_DOCUMENT_TOOL_NAME, documents, visible_tool_names},
@@ -244,6 +266,24 @@ mod tests {
                     library_id: Some(Uuid::from_u128(11)),
                     document_id: None,
                 },
+                AuthGrant {
+                    id: Uuid::from_u128(3),
+                    resource_kind: "library".to_string(),
+                    resource_id: Uuid::from_u128(11),
+                    permission_kind: POLICY_RUNTIME_READ[0].to_string(),
+                    workspace_id: Some(Uuid::from_u128(101)),
+                    library_id: Some(Uuid::from_u128(11)),
+                    document_id: None,
+                },
+                AuthGrant {
+                    id: Uuid::from_u128(4),
+                    resource_kind: "library".to_string(),
+                    resource_id: Uuid::from_u128(11),
+                    permission_kind: POLICY_LIBRARY_READ[0].to_string(),
+                    workspace_id: Some(Uuid::from_u128(101)),
+                    library_id: Some(Uuid::from_u128(11)),
+                    document_id: None,
+                },
             ],
             workspace_memberships: Vec::new(),
             visible_workspace_ids: BTreeSet::new(),
@@ -267,18 +307,37 @@ mod tests {
     }
 
     #[test]
-    fn answer_surface_exposes_only_catalog_and_grounded_answer_tools() {
+    fn answer_surface_exposes_read_only_agent_tools() {
         let tools =
             visible_tool_names(&auth_with_query_and_memory_access(), McpToolSurface::Answer);
         let canonical = crate::interfaces::http::mcp::MCP_ANSWER_TOOL_NAMES;
 
-        assert!(tools.iter().any(|name| name == "grounded_answer"));
-        assert!(tools.iter().any(|name| name == "list_workspaces"));
-        assert!(tools.iter().any(|name| name == "list_libraries"));
-        assert!(!tools.iter().any(|name| name == "list_documents"));
-        assert!(!tools.iter().any(|name| name == "search_documents"));
-        assert!(!tools.iter().any(|name| name == READ_DOCUMENT_TOOL_NAME));
-        assert!(!canonical.contains(&"list_documents"));
+        for expected in [
+            "grounded_answer",
+            "list_workspaces",
+            "list_libraries",
+            "list_documents",
+            "search_documents",
+            READ_DOCUMENT_TOOL_NAME,
+            "search_entities",
+            "get_graph_topology",
+            "list_relations",
+            "get_communities",
+        ] {
+            assert!(tools.iter().any(|name| name == expected), "missing {expected}");
+        }
+        for forbidden in [
+            "create_workspace",
+            "create_library",
+            "upload_documents",
+            "update_document",
+            "delete_document",
+            "submit_web_ingest_run",
+            "cancel_web_ingest_run",
+        ] {
+            assert!(!tools.iter().any(|name| name == forbidden), "forbidden {forbidden}");
+        }
+        assert!(canonical.contains(&"list_documents"));
         assert_eq!(canonical.len(), tools.len());
     }
 

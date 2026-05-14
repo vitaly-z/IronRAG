@@ -20,6 +20,8 @@ use crate::{
     shared::json_coercion::from_value_or_default,
 };
 
+const INLINE_SUMMARY_REFRESH_TARGET_LIMIT: usize = 500;
+
 #[derive(Debug, Clone)]
 pub struct GraphProjectionScope {
     pub library_id: Uuid,
@@ -564,6 +566,24 @@ async fn maybe_apply_summary_refresh(
         .invalidate_summaries(state, scope.library_id, summary_refresh)
         .await
         .context("failed to refresh canonical summaries after graph projection")?;
+    let affected_targets = inline_summary_refresh_target_count(state, scope, summary_refresh)
+        .await
+        .context("failed to count affected canonical summary targets after graph projection")?;
+    if !state
+        .retrieval_intelligence_services
+        .graph_summary
+        .should_batch_refresh(affected_targets, INLINE_SUMMARY_REFRESH_TARGET_LIMIT)
+    {
+        tracing::info!(
+            library_id = %scope.library_id,
+            affected_targets,
+            inline_limit = INLINE_SUMMARY_REFRESH_TARGET_LIMIT,
+            targeted = summary_refresh.is_targeted(),
+            broad = summary_refresh.broad_refresh,
+            "skipping inline canonical summary refresh for large graph mutation",
+        );
+        return Ok(());
+    }
     state
         .retrieval_intelligence_services
         .graph_summary
@@ -571,6 +591,33 @@ async fn maybe_apply_summary_refresh(
         .await
         .context("failed to generate canonical summaries after graph projection")?;
     Ok(())
+}
+
+async fn inline_summary_refresh_target_count(
+    state: &AppState,
+    scope: &GraphProjectionScope,
+    summary_refresh: &GraphSummaryRefreshRequest,
+) -> anyhow::Result<usize> {
+    if summary_refresh.is_targeted() {
+        return Ok(summary_refresh.node_ids.len().saturating_add(summary_refresh.edge_ids.len()));
+    }
+    if !summary_refresh.broad_refresh {
+        return Ok(0);
+    }
+    let snapshot =
+        repositories::get_runtime_graph_snapshot(&state.persistence.postgres, scope.library_id)
+            .await
+            .context("failed to load runtime graph snapshot for summary refresh sizing")?;
+    Ok(summary_target_count_from_snapshot(snapshot.as_ref()))
+}
+
+fn summary_target_count_from_snapshot(snapshot: Option<&RuntimeGraphSnapshotRow>) -> usize {
+    let Some(snapshot) = snapshot else {
+        return 0;
+    };
+    let nodes = usize::try_from(snapshot.node_count.max(0)).unwrap_or_default();
+    let edges = usize::try_from(snapshot.edge_count.max(0)).unwrap_or_default();
+    nodes.saturating_add(edges)
 }
 
 fn provenance_coverage_percent(
@@ -661,5 +708,24 @@ mod tests {
         assert!(
             scope.summary_refresh.as_ref().is_some_and(GraphSummaryRefreshRequest::is_targeted)
         );
+    }
+
+    #[test]
+    fn counts_summary_targets_from_snapshot_without_underflow() {
+        let snapshot = RuntimeGraphSnapshotRow {
+            library_id: Uuid::nil(),
+            graph_status: "ready".to_string(),
+            projection_version: 1,
+            topology_generation: 1,
+            node_count: -1,
+            edge_count: 8,
+            provenance_coverage_percent: Some(100.0),
+            last_built_at: None,
+            last_error_message: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(summary_target_count_from_snapshot(Some(&snapshot)), 8);
     }
 }

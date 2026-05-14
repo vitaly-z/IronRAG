@@ -328,9 +328,9 @@ fn aggregate_by_document(chunks: &[RuntimeMatchedChunk], question: &str) -> Vec<
                 let mut ranks = anchor_rank_map.into_values().collect::<Vec<_>>();
                 ranks.sort_by(|left, right| {
                     right
-                        .retrieval_score
-                        .total_cmp(&left.retrieval_score)
-                        .then_with(|| right.focus_score.cmp(&left.focus_score))
+                        .focus_score
+                        .cmp(&left.focus_score)
+                        .then_with(|| right.retrieval_score.total_cmp(&left.retrieval_score))
                         .then_with(|| left.first_rank.cmp(&right.first_rank))
                         .then_with(|| left.chunk_index.cmp(&right.chunk_index))
                 });
@@ -359,10 +359,10 @@ fn anchor_rank_is_better(
     rank: usize,
     existing: &AnchorRank,
 ) -> bool {
-    retrieval_score > existing.retrieval_score
-        || (retrieval_score == existing.retrieval_score && focus_score > existing.focus_score)
-        || (retrieval_score == existing.retrieval_score
-            && focus_score == existing.focus_score
+    focus_score > existing.focus_score
+        || (focus_score == existing.focus_score && retrieval_score > existing.retrieval_score)
+        || (focus_score == existing.focus_score
+            && retrieval_score == existing.retrieval_score
             && rank < existing.first_rank)
 }
 
@@ -1477,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn test_consolidation_anchor_ranking_prefers_retrieval_score_before_focus() {
+    fn test_consolidation_anchor_ranking_prefers_query_focus_before_tiny_score_gap() {
         let winner_doc = Uuid::now_v7();
         let winner_rev = Uuid::now_v7();
         let question = "Which record mentions AlphaKey?";
@@ -1508,7 +1508,7 @@ mod tests {
         let Some((winner, _, _)) = decide_focus(&bundle, &query_ir, question, 8) else {
             panic!("single retrieved document should consolidate");
         };
-        assert_eq!(winner.ranked_content_anchors.first().copied(), Some(40));
+        assert_eq!(winner.ranked_content_anchors.first().copied(), Some(4));
     }
 
     #[test]

@@ -3,6 +3,7 @@ import type { PreparedSegmentItem } from "@/shared/api/documents";
 import {
   codeLanguageForSourceFormat,
   isCodeLikeSourceFormat,
+  isRasterImageSourceFormat,
   isTableLikeSourceFormat,
 } from "./editorSurfaceMode";
 
@@ -44,10 +45,10 @@ export function buildEditorBlocks(
   items: PreparedSegmentItem[],
   sourceFormat?: string,
 ): DocumentEditorBlock[] {
-  const normalized = items.map(normalizeSegment);
+  const sourceSegments = items.map(normalizeSegment);
 
   if (isCodeLikeSourceFormat(sourceFormat)) {
-    const codeLines = normalized
+    const codeLines = sourceSegments
       .map((segment) => segment.text)
       .filter((text) => text.trim().length > 0);
 
@@ -62,6 +63,7 @@ export function buildEditorBlocks(
       : [];
   }
 
+  const normalized = prepareSegmentsForEditor(sourceSegments, sourceFormat);
   const rowSegmentsByParent = new Map<string, NormalizedSegment[]>();
 
   for (const segment of normalized) {
@@ -170,6 +172,41 @@ function normalizeSegment(item: PreparedSegmentItem): NormalizedSegment {
   };
 }
 
+function prepareSegmentsForEditor(
+  segments: NormalizedSegment[],
+  sourceFormat?: string,
+): NormalizedSegment[] {
+  if (isRasterImageSourceFormat(sourceFormat)) {
+    return segments;
+  }
+
+  const readableSegments = segments.filter(
+    (segment) => !isExtractionScaffoldSegment(segment),
+  );
+
+  return readableSegments.some((segment) => segment.text.trim().length > 0)
+    ? readableSegments
+    : segments;
+}
+
+function isExtractionScaffoldSegment(segment: NormalizedSegment): boolean {
+  const text = segment.text.trim();
+  if (text.length === 0) {
+    return false;
+  }
+
+  if (text === "<!-- image -->") {
+    return true;
+  }
+
+  const unquoted = stripQuoteMarkers(text);
+  if (/^Image OCR:\s*/i.test(unquoted)) {
+    return true;
+  }
+
+  return /^--- Embedded image \d+(?:\s*\([^)]+\))?\s*---/i.test(text);
+}
+
 function normalizeBlockKind(
   blockKind: string,
 ): DocumentEditorBlockKind | "table_row" | null {
@@ -197,13 +234,17 @@ function parseHeading(
 ): Extract<DocumentEditorBlock, { kind: "heading" }> {
   const match = text.match(/^(#{1,6})\s+(.*)$/);
   if (match) {
-    return { kind: "heading", level: match[1].length, text: match[2].trim() };
+    return {
+      kind: "heading",
+      level: match[1].length,
+      text: normalizeDisplayText(match[2]),
+    };
   }
 
   return {
     kind: "heading",
     level: Math.min(Math.max(headingTrail.length, 1), 6),
-    text: text.trim(),
+    text: normalizeDisplayText(text),
   };
 }
 
@@ -213,7 +254,7 @@ function buildScalarBlock(
 ): DocumentEditorBlock {
   switch (kind) {
     case "list_item":
-      return { kind, text: stripListMarker(segment.text) };
+      return { kind, text: normalizeDisplayText(stripListMarker(segment.text)) };
     case "code_block":
       return {
         kind,
@@ -221,13 +262,16 @@ function buildScalarBlock(
         language: segment.codeLanguage ?? undefined,
       };
     case "quote_block":
-      return { kind, text: stripQuoteMarkers(segment.text) };
+      return {
+        kind,
+        text: normalizeDisplayText(stripQuoteMarkers(segment.text)),
+      };
     case "metadata_block":
     case "source_unit":
-      return { kind, text: segment.text.trim() };
+      return { kind, text: normalizeDisplayText(segment.text) };
     case "paragraph":
     default:
-      return { kind: "paragraph", text: segment.text.trim() };
+      return { kind: "paragraph", text: normalizeDisplayText(segment.text) };
   }
 }
 
@@ -317,6 +361,16 @@ function stripQuoteMarkers(text: string): string {
     .split(/\r?\n/)
     .map((line) => line.replace(/^\s*>\s?/, ""))
     .join("\n")
+    .trim();
+}
+
+function normalizeDisplayText(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 

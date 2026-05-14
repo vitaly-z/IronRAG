@@ -273,10 +273,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="hidden md:flex items-center gap-1.5 ml-auto">
           {/* Library readiness warning */}
           {activeLibrary && missingPurposes.length > 0 && (
-            <div className="flex items-center gap-1 rounded-full border border-amber-700/25 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-900 dark:border-amber-400/25 dark:bg-amber-950/40 dark:text-amber-200">
+            <button
+              onClick={() => navigate('/admin?tab=ai')}
+              className="flex items-center gap-1 rounded-full border border-amber-700/25 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-900 hover:bg-amber-100 transition-colors dark:border-amber-400/25 dark:bg-amber-950/40 dark:text-amber-200 dark:hover:bg-amber-950/60"
+              title={t('shell.configureInSettings')}
+            >
               <AlertTriangle className="h-3 w-3" />
-              <span>{missingPurposes.length} {missingPurposes.length > 1 ? t('admin.bindingsMissingPlural') : t('admin.bindingsMissing')}</span>
-            </div>
+              <span>{missingPurposes.length > 1 ? t('admin.bindingsMissingPlural') : t('admin.bindingsMissing')}</span>
+            </button>
           )}
 
           {/* Workspace selector */}

@@ -90,11 +90,15 @@ pub struct ContentDocumentListItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_percent: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub processing_started_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub processing_finished_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
     pub retryable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_kind: Option<String>,

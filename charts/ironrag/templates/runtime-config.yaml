@@ -43,6 +43,14 @@ data:
   IRONRAG_ARANGODB_BOOTSTRAP_VIEWS: {{ .Values.app.arangodbBootstrap.views | quote }}
   IRONRAG_ARANGODB_BOOTSTRAP_GRAPH: {{ .Values.app.arangodbBootstrap.graph | quote }}
   IRONRAG_ARANGODB_BOOTSTRAP_VECTOR_INDEXES: {{ .Values.app.arangodbBootstrap.vectorIndexes | quote }}
+  IRONRAG_OTEL_ENABLED: {{ .Values.observability.enabled | quote }}
+  OTEL_RESOURCE_ATTRIBUTES: {{ .Values.observability.resourceAttributes | quote }}
+  OTEL_TRACES_EXPORTER: {{ .Values.observability.tracesExporter | quote }}
+  OTEL_METRICS_EXPORTER: {{ .Values.observability.metricsExporter | quote }}
+  OTEL_LOGS_EXPORTER: {{ .Values.observability.logsExporter | quote }}
+  OTEL_EXPORTER_OTLP_PROTOCOL: {{ .Values.observability.otlpProtocol | quote }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.observability.otlpEndpoint | quote }}
+  OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: {{ .Values.observability.metricsTemporality | quote }}
 {{- if not .Values.runtimeSecret.existingSecret }}
 ---
 apiVersion: v1

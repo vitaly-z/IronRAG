@@ -204,12 +204,12 @@ pub struct Settings {
     pub query_balanced_context_enabled: bool,
     pub runtime_graph_extract_recovery_enabled: bool,
     pub runtime_graph_extract_recovery_max_attempts: usize,
-    /// Hard wall-clock cap on a single `extract_graph` stage run
-    /// (candidate materialization + revision graph reconcile combined).
-    /// Guards against stages that silently stall the tokio runtime and
-    /// starve the heartbeat loop: when exceeded the attempt finalizes
-    /// with `stage_timeout` so the queue can move forward instead of
-    /// waiting on a steady-state lease reaper.
+    /// Idle cap for graph candidate materialization. The stage may run for a
+    /// long time on large documents, but it must keep completing per-chunk
+    /// graph extraction checkpoints within this window.
+    pub runtime_graph_extract_idle_timeout_seconds: u64,
+    /// Wall-clock cap for the final revision graph reconcile step. Candidate
+    /// materialization is guarded by the idle timeout above instead.
     pub runtime_graph_extract_stage_timeout_seconds: u64,
     pub runtime_graph_extract_resume_downgrade_level_one_after_replays: usize,
     pub runtime_graph_extract_resume_downgrade_level_two_after_replays: usize,
@@ -552,7 +552,7 @@ fn settings_config_builder()
         .set_default("ingestion_worker_lease_seconds", 300)?
         .set_default("ingestion_worker_heartbeat_interval_seconds", 15)?
         .set_default("ingestion_embedding_parallelism", 2)?
-        .set_default("ingestion_graph_extract_parallelism_per_doc", 2)?
+        .set_default("ingestion_graph_extract_parallelism_per_doc", 4)?
         .set_default("web_ingest_http_timeout_seconds", 20)?
         .set_default("web_ingest_max_redirects", 10)?
         .set_default("web_ingest_user_agent", "IronRAG-WebIngest/0.1")?
@@ -579,7 +579,8 @@ fn settings_config_builder()
         .set_default("query_balanced_context_enabled", true)?
         .set_default("runtime_graph_extract_recovery_enabled", true)?
         .set_default("runtime_graph_extract_recovery_max_attempts", 4)?
-        .set_default("runtime_graph_extract_stage_timeout_seconds", 600)?
+        .set_default("runtime_graph_extract_idle_timeout_seconds", 300)?
+        .set_default("runtime_graph_extract_stage_timeout_seconds", 1800)?
         .set_default("runtime_graph_extract_resume_downgrade_level_one_after_replays", 3)?
         .set_default("runtime_graph_extract_resume_downgrade_level_two_after_replays", 5)?
         .set_default("runtime_graph_summary_refresh_batch_size", 64)?

@@ -211,27 +211,45 @@ pub async fn create_conversation(
     max_library_conversations: usize,
 ) -> Result<QueryConversationRow, sqlx::Error> {
     let mut transaction = postgres.begin().await?;
-    let existing_ids = sqlx::query_scalar::<_, Uuid>(
-        "select id
+    let existing_count = sqlx::query_scalar::<_, i64>(
+        "select count(*)::bigint
          from query_conversation
          where library_id = $1
-           and request_surface = $2::surface_kind
-         order by created_at asc, id asc",
+           and request_surface = $2::surface_kind",
     )
     .bind(input.library_id)
     .bind(input.request_surface)
-    .fetch_all(&mut *transaction)
+    .fetch_one(&mut *transaction)
     .await?;
 
     let overflow_count =
-        existing_ids.len().saturating_add(1).saturating_sub(max_library_conversations);
+        existing_count.saturating_add(1).saturating_sub(max_library_conversations as i64);
 
     if overflow_count > 0 {
-        let prune_ids = existing_ids.into_iter().take(overflow_count).collect::<Vec<_>>();
-        sqlx::query("delete from query_conversation where id = any($1)")
-            .bind(&prune_ids)
-            .execute(&mut *transaction)
-            .await?;
+        sqlx::query(
+            "delete from query_conversation
+             where id in (
+                 select conversation.id
+                 from query_conversation conversation
+                 where conversation.library_id = $1
+                   and conversation.request_surface = $2::surface_kind
+                   and conversation.created_at < now() - interval '10 minutes'
+                   and not exists (
+                       select 1
+                       from query_execution execution
+                       where execution.conversation_id = conversation.id
+                         and execution.completed_at is null
+                   )
+                 order by conversation.created_at asc, conversation.id asc
+                 limit $3
+                 for update skip locked
+             )",
+        )
+        .bind(input.library_id)
+        .bind(input.request_surface)
+        .bind(overflow_count)
+        .execute(&mut *transaction)
+        .await?;
     }
 
     let row = sqlx::query_as::<_, QueryConversationRowRecord>(

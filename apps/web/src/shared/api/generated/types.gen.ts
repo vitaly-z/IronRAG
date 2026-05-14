@@ -36,6 +36,23 @@ export type AdminViewerSummary = {
     principalId: string;
 };
 
+/**
+ * Metadata describing the tool-use loop that produced this snapshot.
+ * Present only on turns driven by tool-use execution; absent on
+ * single-shot grounded-answer turns.
+ */
+export type AgentLoopMetadata = {
+    deadlineMs: number;
+    iterationCap: number;
+    stoppedReason: AgentStopReason;
+    toolCallCount: number;
+};
+
+/**
+ * Reason the tool-use loop stopped iterating.
+ */
+export type AgentStopReason = 'final_answer' | 'iteration_cap' | 'deadline' | 'tool_error';
+
 export type AiBindingAssignmentResponse = {
     bindingPurpose: AiBindingPurpose;
     bindingState: string;
@@ -520,6 +537,12 @@ export type ChatMessage = {
      */
     name?: string | null;
     /**
+     * Provider-emitted reasoning trace echoed back by DeepSeek thinking
+     * models when continuing a multi-turn tool-loop. Other providers
+     * ignore the field.
+     */
+    reasoning_content?: string | null;
+    /**
      * One of: "system", "user", "assistant", "tool".
      */
     role: string;
@@ -600,6 +623,7 @@ export type ContentDocumentListItem = {
     costCurrencyCode: string;
     documentState: string;
     failureCode?: string | null;
+    failureMessage?: string | null;
     fileName: string;
     fileSize?: number | null;
     fileType?: string | null;
@@ -607,6 +631,7 @@ export type ContentDocumentListItem = {
     libraryId: string;
     processingFinishedAt?: string | null;
     processingStartedAt?: string | null;
+    progressPercent?: number | null;
     /**
      * Canonical readiness bucket derived server-side.
      */
@@ -924,12 +949,14 @@ export type DeploymentReadinessSnapshot = {
 export type DocumentAttempt = {
     attemptKind: string;
     attemptNo: number;
+    currencyCode?: string | null;
     finishedAt?: string | null;
     jobId: string;
     queueStartedAt: string;
     stageEvents: Array<DocumentStageEvent>;
     startedAt?: string | null;
     status: string;
+    totalCost?: string | null;
     totalElapsedMs?: number | null;
 };
 
@@ -989,11 +1016,13 @@ export type DocumentStageEvent = {
     chunksProcessed?: number | null;
     completionTokens?: number | null;
     currencyCode?: string | null;
+    details?: unknown;
     elapsedMs?: number | null;
     estimatedCost?: string | null;
     finishedAt?: string | null;
     modelName?: string | null;
     promptTokens?: number | null;
+    providerCallCount?: number | null;
     providerKind?: string | null;
     /**
      * Diff-aware ingest: number of chunks whose extraction output was reused
@@ -1169,12 +1198,14 @@ export type IngestAttempt = {
     current_stage?: string | null;
     failure_class?: string | null;
     failure_code?: string | null;
+    failure_message?: string | null;
     finished_at?: string | null;
     heartbeat_at?: string | null;
     id: string;
     job_id: string;
     knowledge_generation_id?: string | null;
     lease_token?: string | null;
+    progress_percent: number;
     retryable: boolean;
     started_at: string;
     worker_principal_id?: string | null;
@@ -1722,6 +1753,7 @@ export type LibrarySummary = {
  * The UI can render `iterations` as a stacked timeline.
  */
 export type LlmContextSnapshot = {
+    agentLoop?: null | AgentLoopMetadata;
     capturedAt: string;
     executionId: string;
     finalAnswer?: string | null;
@@ -1746,6 +1778,13 @@ export type LlmContextSnapshot = {
  * if the provider returned one.
  */
 export type LlmIterationDebug = {
+    /**
+     * Runtime execution IDs spawned by tool calls in this iteration.
+     * Populated when a tool call (e.g. `grounded_answer`) recursed into
+     * `execute_turn` and produced its own `LlmContextSnapshot`. Empty
+     * for all single-shot grounded-answer iterations.
+     */
+    childRuntimeExecutionIds?: Array<string>;
     iteration: number;
     modelName: string;
     providerKind: string;
@@ -5959,14 +5998,14 @@ export type GetQueryExecutionLlmContextErrors = {
      */
     403: unknown;
     /**
-     * Execution not found or no longer in the debug cache
+     * Execution not found or no LLM context snapshot was recorded
      */
     404: unknown;
 };
 
 export type GetQueryExecutionLlmContextResponses = {
     /**
-     * Volatile in-memory LLM request/response capture for the execution
+     * Durable LLM request/response capture for the execution
      */
     200: LlmContextSnapshot;
 };

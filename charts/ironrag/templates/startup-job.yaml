@@ -42,6 +42,8 @@ spec:
               value: startup
             - name: IRONRAG_SERVICE_NAME
               value: ironrag-startup
+            - name: OTEL_SERVICE_NAME
+              value: ironrag-startup
           volumeMounts:
             - name: tmp
               mountPath: /tmp

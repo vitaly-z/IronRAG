@@ -5,7 +5,7 @@ mod web_jobs;
 
 use std::{
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -15,7 +15,11 @@ use anyhow::Context;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::{sync::broadcast, task::JoinHandle, time};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, broadcast},
+    task::JoinHandle,
+    time,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -66,6 +70,10 @@ const CANONICAL_STALE_LEASE_SECONDS: i64 = 60;
 /// the heartbeat interval (`CANONICAL_HEARTBEAT_INTERVAL`) so a healthy
 /// sibling worker in a multi-worker deployment is never falsely reclaimed.
 const CANONICAL_STARTUP_LEASE_RECOVERY_SECONDS: i64 = 30;
+const DEFAULT_HEAVY_REVISION_BYTES: i64 = 8 * 1024 * 1024;
+
+static HEAVY_REVISION_PIPELINE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(heavy_revision_pipeline_parallelism())));
 
 struct AttemptHeartbeatGuard {
     running: Arc<AtomicBool>,
@@ -113,9 +121,21 @@ struct JobCanceledByShutdown {
     job_id: Uuid,
 }
 
-fn job_cancellation_error(job_id: Uuid, user_cancel_requested: &AtomicBool) -> anyhow::Error {
+#[derive(Debug, Error)]
+#[error("canonical ingest job {job_id} lost its active attempt lease")]
+struct JobLeaseLost {
+    job_id: Uuid,
+}
+
+fn job_cancellation_error(
+    job_id: Uuid,
+    user_cancel_requested: &AtomicBool,
+    lease_lost_requested: &AtomicBool,
+) -> anyhow::Error {
     if user_cancel_requested.load(Ordering::Relaxed) {
         anyhow::Error::new(JobCanceledByRequest { job_id })
+    } else if lease_lost_requested.load(Ordering::Relaxed) {
+        anyhow::Error::new(JobLeaseLost { job_id })
     } else {
         anyhow::Error::new(JobCanceledByShutdown { job_id })
     }
@@ -124,23 +144,66 @@ fn job_cancellation_error(job_id: Uuid, user_cancel_requested: &AtomicBool) -> a
 fn check_job_cancellation(
     cancellation_token: &CancellationToken,
     user_cancel_requested: &AtomicBool,
+    lease_lost_requested: &AtomicBool,
     job_id: Uuid,
 ) -> anyhow::Result<()> {
     if cancellation_token.is_cancelled() {
-        Err(job_cancellation_error(job_id, user_cancel_requested))
+        Err(job_cancellation_error(job_id, user_cancel_requested, lease_lost_requested))
     } else {
         Ok(())
     }
 }
 
+async fn acquire_heavy_revision_pipeline_permit(
+    revision: &content_repository::ContentRevisionRow,
+) -> anyhow::Result<Option<OwnedSemaphorePermit>> {
+    if !is_heavy_revision_pipeline_job(revision) {
+        return Ok(None);
+    }
+    let permit = HEAVY_REVISION_PIPELINE
+        .clone()
+        .acquire_owned()
+        .await
+        .context("heavy revision pipeline limiter is closed")?;
+    Ok(Some(permit))
+}
+
+fn is_heavy_revision_pipeline_job(revision: &content_repository::ContentRevisionRow) -> bool {
+    let mime_type = revision
+        .mime_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    mime_type == "application/pdf" && revision.byte_size >= heavy_revision_byte_threshold()
+}
+
+fn heavy_revision_byte_threshold() -> i64 {
+    std::env::var("IRONRAG_INGESTION_HEAVY_REVISION_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_HEAVY_REVISION_BYTES)
+}
+
+fn heavy_revision_pipeline_parallelism() -> usize {
+    std::env::var("IRONRAG_INGESTION_HEAVY_PIPELINE_PARALLELISM")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
 fn map_stage_error(
     error: anyhow::Error,
     user_cancel_requested: &AtomicBool,
+    lease_lost_requested: &AtomicBool,
     job_id: Uuid,
     context: &'static str,
 ) -> anyhow::Error {
     if anyhow_is_cancelled(&error) {
-        job_cancellation_error(job_id, user_cancel_requested)
+        job_cancellation_error(job_id, user_cancel_requested, lease_lost_requested)
     } else {
         error.context(context)
     }
@@ -172,6 +235,14 @@ impl CanonicalExtractContentError {
             message: rejection.message().to_string(),
         }
     }
+
+    fn extraction_failed(failure_code: &str, message: impl std::fmt::Display) -> Self {
+        Self {
+            failure_code: failure_code.to_string(),
+            retryable: true,
+            message: message.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for CanonicalExtractContentError {
@@ -197,6 +268,99 @@ pub fn spawn_ingestion_worker(
     tokio::spawn(async move {
         run_ingestion_worker_pool(Arc::new(state), shutdown).await;
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_attempt_heartbeat_observer(
+    heartbeat_pg: sqlx::PgPool,
+    attempt_id: Uuid,
+    job_id: Uuid,
+    heartbeat_interval: Duration,
+    heartbeat_running: Arc<AtomicBool>,
+    cancellation_token: CancellationToken,
+    user_cancel_requested: Arc<AtomicBool>,
+    lease_lost_requested: Arc<AtomicBool>,
+) {
+    let thread_name = format!("ironrag-heartbeat-{}", attempt_id.simple());
+    let spawn_failure_cancellation = cancellation_token.clone();
+    let spawn_failure_lease_lost = Arc::clone(&lease_lost_requested);
+    let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(%error, %attempt_id, "attempt heartbeat observer failed to start runtime");
+                lease_lost_requested.store(true, Ordering::Relaxed);
+                cancellation_token.cancel();
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            // Runs outside the main Tokio runtime so CPU-heavy graph reconcile
+            // cannot starve heartbeats and trigger a false stale-lease requeue.
+            while heartbeat_running.load(Ordering::Relaxed) {
+                tokio::time::sleep(heartbeat_interval).await;
+                if !heartbeat_running.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                match ingest_repository::touch_attempt_heartbeat_and_load_job_state(
+                    &heartbeat_pg,
+                    attempt_id,
+                    None,
+                )
+                .await
+                {
+                    Ok(Some(queue_state)) if queue_state == "leased" => {}
+                    Ok(Some(queue_state)) if queue_state == "canceled" => {
+                        info!(
+                            %job_id,
+                            %attempt_id,
+                            "cancellation observed on heartbeat tick, signalling pipeline abort"
+                        );
+                        user_cancel_requested.store(true, Ordering::Relaxed);
+                        cancellation_token.cancel();
+                    }
+                    Ok(Some(queue_state)) => {
+                        lease_lost_requested.store(true, Ordering::Relaxed);
+                        cancellation_token.cancel();
+                        warn!(
+                            %job_id,
+                            %attempt_id,
+                            queue_state = %queue_state,
+                            "attempt heartbeat observed job lease moved away; cancelling stale worker pipeline"
+                        );
+                        break;
+                    }
+                    Ok(None) => {
+                        lease_lost_requested.store(true, Ordering::Relaxed);
+                        cancellation_token.cancel();
+                        warn!(
+                            %job_id,
+                            %attempt_id,
+                            "attempt heartbeat observed lost lease; cancelling stale worker pipeline"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            %attempt_id,
+                            "failed to touch attempt heartbeat and poll queue state"
+                        );
+                    }
+                }
+            }
+        });
+    });
+    if let Err(error) = spawn_result {
+        tracing::error!(%error, %attempt_id, "failed to spawn attempt heartbeat observer");
+        spawn_failure_lease_lost.store(true, Ordering::Relaxed);
+        spawn_failure_cancellation.cancel();
+    }
 }
 
 async fn execute_canonical_ingest_job(
@@ -235,69 +399,20 @@ async fn execute_canonical_ingest_job(
     let heartbeat_running = Arc::new(AtomicBool::new(true));
     let heartbeat_guard = AttemptHeartbeatGuard::new(Arc::clone(&heartbeat_running));
     let user_cancel_requested = Arc::new(AtomicBool::new(false));
+    let lease_lost_requested = Arc::new(AtomicBool::new(false));
 
-    // The heartbeat loop does double duty: it refreshes `heartbeat_at` so the
-    // stale-lease reaper leaves this attempt alone, AND it polls the job's
-    // current `queue_state` so the pipeline notices a user-issued cancel
-    // between stages. One DB round-trip per tick keeps the observer latency
-    // bounded by `CANONICAL_HEARTBEAT_INTERVAL` (≤15s), which is tight enough
-    // for an interactive "Cancel Processing" button.
-    let heartbeat_flag = Arc::clone(&heartbeat_running);
-    // Dedicated tiny pool — never competes with the main working pool
-    // for connections, so `touch_attempt_heartbeat` always succeeds even
-    // while ingest stages hold every slot in `persistence.postgres`.
-    let heartbeat_pg = state.persistence.heartbeat_postgres.clone();
-    let heartbeat_cancellation = cancellation_token.clone();
-    let heartbeat_user_cancel_requested = Arc::clone(&user_cancel_requested);
-    let heartbeat_job_id = job.id;
     let heartbeat_interval =
         Duration::from_secs(state.settings.ingestion_worker_heartbeat_interval_seconds.max(1));
-    tokio::spawn(async move {
-        // The cancel poll only runs until we observe the first `canceled`
-        // signal: after that we know the pipeline is cooperatively unwinding,
-        // and the heartbeat loop switches to pure heartbeat mode so the
-        // stale-lease reaper does **not** clobber the attempt with
-        // `stale_heartbeat` while the worker is draining a mid-stage LLM call
-        // on its way to `JobCanceledByRequest`. Without this, long-running
-        // stages like `extract_graph` would see the attempt re-written to
-        // `failed + lease_expired` by the reaper before they finished
-        // unwinding, losing the user's cancel intent.
-        let mut observed_cancel = false;
-        while heartbeat_flag.load(Ordering::Relaxed) {
-            time::sleep(heartbeat_interval).await;
-            if !heartbeat_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            if let Err(e) =
-                ingest_repository::touch_attempt_heartbeat(&heartbeat_pg, attempt_id, None).await
-            {
-                tracing::warn!(?e, %attempt_id, "failed to touch attempt heartbeat");
-            }
-            if observed_cancel {
-                continue;
-            }
-            match ingest_repository::get_ingest_job_by_id(&heartbeat_pg, heartbeat_job_id).await {
-                Ok(Some(row)) if row.queue_state == "canceled" => {
-                    info!(
-                        job_id = %heartbeat_job_id,
-                        %attempt_id,
-                        "cancellation observed on heartbeat tick, signalling pipeline abort"
-                    );
-                    heartbeat_user_cancel_requested.store(true, Ordering::Relaxed);
-                    heartbeat_cancellation.cancel();
-                    observed_cancel = true;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        ?e,
-                        %attempt_id,
-                        "heartbeat cancel poll failed; will retry on next tick"
-                    );
-                }
-            }
-        }
-    });
+    spawn_attempt_heartbeat_observer(
+        state.persistence.heartbeat_postgres.clone(),
+        attempt_id,
+        job.id,
+        heartbeat_interval,
+        Arc::clone(&heartbeat_running),
+        cancellation_token.clone(),
+        Arc::clone(&user_cancel_requested),
+        Arc::clone(&lease_lost_requested),
+    );
 
     // Pre-lease cancellation guard: a job may have been canceled *between*
     // `claim_next_queued_ingest_job` and the point where the heartbeat loop
@@ -309,10 +424,13 @@ async fn execute_canonical_ingest_job(
     if current_job.as_ref().is_some_and(|j| j.queue_state == "canceled") {
         user_cancel_requested.store(true, Ordering::Relaxed);
         cancellation_token.cancel();
+    } else if current_job.as_ref().is_some_and(|j| j.queue_state != "leased") {
+        lease_lost_requested.store(true, Ordering::Relaxed);
+        cancellation_token.cancel();
     }
 
     let result = if cancellation_token.is_cancelled() {
-        Err(job_cancellation_error(job.id, &user_cancel_requested))
+        Err(job_cancellation_error(job.id, &user_cancel_requested, &lease_lost_requested))
     } else {
         match job.job_kind.as_str() {
             "content_mutation" => {
@@ -356,6 +474,7 @@ async fn execute_canonical_ingest_job(
                     revision_id,
                     &cancellation_token,
                     &user_cancel_requested,
+                    &lease_lost_requested,
                 )
                 .await
             }
@@ -376,7 +495,7 @@ async fn execute_canonical_ingest_job(
 
     match result {
         Ok(()) => {
-            state
+            let finalize_result = state
                 .canonical_services
                 .ingest
                 .finalize_attempt(
@@ -394,11 +513,25 @@ async fn execute_canonical_ingest_job(
                         }),
                         failure_class: None,
                         failure_code: None,
+                        failure_message: None,
                         retryable: false,
                     },
                 )
-                .await
-                .context("failed to finalize canonical ingest attempt as succeeded")?;
+                .await;
+            if let Err(error) = finalize_result {
+                if matches!(error, crate::interfaces::http::router_support::ApiError::Conflict(_)) {
+                    warn!(
+                        %worker_id,
+                        %job_id,
+                        %attempt_id,
+                        ?error,
+                        "canonical ingest job finished after losing its active lease; leaving queue state to the current owner"
+                    );
+                    return Ok(());
+                }
+                return Err(error)
+                    .context("failed to finalize canonical ingest attempt as succeeded");
+            }
             info!(
                 %worker_id,
                 %job_id,
@@ -414,6 +547,15 @@ async fn execute_canonical_ingest_job(
                     %job_id,
                     %attempt_id,
                     "canonical ingest job observed user cancel request and stopped cooperatively",
+                );
+                return Ok(());
+            }
+            if error.downcast_ref::<JobLeaseLost>().is_some() {
+                warn!(
+                    %worker_id,
+                    %job_id,
+                    %attempt_id,
+                    "canonical ingest job stopped because its attempt lease was lost"
                 );
                 return Ok(());
             }
@@ -451,6 +593,9 @@ async fn execute_canonical_ingest_job(
                             current_stage: Some(initial_stage.clone()),
                             failure_class: Some("worker_shutdown".to_string()),
                             failure_code: Some("shutdown_cancelled".to_string()),
+                            failure_message: Some(
+                                "Worker shutdown canceled document processing".to_string(),
+                            ),
                             retryable: true,
                         },
                     )
@@ -479,6 +624,9 @@ async fn execute_canonical_ingest_job(
                             current_stage: Some(initial_stage.clone()),
                             failure_class: Some("content_mutation".to_string()),
                             failure_code: Some("document_deleted".to_string()),
+                            failure_message: Some(
+                                "Document was deleted before processing finished".to_string(),
+                            ),
                             retryable: false,
                         },
                     )
@@ -521,6 +669,7 @@ async fn execute_canonical_ingest_job(
                                     _ => "canonical_pipeline_failed".to_string(),
                                 }),
                         ),
+                        failure_message: Some(message.clone()),
                         retryable: extract_error.map(|failure| failure.retryable).unwrap_or(true),
                     },
                 )
@@ -542,9 +691,15 @@ async fn run_canonical_ingest_pipeline(
     revision_id: Uuid,
     cancellation_token: &CancellationToken,
     user_cancel_requested: &AtomicBool,
+    lease_lost_requested: &AtomicBool,
 ) -> anyhow::Result<()> {
     // --- Stage: extract_content -----------------------------------------------
-    check_job_cancellation(cancellation_token, user_cancel_requested, job.id)?;
+    check_job_cancellation(
+        cancellation_token,
+        user_cancel_requested,
+        lease_lost_requested,
+        job.id,
+    )?;
     state
         .canonical_services
         .ingest
@@ -572,14 +727,122 @@ async fn run_canonical_ingest_pipeline(
 
     let extract_content_start = Instant::now();
 
-    let revision = state
+    // Read revision metadata from Postgres — the canonical source of truth.
+    // ArangoDB is a derived cache; if the revision hasn't been mirrored yet
+    // (e.g. after an ArangoDB outage during upload) populate it here so the
+    // pipeline has a consistent view.
+    let revision_row =
+        content_repository::get_revision_by_id(&state.persistence.postgres, revision_id)
+            .await
+            .context("failed to load knowledge revision from postgres")?
+            .with_context(|| format!("knowledge revision {revision_id} not found in postgres"))?;
+    let heavy_revision_pipeline_permit =
+        acquire_heavy_revision_pipeline_permit(&revision_row).await?;
+    let heavy_revision_pipeline_limited = heavy_revision_pipeline_permit.is_some();
+    if heavy_revision_pipeline_limited {
+        tracing::info!(
+            %revision_id,
+            byte_size = revision_row.byte_size,
+            "heavy revision pipeline slot acquired"
+        );
+    }
+
+    let arango_revision = state
         .arango_document_store
         .get_revision(revision_id)
         .await
-        .context("failed to load knowledge revision")?
-        .with_context(|| format!("knowledge revision {revision_id} not found"))?;
+        .context("failed to load knowledge revision from arango")?;
 
-    let extracted_content = match resolve_canonical_extract_content(state, job, &revision).await {
+    let revision = if let Some(existing) = arango_revision {
+        existing
+    } else {
+        tracing::info!(
+            %revision_id,
+            "revision missing from ArangoDB — self-healing from Postgres"
+        );
+
+        // Ensure the document shell exists in ArangoDB before writing the
+        // revision — write_revision also upserts a document→revision edge
+        // which requires the document node to be present.
+        let document = content_repository::get_document_by_id(
+            &state.persistence.postgres,
+            revision_row.document_id,
+        )
+        .await
+        .context("failed to load document for self-heal")?
+        .with_context(|| format!("document {} not found in Postgres", revision_row.document_id))?;
+
+        if state
+            .arango_document_store
+            .get_document(revision_row.document_id)
+            .await
+            .context("failed to check document in ArangoDB")?
+            .is_none()
+        {
+            state
+                .canonical_services
+                .knowledge
+                .create_document_shell(
+                    state,
+                    crate::services::knowledge::service::CreateKnowledgeDocumentCommand {
+                        document_id: document.id,
+                        workspace_id: document.workspace_id,
+                        library_id: document.library_id,
+                        external_key: document.external_key.clone(),
+                        file_name: Some(document.external_key.clone()),
+                        title: None,
+                        document_state: document.document_state.clone(),
+                    },
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to self-heal knowledge document {} in ArangoDB", document.id)
+                })?;
+        }
+
+        let cmd = crate::services::knowledge::service::CreateKnowledgeRevisionCommand {
+            revision_id: revision_row.id,
+            workspace_id: revision_row.workspace_id,
+            library_id: revision_row.library_id,
+            document_id: revision_row.document_id,
+            revision_number: i64::from(revision_row.revision_number),
+            revision_state: "accepted".to_string(),
+            revision_kind: revision_row.content_source_kind.clone(),
+            storage_ref: revision_row.storage_key.clone(),
+            source_uri: revision_row.source_uri.clone(),
+            mime_type: revision_row.mime_type.clone(),
+            checksum: revision_row.checksum.clone(),
+            byte_size: revision_row.byte_size,
+            title: revision_row.title.clone(),
+            normalized_text: None,
+            text_checksum: None,
+            text_state: "accepted".to_string(),
+            vector_state: "accepted".to_string(),
+            graph_state: "accepted".to_string(),
+            text_readable_at: None,
+            vector_ready_at: None,
+            graph_ready_at: None,
+            superseded_by_revision_id: None,
+        };
+        state.canonical_services.knowledge.write_revision(state, cmd).await.with_context(|| {
+            format!("failed to self-heal knowledge revision {revision_id} in ArangoDB")
+        })?;
+        // Re-read from ArangoDB so we have the canonical row.
+        state
+            .arango_document_store
+            .get_revision(revision_id)
+            .await
+            .context("failed to load self-healed revision from arango")?
+            .with_context(|| {
+                format!("self-healed revision {revision_id} was not persisted to arango")
+            })?
+    };
+
+    let extracted_content = match resolve_canonical_extract_content(
+        state, job, attempt_id, &revision,
+    )
+    .await
+    {
         Ok(content) => content,
         Err(error) => {
             let failure_message = error.to_string();
@@ -722,7 +985,12 @@ async fn run_canonical_ingest_pipeline(
         .context("failed to record extract_content stage event")?;
 
     // --- Stage: prepare_structure / chunk_content / extract_technical_facts ---
-    check_job_cancellation(cancellation_token, user_cancel_requested, job.id)?;
+    check_job_cancellation(
+        cancellation_token,
+        user_cancel_requested,
+        lease_lost_requested,
+        job.id,
+    )?;
     state
         .canonical_services
         .ingest
@@ -751,7 +1019,8 @@ async fn run_canonical_ingest_pipeline(
         .await
         .context("failed to record prepare_structure start stage event")?;
 
-    let preparation = state
+    let prepare_structure_start = Instant::now();
+    let preparation = match state
         .canonical_services
         .content
         .prepare_and_persist_revision_structure(
@@ -761,14 +1030,48 @@ async fn run_canonical_ingest_pipeline(
             cancellation_token,
         )
         .await
-        .map_err(|error| {
-            map_stage_error(
+    {
+        Ok(preparation) => preparation,
+        Err(error) => {
+            let mapped_error = map_stage_error(
                 error.into(),
                 user_cancel_requested,
+                lease_lost_requested,
                 job.id,
                 "failed to prepare and persist structured revision",
-            )
-        })?;
+            );
+            let failure_message = format!("{mapped_error:#}");
+            let elapsed_ms = Some(prepare_structure_start.elapsed().as_millis() as i64);
+            state
+                .canonical_services
+                .ingest
+                .record_stage_event(
+                    state,
+                    RecordStageEventCommand {
+                        attempt_id,
+                        stage_name: INGEST_STAGE_PREPARE_STRUCTURE.to_string(),
+                        stage_state: "failed".to_string(),
+                        message: Some("structured revision preparation failed".to_string()),
+                        details_json: serde_json::json!({
+                            "revisionId": revision_id,
+                            "error": failure_message,
+                        }),
+                        provider_kind: None,
+                        model_name: None,
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                        total_tokens: None,
+                        cached_tokens: None,
+                        estimated_cost: None,
+                        currency_code: None,
+                        elapsed_ms,
+                    },
+                )
+                .await
+                .context("failed to record prepare_structure failure stage event")?;
+            return Err(mapped_error);
+        }
+    };
 
     let prepare_structure_elapsed_ms = Some(preparation.prepare_structure_elapsed_ms);
     let chunk_content_elapsed_ms = Some(preparation.chunk_content_elapsed_ms);
@@ -904,12 +1207,25 @@ async fn run_canonical_ingest_pipeline(
         )
         .await
         .context("failed to record extract_technical_facts stage event")?;
+    drop(extracted_content.extraction_plan);
+    if heavy_revision_pipeline_limited {
+        drop(heavy_revision_pipeline_permit);
+        tracing::info!(
+            %revision_id,
+            "heavy revision pipeline slot released before provider-bound stages"
+        );
+    }
 
     // --- Stage: embed_chunk ---------------------------------------------------
     // Chunk embedding is required for a readable revision. Failure marks
     // vector/graph readiness failed and aborts this attempt; the worker does
     // not continue into graph extraction with a partial vector inventory.
-    check_job_cancellation(cancellation_token, user_cancel_requested, job.id)?;
+    check_job_cancellation(
+        cancellation_token,
+        user_cancel_requested,
+        lease_lost_requested,
+        job.id,
+    )?;
     state
         .canonical_services
         .ingest
@@ -1006,7 +1322,11 @@ async fn run_canonical_ingest_pipeline(
         }
         Err(error) => {
             if matches!(error, crate::services::query::error::QueryServiceError::Cancelled) {
-                return Err(job_cancellation_error(job.id, user_cancel_requested));
+                return Err(job_cancellation_error(
+                    job.id,
+                    user_cancel_requested,
+                    lease_lost_requested,
+                ));
             }
             embed_chunk_failure = Some(format!("chunk embedding failed: {error:#}"));
             warn!(
@@ -1052,7 +1372,12 @@ async fn run_canonical_ingest_pipeline(
     }
 
     // --- Stage: extract_graph -------------------------------------------------
-    check_job_cancellation(cancellation_token, user_cancel_requested, job.id)?;
+    check_job_cancellation(
+        cancellation_token,
+        user_cancel_requested,
+        lease_lost_requested,
+        job.id,
+    )?;
     state
         .canonical_services
         .ingest
@@ -1082,17 +1407,19 @@ async fn run_canonical_ingest_pipeline(
         .context("failed to record extract_graph start stage event")?;
 
     let extract_graph_start = Instant::now();
-    // Canonical wall-clock cap on the entire extract_graph stage. Guards
-    // against stages that silently monopolize the tokio runtime and
-    // starve heartbeat/cancel polling. Timeout is handled by the same
-    // fail-loud path as graph extraction errors, so the attempt finalizes
-    // instead of leaking a `leased` row until the reaper catches it.
-    let stage_timeout =
+    // Graph candidate materialization is a per-chunk checkpointed stage:
+    // each successful chunk writes a ready `runtime_graph_extraction` row
+    // and provider calls carry their own request timeout. The content service
+    // enforces an idle/progress timeout there; this worker only keeps the
+    // bounded timeout for the final reconcile step, which is a single
+    // graph-store projection operation.
+    let graph_reconcile_timeout =
         Duration::from_secs(state.settings.runtime_graph_extract_stage_timeout_seconds.max(1));
 
-    let graph_materialization = match time::timeout(
-        stage_timeout,
-        state.canonical_services.content.materialize_revision_graph_candidates(
+    let graph_materialization = match state
+        .canonical_services
+        .content
+        .materialize_revision_graph_candidates(
             state,
             MaterializeRevisionGraphCandidatesCommand {
                 workspace_id: revision.workspace_id,
@@ -1101,21 +1428,18 @@ async fn run_canonical_ingest_pipeline(
                 attempt_id: Some(attempt_id),
             },
             cancellation_token,
-        ),
-    )
-    .await
+        )
+        .await
     {
-        Ok(Ok(materialization)) => Ok(materialization),
-        Ok(Err(crate::services::content::error::ContentServiceError::Cancelled)) => {
-            return Err(job_cancellation_error(job.id, user_cancel_requested));
+        Ok(materialization) => Ok(materialization),
+        Err(crate::services::content::error::ContentServiceError::Cancelled) => {
+            return Err(job_cancellation_error(
+                job.id,
+                user_cancel_requested,
+                lease_lost_requested,
+            ));
         }
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(crate::services::content::error::ContentServiceError::StateConflict {
-            message: format!(
-                "stage_timeout: extract_graph stage exceeded canonical timeout of {}s during graph candidate materialization",
-                stage_timeout.as_secs()
-            ),
-        }),
+        Err(error) => Err(error),
     };
     let mut graph_ready = false;
     let mut graph_failure: Option<String> = None;
@@ -1123,7 +1447,7 @@ async fn run_canonical_ingest_pipeline(
     match graph_materialization {
         Ok(graph_materialization) => {
             let graph_outcome = match time::timeout(
-                stage_timeout,
+                graph_reconcile_timeout,
                 state.canonical_services.graph.reconcile_revision_graph(
                     state,
                     job.library_id,
@@ -1137,13 +1461,17 @@ async fn run_canonical_ingest_pipeline(
             {
                 Ok(Ok(outcome)) => Ok(outcome),
                 Ok(Err(crate::services::graph::error::GraphServiceError::Cancelled)) => {
-                    return Err(job_cancellation_error(job.id, user_cancel_requested));
+                    return Err(job_cancellation_error(
+                        job.id,
+                        user_cancel_requested,
+                        lease_lost_requested,
+                    ));
                 }
                 Ok(Err(error)) => Err(error),
                 Err(_) => Err(crate::services::graph::error::GraphServiceError::StateConflict {
                     message: format!(
                         "extract_graph stage exceeded canonical timeout of {}s during revision graph reconcile",
-                        stage_timeout.as_secs()
+                        graph_reconcile_timeout.as_secs()
                     ),
                 }),
             };
@@ -1170,6 +1498,7 @@ async fn run_canonical_ingest_pipeline(
                                     "extractedEntityCandidates": graph_materialization.extracted_entities,
                                     "extractedRelationCandidates": graph_materialization.extracted_relations,
                                     "reusedChunks": graph_materialization.reused_chunks,
+                                    "reusedPromptHashMismatches": graph_materialization.reused_prompt_hash_mismatches,
                                     "reusedEntities": graph_materialization.reused_entities,
                                     "reusedRelations": graph_materialization.reused_relations,
                                     "projectedNodes": outcome.projection.node_count,
@@ -1194,38 +1523,6 @@ async fn run_canonical_ingest_pipeline(
                         )
                         .await
                         .context("failed to record extract_graph stage event")?;
-
-                    // Capture graph-embedding billing under its own
-                    // `embed_graph` call_kind. Previous versions filed
-                    // this usage under the `embed_chunk` stage event,
-                    // which made every dashboard conflate chunk-embed
-                    // activity (which was actually a no-op until this
-                    // release) with graph-node/edge embedding activity.
-                    if let Some(embedding_usage) = outcome.embedding_usage {
-                        let embed_provider = embedding_usage.provider_kind.clone();
-                        let embed_model = embedding_usage.model_name.clone();
-
-                        if let Err(e) = state
-                            .canonical_services
-                            .billing
-                            .capture_ingest_attempt(
-                                state,
-                                crate::services::ops::billing::CaptureIngestAttemptBillingCommand {
-                                    workspace_id: job.workspace_id,
-                                    library_id: job.library_id,
-                                    attempt_id,
-                                    binding_id: None,
-                                    provider_kind: embed_provider.clone().unwrap_or_default(),
-                                    model_name: embed_model.clone().unwrap_or_default(),
-                                    call_kind: "embed_graph".to_string(),
-                                    usage_json: embedding_usage.into_usage_json(),
-                                },
-                            )
-                            .await
-                        {
-                            warn!(%worker_id, job_id = %job.id, ?e, "embed_graph billing capture failed");
-                        }
-                    }
                 }
                 Err(graph_error) => {
                     graph_failure = Some(format!("graph reconcile failed: {graph_error:#}"));
@@ -1322,84 +1619,6 @@ async fn run_canonical_ingest_pipeline(
         return Err(anyhow::anyhow!(reason));
     }
 
-    // --- Graph maintenance (entity resolution + community detection) ---
-    //
-    // Entity resolution walks O(nodes) comparing pairs, community
-    // detection runs label-propagation over O(nodes + edges), and
-    // `generate_community_summaries` does one LLM call per community.
-    // On a mid-sized library one pass is a few CPU-seconds plus a
-    // handful of LLM round-trips.
-    //
-    // Without the throttle below, these three ran at the end of every
-    // single ingest job — under a burst of parallel workers each
-    // finishing job kicked another full-library pass while the previous
-    // one was still running, and the maintenance loop became the
-    // dominant CPU sink instead of the actual extract/merge work.
-    //
-    // The work is idempotent and library-wide, so compressing a burst
-    // of finalising jobs into one maintenance pass per library per
-    // interval is safe. `try_acquire_graph_maintenance_slot` gives us
-    // exactly that: the first job to finish in a window claims the
-    // pass, the rest skip the block entirely.
-    if graph_ready
-        && crate::services::graph::maintenance::try_acquire_graph_maintenance_slot(job.library_id)
-    {
-        if let Err(error) = crate::services::graph::entity_resolution::resolve_after_ingestion(
-            state,
-            job.library_id,
-        )
-        .await
-        {
-            tracing::warn!(library_id = %job.library_id, ?error, "entity resolution failed, continuing");
-        }
-
-        if let Err(error) = crate::services::graph::community_detection::detect_after_ingestion(
-            state,
-            job.library_id,
-        )
-        .await
-        {
-            tracing::warn!(library_id = %job.library_id, ?error, "community detection failed, continuing");
-        }
-
-        // Generate community summaries from top entities and relationships
-        if let Err(error) =
-            crate::services::graph::community_detection::generate_community_summaries(
-                state,
-                job.library_id,
-            )
-            .await
-        {
-            tracing::warn!(library_id = %job.library_id, ?error, "community summary generation failed, continuing");
-        }
-    } else if graph_ready {
-        tracing::debug!(
-            library_id = %job.library_id,
-            "graph maintenance skipped — another ingest job already ran the pass in this window"
-        );
-    }
-
-    // --- Graph backfill ----------------------------------------------------------
-    //
-    // Successful jobs may observe older stuck graph rows from previous
-    // versions. Keep the bounded library-wide repair pass here, after the
-    // current revision has proven graph-ready, so failed current attempts do
-    // not hide behind background repair.
-    if graph_ready
-        && crate::services::graph::backfill::try_acquire_graph_backfill_slot(job.library_id)
-    {
-        if let Err(error) =
-            crate::services::graph::backfill::run_library_graph_backfill(state, job.library_id)
-                .await
-        {
-            tracing::warn!(
-                library_id = %job.library_id,
-                ?error,
-                "graph backfill pass failed, continuing"
-            );
-        }
-    }
-
     // --- Generate document summary from structured blocks ---------------------
     match generate_document_summary_from_blocks(state, revision_id).await {
         Ok(summary) if !summary.is_empty() => {
@@ -1420,7 +1639,12 @@ async fn run_canonical_ingest_pipeline(
     }
 
     // --- Stage: finalize readiness --------------------------------------------
-    check_job_cancellation(cancellation_token, user_cancel_requested, job.id)?;
+    check_job_cancellation(
+        cancellation_token,
+        user_cancel_requested,
+        lease_lost_requested,
+        job.id,
+    )?;
     state
         .canonical_services
         .ingest

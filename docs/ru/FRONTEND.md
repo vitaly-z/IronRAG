@@ -37,16 +37,19 @@ apps/web/src/
 ### Documents
 
 - Владеет keyset-пагинацией, upload, batch-action, inspector, web-run list и входом в editor.
-- Использует канонический list endpoint `/v1/content/documents`.
+- Использует основной list endpoint `/v1/content/documents`.
+- Строки показывают active ingest progress из document list payload; отдельный polling lane для per-row процентов не нужен.
 - Inspector detail, prepared segments, technical facts, revisions и source download грузятся отдельными endpoint'ами.
+- Inspector pipeline state строится из stage read-model data: stage status, progress, duration, model, cost, provider-call count и extraction/chunk details.
 - Прогресс batch rerun поллится через `/v1/ops/operations/{operationId}`.
 
 ### Assistant
 
 - Владеет списком сессий, активной сессией, историей сообщений, pending-turn state и debug context.
 - Использует `/v1/query/sessions/*` для session CRUD и turn execution.
-- Turn execution — один JSON `POST /v1/query/sessions/{sessionId}/turns` request; отдельного UI SSE fallback/recovery lane нет.
-- Когда completed turn пришёл, заменяется только pending bubble ассистента.
+- Turn execution использует один canonical `POST /v1/query/sessions/{sessionId}/turns` request. UI запрашивает `text/event-stream`, чтобы activity, failure и completion events обновляли pending answer bubble, а completed answer оставался persisted session/execution record.
+- Если browser или proxy роняет stream после старта backend work, client перечитывает durable session result, созданный после request boundary, вместо повторной отправки turn. Backend `failed` events остаются terminal errors.
+- LLM context debug загружает persisted execution snapshots, а не process-local cache, поэтому reload и cached answer replay остаются inspectable при наличии snapshot.
 
 ### Graph
 
@@ -63,6 +66,11 @@ apps/web/src/
 - Использует `/v1/admin/surface` как shell bootstrap.
 - Access, AI, pricing, audit, MCP prompt, snapshot и catalog operations владеют своими fetch path.
 - Tabs монтируются лениво; неактивные вкладки не должны бесконечно рефетчить.
+
+### Swagger
+
+- Route `/swagger` встраивает `/swagger.html` через iframe.
+- Vendor CSS Swagger UI изолирован от Tailwind app shell; страница грузит generated OpenAPI JSON через frontend origin.
 
 ## Frontend quality gates
 
@@ -100,7 +108,7 @@ Playwright-сьют снимает живой UI на desktop и constrained mob
 
 - Dashboard refresh не перестраивает всю страницу.
 - Documents table остается usable на узких ширинах, web-run rows раскрываются inline.
-- Assistant streaming обновляет только активный answer bubble и не ломает scroll behavior.
+- Assistant streaming обновляет только активный answer bubble, не ломает scroll behavior и не дублирует turn при transport recovery.
 - Graph selection меняет inspector state без повторной загрузки topology stream.
 - Admin tabs грузят только свои данные и остаются usable на узких ширинах.
 

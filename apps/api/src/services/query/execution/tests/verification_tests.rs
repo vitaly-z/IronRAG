@@ -1,10 +1,60 @@
 use super::*;
 
+fn runtime_chunk(source_text: &str) -> RuntimeMatchedChunk {
+    let document_id = Uuid::now_v7();
+    RuntimeMatchedChunk {
+        chunk_id: Uuid::now_v7(),
+        document_id,
+        revision_id: Uuid::now_v7(),
+        chunk_index: 0,
+        chunk_kind: Some("paragraph".to_string()),
+        document_label: "fixture.md".to_string(),
+        excerpt: source_text.to_string(),
+        score_kind: crate::services::query::execution::RuntimeChunkScoreKind::Relevance,
+        score: Some(1.0),
+        source_text: source_text.to_string(),
+    }
+}
+
 #[test]
 fn verify_answer_accepts_semantic_web_and_knowledge_graph_targets() {
+    let document_id = Uuid::now_v7();
+    let revision_id = Uuid::now_v7();
     let verification = verify_answer_against_canonical_evidence(
         "Which technology in this corpus focuses on making Internet data machine-readable through standards like RDF and OWL, and which one stores interlinked descriptions of entities and concepts?",
         "Semantic web makes Internet data machine-readable through RDF and OWL. Knowledge graph stores interlinked descriptions of entities and concepts.",
+        &QueryIntentProfile::default(),
+        &CanonicalAnswerEvidence {
+            bundle: None,
+            chunk_rows: Vec::new(),
+            structured_blocks: Vec::new(),
+            technical_facts: Vec::new(),
+        },
+        &[RuntimeMatchedChunk {
+            chunk_id: Uuid::now_v7(),
+            document_id,
+            revision_id,
+            chunk_index: 0,
+            chunk_kind: Some("paragraph".to_string()),
+            document_label: "concepts.md".to_string(),
+            excerpt: "Semantic web makes Internet data machine-readable through RDF and OWL. Knowledge graph stores interlinked descriptions of entities and concepts.".to_string(),
+            score_kind: crate::services::query::execution::RuntimeChunkScoreKind::Relevance,
+            score: Some(1.0),
+            source_text: "Semantic web makes Internet data machine-readable through RDF and OWL. Knowledge graph stores interlinked descriptions of entities and concepts.".to_string(),
+        }],
+        "",
+        &AssistantGroundingEvidence::default(),
+    );
+
+    assert_eq!(verification.state, QueryVerificationState::Verified);
+    assert!(verification.warnings.is_empty());
+}
+
+#[test]
+fn verify_answer_rejects_nonempty_answer_without_canonical_evidence() {
+    let verification = verify_answer_against_canonical_evidence(
+        "What is the configured endpoint?",
+        "The endpoint is `/not-grounded`.",
         &QueryIntentProfile::default(),
         &CanonicalAnswerEvidence {
             bundle: None,
@@ -17,8 +67,8 @@ fn verify_answer_accepts_semantic_web_and_knowledge_graph_targets() {
         &AssistantGroundingEvidence::default(),
     );
 
-    assert_eq!(verification.state, QueryVerificationState::Verified);
-    assert!(verification.warnings.is_empty());
+    assert_eq!(verification.state, QueryVerificationState::InsufficientEvidence);
+    assert!(verification.warnings.iter().any(|warning| warning.code == "no_canonical_evidence"));
 }
 
 #[test]
@@ -117,7 +167,7 @@ fn verify_answer_records_unsupported_literals_for_revision_guard() {
             structured_blocks: Vec::new(),
             technical_facts: Vec::new(),
         },
-        &[],
+        &[runtime_chunk("Run democtl present --flag.")],
         "Run democtl present --flag.",
         &AssistantGroundingEvidence::default(),
     );
@@ -192,7 +242,9 @@ fn verify_answer_accepts_literals_grounded_by_html_entity_equivalent_context() {
             structured_blocks: Vec::new(),
             technical_facts: Vec::new(),
         },
-        &[],
+        &[runtime_chunk(
+            "Example:\nSELECT name, age\nFROM students\nWHERE age &gt; 18\nORDER BY name ASC;",
+        )],
         "Example:\nSELECT name, age\nFROM students\nWHERE age &gt; 18\nORDER BY name ASC;",
         &AssistantGroundingEvidence::default(),
     );
@@ -213,7 +265,7 @@ fn verify_answer_accepts_named_decimal_and_hex_html_entities() {
             structured_blocks: Vec::new(),
             technical_facts: Vec::new(),
         },
-        &[],
+        &[runtime_chunk("Use &quot;alpha&quot;, beta&#39;s, and &#x2F;v1&#x2F;items.")],
         "Use &quot;alpha&quot;, beta&#39;s, and &#x2F;v1&#x2F;items.",
         &AssistantGroundingEvidence::default(),
     );
@@ -234,7 +286,7 @@ fn verify_answer_does_not_decode_malformed_html_entity_without_semicolon() {
             structured_blocks: Vec::new(),
             technical_facts: Vec::new(),
         },
-        &[],
+        &[runtime_chunk("Use AT&ampT.")],
         "Use AT&ampT.",
         &AssistantGroundingEvidence::default(),
     );

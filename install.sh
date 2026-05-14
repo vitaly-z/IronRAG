@@ -196,52 +196,64 @@ sync_frontend_origin_to_port "${INSTALL_DIR}/.env" "$published_port"
 (
   cd "$INSTALL_DIR"
   docker compose pull
-  docker compose up -d
+  docker compose up -d postgres redis arangodb startup
 )
 
-# Watch the startup container for the canonical "migration N was
-# previously applied but has been modified" failure. sqlx refuses to
-# start until every applied migration's checksum matches the file
-# baked into the new image — older deployments often hit this when
-# they pull a release that contains touched migrations. Without this
-# guard, install.sh just leaves `ironrag-startup-1 Waiting` in
-# Restarting forever and the operator has no idea what went wrong.
-detect_migration_checksum_drift() {
+# Watch the startup container before creating app services. Some Compose
+# versions block forever on `service_completed_successfully` dependents when
+# startup restarts, so the installer owns the wait loop and can print the real
+# failure instead of leaving `ironrag-startup-1 Waiting`.
+wait_for_startup_authority() {
   local install_dir="$1"
-  local deadline=$(( $(date +%s) + 90 ))
-  local backend_id startup_id
+  local wait_seconds="${IRONRAG_STARTUP_WAIT_SECS:-300}"
+  local deadline=$(( $(date +%s) + wait_seconds ))
+  local startup_id
+
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if curl -fsS --max-time 3 "http://127.0.0.1:${published_port}/v1/health" >/dev/null 2>&1; then
-      return 0
-    fi
-    backend_id="$(cd "$install_dir" && docker compose ps -q backend 2>/dev/null || true)"
     startup_id="$(cd "$install_dir" && docker compose ps -q startup 2>/dev/null || true)"
-    if [ -n "$startup_id" ]; then
-      local startup_logs
-      startup_logs="$(docker logs "$startup_id" 2>&1 | tail -n 200)"
-      local drift_line
-      drift_line="$(printf '%s\n' "$startup_logs" | grep -m 1 -E 'migration [0-9]+ was previously applied but has been modified' || true)"
-      if [ -n "$drift_line" ]; then
-        local version
-        version="$(printf '%s\n' "$drift_line" | grep -oE '[0-9]+' | head -n 1)"
-        cat >&2 <<DRIFT_ERR
+    if [ -z "$startup_id" ]; then
+      sleep 2
+      continue
+    fi
+
+    local startup_logs
+    startup_logs="$(docker logs "$startup_id" 2>&1 | tail -n 200)"
+
+    local drift_line
+    drift_line="$(printf '%s\n' "$startup_logs" | grep -m 1 -E 'migration [0-9]+ was previously applied but has been modified' || true)"
+    if [ -n "$drift_line" ]; then
+      local version padded_version
+      version="$(printf '%s\n' "$drift_line" | grep -oE '[0-9]+' | head -n 1)"
+      padded_version="$(printf '%04d' "$version")"
+      cat >&2 <<DRIFT_ERR
 ERROR: ironrag-startup-1 keeps restarting because the bundled
        schema for migration ${version} doesn't match the one applied
        to this database. sqlx refuses to start until the recorded
-       checksum is updated to the new file.
+       checksum matches the file in the running image.
        This happens when an existing deployment pulls a release that
        touched a previously-applied migration.
 
-       Resolve in two steps:
+       Resolve in three steps:
 
-       1. Compute the new checksum for migration ${version} from the
+       1. Extract and apply the canonical idempotent migration file:
+
+            docker compose -f ${install_dir}/docker-compose.yml run --rm --no-deps \\
+              --entrypoint sh backend \\
+              -c 'cat /app/migrations/${padded_version}_*.sql' \\
+              >/tmp/ironrag-migration-${version}.sql
+
+            docker compose -f ${install_dir}/docker-compose.yml exec -T \\
+              postgres psql -U postgres -d ironrag \\
+              </tmp/ironrag-migration-${version}.sql
+
+       2. Compute the new checksum for migration ${version} from the
           running backend image:
 
-            docker compose -f ${install_dir}/docker-compose.yml run --rm \\
+            docker compose -f ${install_dir}/docker-compose.yml run --rm --no-deps \\
               --entrypoint sha384sum backend \\
-              /app/migrations/000${version}_*.sql
+              /app/migrations/${padded_version}_*.sql
 
-       2. Update the row in _sqlx_migrations:
+       3. Update the row in _sqlx_migrations:
 
             docker compose -f ${install_dir}/docker-compose.yml exec \\
               postgres psql -U postgres -d ironrag -c \\
@@ -254,27 +266,55 @@ ERROR: ironrag-startup-1 keeps restarting because the bundled
 
        Stack is stopped now to avoid a silent restart loop.
 DRIFT_ERR
-        (cd "$install_dir" && docker compose stop startup backend worker frontend >/dev/null 2>&1 || true)
-        return 1
-      fi
+      (cd "$install_dir" && docker compose stop startup backend worker frontend >/dev/null 2>&1 || true)
+      return 1
     fi
-    if [ -n "$backend_id" ]; then
-      local backend_state
-      backend_state="$(docker inspect "$backend_id" -f '{{.State.Status}}' 2>/dev/null || echo unknown)"
-      if [ "$backend_state" = "running" ]; then
-        # Backend is up but health probe still says not-ok; give it
-        # a couple more cycles before bailing.
-        :
-      fi
+
+    local state status exit_code restart_count
+    state="$(docker inspect "$startup_id" -f '{{.State.Status}}|{{.State.ExitCode}}|{{.RestartCount}}' 2>/dev/null || echo 'unknown|1|0')"
+    status="${state%%|*}"
+    state="${state#*|}"
+    exit_code="${state%%|*}"
+    restart_count="${state##*|}"
+
+    if [ "$status" = "exited" ] && [ "$exit_code" = "0" ]; then
+      return 0
     fi
+
+    if { [ "$status" = "exited" ] && [ "$exit_code" != "0" ]; } \
+      || { [ "$status" = "restarting" ] && [ "${restart_count:-0}" -gt 0 ]; }; then
+      cat >&2 <<STARTUP_ERR
+ERROR: ironrag-startup-1 failed before the API could start.
+
+Last startup logs:
+${startup_logs}
+
+Stack is stopped now to avoid a silent restart loop.
+STARTUP_ERR
+      (cd "$install_dir" && docker compose stop startup backend worker frontend >/dev/null 2>&1 || true)
+      return 1
+    fi
+
     sleep 3
   done
-  return 0
+
+  startup_id="$(cd "$install_dir" && docker compose ps -q startup 2>/dev/null || true)"
+  if [ -n "$startup_id" ]; then
+    docker logs "$startup_id" --tail 200 >&2 || true
+  fi
+  echo "ERROR: ironrag-startup-1 did not finish within ${wait_seconds}s." >&2
+  (cd "$install_dir" && docker compose stop startup backend worker frontend >/dev/null 2>&1 || true)
+  return 1
 }
 
-if ! detect_migration_checksum_drift "$INSTALL_DIR"; then
+if ! wait_for_startup_authority "$INSTALL_DIR"; then
   exit 1
 fi
+
+(
+  cd "$INSTALL_DIR"
+  docker compose up -d backend worker frontend
+)
 
 cat <<EOF
 IronRAG ${VERSION} is starting.

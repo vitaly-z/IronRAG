@@ -4,7 +4,7 @@ use super::types::{
     GraphExtractionTechnicalFact,
 };
 
-pub(crate) const GRAPH_EXTRACTION_VERSION: &str = "graph_extract_v8";
+pub(crate) const GRAPH_EXTRACTION_VERSION: &str = "graph_extract";
 pub(crate) const GRAPH_EXTRACTION_MAX_PROVIDER_ATTEMPTS: usize = 2;
 pub(crate) const GRAPH_EXTRACTION_REQUEST_OVERHEAD_BYTES: usize = 8 * 1024;
 pub(crate) const GRAPH_EXTRACTION_MAX_SEGMENTS: usize = 3;
@@ -99,6 +99,7 @@ SOURCE WRITING PRESERVATION (critical):\n\
 - Every `label`, `alias`, `source_label`, `target_label`, and textual `summary` MUST preserve the writing system and language used by the source chunk text.\n\
 - NEVER transliterate, translate, phonetically transcribe, or otherwise convert source text from one writing system to another.\n\
 - NEVER substitute visually similar glyphs across writing systems or replace digits with look-alike letters or letters with look-alike digits.\n\
+- NEVER emit UTF-8 mojibake, Latin-1 byte artifacts, replacement characters, or C0/C1 control characters in any JSON string value.\n\
 - Each `label`, `source_label`, and `target_label` value MUST appear as a verbatim, byte-for-byte substring of the prepared chunk text segments. If you cannot copy a name directly from the source, do not emit it.".to_string(),
     ));
     sections.push((
@@ -226,7 +227,8 @@ Critical rules:\n\
         .join("\n\n");
     let request_size_bytes = prompt.len();
     let request_shape_key = format!(
-        "graph_extract_v8:{}:segments_{}:downgrade_{}:{}",
+        "{}:{}:segments_{}:downgrade_{}:{}",
+        GRAPH_EXTRACTION_VERSION,
         match variant {
             GraphExtractionPromptVariant::Initial => "initial",
             GraphExtractionPromptVariant::ProviderRetry => "provider_retry",

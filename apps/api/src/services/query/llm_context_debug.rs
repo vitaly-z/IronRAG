@@ -1,4 +1,4 @@
-//! In-memory capture of the exact LLM request sent on each answer
+//! Durable capture of the exact LLM request sent on each answer
 //! iteration, used by the assistant's debug panel to show the user
 //! what actually reached the provider.
 //!
@@ -7,16 +7,12 @@
 //! fidelity revision over the same evidence. This module lets the
 //! operator inspect those exact wire payloads after the fact.
 //!
-//! Storage is a bounded FIFO cache keyed by `execution_id`. Volatile
-//! on purpose: debug snapshots are large (kilobytes to a few hundred
-//! kilobytes per turn) and have zero value past the current debug
-//! session. A worker restart clears the cache; there is no schema
-//! migration and no disk footprint.
-
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+//! Storage is canonical Postgres state keyed by `execution_id`, so
+//! completed turns, cached answer replays, and backend restarts all
+//! expose the same provider payload to the UI.
 
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::integrations::llm::ChatMessage;
@@ -53,8 +49,8 @@ pub struct ResponseToolCallDebug {
     pub is_error: bool,
 }
 
-/// Metadata describing the agent tool-loop that produced this snapshot.
-/// Present only on turns driven by the MCP-agent loop; absent on
+/// Metadata describing the tool-use loop that produced this snapshot.
+/// Present only on turns driven by tool-use execution; absent on
 /// single-shot grounded-answer turns.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -65,7 +61,7 @@ pub struct AgentLoopMetadata {
     pub tool_call_count: usize,
 }
 
-/// Reason the agent tool-loop stopped iterating.
+/// Reason the tool-use loop stopped iterating.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStopReason {
@@ -94,8 +90,8 @@ pub struct LlmContextSnapshot {
     /// on records written by older code paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_ir: Option<serde_json::Value>,
-    /// Agent tool-loop metadata. `None` for single-shot grounded-answer
-    /// turns; `Some` when an MCP-agent loop drove this turn.
+    /// Tool-use loop metadata. `None` for single-shot grounded-answer turns;
+    /// `Some` when tool-use execution drove this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_loop: Option<AgentLoopMetadata>,
 }
@@ -115,63 +111,55 @@ impl LlmContextSnapshot {
     }
 }
 
-/// Bounded FIFO cache of recent snapshots, keyed by `execution_id`.
-///
-/// Capacity is a hard upper bound; oldest entries are dropped when
-/// inserting past the limit. 100 turns × up to ~200 kB per snapshot =
-/// ≤ 20 MB peak — fine for an always-on operator tool, never persisted.
-#[derive(Clone)]
-pub struct LlmContextDebugStore {
-    inner: Arc<Mutex<VecDeque<(Uuid, LlmContextSnapshot)>>>,
-    capacity: usize,
+pub async fn upsert_snapshot(
+    postgres: &PgPool,
+    snapshot: &LlmContextSnapshot,
+) -> Result<(), sqlx::Error> {
+    let snapshot_json = serde_json::to_value(snapshot).map_err(|error| {
+        sqlx::Error::Protocol(format!("failed to serialize LLM context snapshot: {error}"))
+    })?;
+    sqlx::query(
+        "insert into query_llm_context_snapshot (
+            execution_id, snapshot_json, captured_at
+         ) values ($1, $2, $3)
+         on conflict (execution_id) do update
+         set snapshot_json = excluded.snapshot_json,
+             captured_at = excluded.captured_at",
+    )
+    .bind(snapshot.execution_id)
+    .bind(snapshot_json)
+    .bind(snapshot.captured_at)
+    .execute(postgres)
+    .await?;
+    Ok(())
 }
 
-impl Default for LlmContextDebugStore {
-    fn default() -> Self {
-        Self::with_capacity(100)
-    }
-}
-
-impl LlmContextDebugStore {
-    #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(VecDeque::with_capacity(capacity.max(1)))),
-            capacity: capacity.max(1),
-        }
-    }
-
-    pub fn insert(&self, snapshot: LlmContextSnapshot) {
-        let mut guard = match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // Evict any prior record for the same execution so repeated
-        // writes (streamed vs blocking path) don't duplicate and so
-        // the FIFO stays tight.
-        guard.retain(|(id, _)| *id != snapshot.execution_id);
-        if guard.len() >= self.capacity {
-            guard.pop_front();
-        }
-        guard.push_back((snapshot.execution_id, snapshot));
-    }
-
-    #[must_use]
-    pub fn get(&self, execution_id: Uuid) -> Option<LlmContextSnapshot> {
-        let guard = match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.iter().find(|(id, _)| *id == execution_id).map(|(_, snapshot)| snapshot.clone())
-    }
+pub async fn load_snapshot(
+    postgres: &PgPool,
+    execution_id: Uuid,
+) -> Result<Option<LlmContextSnapshot>, sqlx::Error> {
+    let snapshot_json = sqlx::query_scalar::<_, serde_json::Value>(
+        "select snapshot_json
+         from query_llm_context_snapshot
+         where execution_id = $1",
+    )
+    .bind(execution_id)
+    .fetch_optional(postgres)
+    .await?;
+    snapshot_json
+        .map(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                sqlx::Error::Protocol(format!(
+                    "failed to deserialize LLM context snapshot {execution_id}: {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AgentLoopMetadata, AgentStopReason, LlmContextDebugStore, LlmContextSnapshot,
-        LlmIterationDebug,
-    };
+    use super::{AgentLoopMetadata, AgentStopReason, LlmContextSnapshot, LlmIterationDebug};
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -200,42 +188,6 @@ mod tests {
             usage: serde_json::Value::Null,
             child_runtime_execution_ids: Vec::new(),
         }
-    }
-
-    #[test]
-    fn insert_and_get_roundtrips() {
-        let store = LlmContextDebugStore::with_capacity(4);
-        let id = Uuid::now_v7();
-        store.insert(fake_snapshot(id));
-        assert!(store.get(id).is_some());
-    }
-
-    #[test]
-    fn capacity_evicts_oldest_fifo() {
-        let store = LlmContextDebugStore::with_capacity(2);
-        let a = Uuid::now_v7();
-        let b = Uuid::now_v7();
-        let c = Uuid::now_v7();
-        store.insert(fake_snapshot(a));
-        store.insert(fake_snapshot(b));
-        store.insert(fake_snapshot(c));
-        assert!(store.get(a).is_none());
-        assert!(store.get(b).is_some());
-        assert!(store.get(c).is_some());
-    }
-
-    #[test]
-    fn reinsert_same_execution_replaces_prior_record() {
-        let store = LlmContextDebugStore::with_capacity(4);
-        let id = Uuid::now_v7();
-        let mut first = fake_snapshot(id);
-        first.question = "first".into();
-        store.insert(first);
-        let mut second = fake_snapshot(id);
-        second.question = "second".into();
-        store.insert(second);
-        let fetched = store.get(id);
-        assert_eq!(fetched.map(|s| s.question), Some("second".to_string()));
     }
 
     #[test]

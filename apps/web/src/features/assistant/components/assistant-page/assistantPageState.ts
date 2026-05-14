@@ -27,9 +27,43 @@ export function isTransientNetworkReject(message: string): boolean {
   const lower = message.toLowerCase();
   return (
     lower.includes('networkerror') ||
+    lower.includes('input stream') ||
     lower.includes('failed to fetch') ||
-    lower.includes('load failed')
+    lower.includes('load failed') ||
+    lower.includes('body stream') ||
+    lower.includes('timeout') ||
+    lower.includes('abort')
   );
+}
+
+const TURN_RETRY_MAX_ATTEMPTS = 3;
+const TURN_RETRY_BASE_DELAY_MS = 1000;
+const TURN_RETRY_BACKOFF_FACTOR = 3;
+
+/** Calls `createTurn` with exponential-backoff retry for transient
+ *  network errors (timeout, connection reset, etc.).  Non-transient
+ *  errors (4xx, 5xx) are re-thrown immediately. */
+export async function createTurnWithRetry(
+  sessionId: string,
+  questionText: string,
+  createTurn: (sessionId: string, contentText: string) => Promise<AssistantTurnExecutionResponse>,
+): Promise<AssistantTurnExecutionResponse> {
+  for (let attempt = 0; attempt <= TURN_RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await createTurn(sessionId, questionText);
+    } catch (err: unknown) {
+      const msg = typeof err === 'object' && err !== null && 'message' in err
+        ? String(err.message)
+        : String(err);
+      if (!isTransientNetworkReject(msg) || attempt >= TURN_RETRY_MAX_ATTEMPTS) {
+        throw err;
+      }
+      // Exponential backoff: 1s, 3s, 9s
+      const delay = TURN_RETRY_BASE_DELAY_MS * TURN_RETRY_BACKOFF_FACTOR ** attempt;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw new Error('unreachable');
 }
 
 export function createUserMessage(question: string, now: number): AssistantMessage {

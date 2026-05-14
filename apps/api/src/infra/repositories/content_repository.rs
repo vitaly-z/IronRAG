@@ -900,6 +900,16 @@ pub async fn list_chunks_by_revision(
     .await
 }
 
+pub async fn count_chunks_by_revision(
+    postgres: &PgPool,
+    revision_id: Uuid,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("select count(*) from content_chunk where revision_id = $1")
+        .bind(revision_id)
+        .fetch_one(postgres)
+        .await
+}
+
 pub async fn get_chunk_by_id(
     postgres: &PgPool,
     chunk_id: Uuid,
@@ -1010,7 +1020,7 @@ async fn create_chunk_batch(
     );
 
     builder.push_values(new_chunks.iter(), |mut row, new_chunk| {
-        row.push_bind(Uuid::now_v7())
+        row.push_bind(canonical_content_chunk_id(new_chunk))
             .push_bind(new_chunk.revision_id)
             .push_bind(new_chunk.chunk_index)
             .push_bind(new_chunk.start_offset)
@@ -1037,6 +1047,13 @@ async fn create_chunk_batch(
     );
 
     builder.build_query_as::<ContentChunkRow>().fetch_all(postgres).await
+}
+
+const CONTENT_CHUNK_ID_NAMESPACE: Uuid = Uuid::from_u128(0x6f44_2a36_0f5d_4f18_8f6c_f11d_f356_8f5a);
+
+fn canonical_content_chunk_id(chunk: &NewContentChunk<'_>) -> Uuid {
+    let name = format!("{}:{}:{}", chunk.revision_id, chunk.chunk_index, chunk.text_checksum);
+    Uuid::new_v5(&CONTENT_CHUNK_ID_NAMESPACE, name.as_bytes())
 }
 
 pub async fn delete_chunks_by_revision(
@@ -1475,6 +1492,8 @@ pub struct ContentDocumentListRow {
     pub attempt_failure_code: Option<String>,
     pub attempt_retryable: Option<bool>,
     pub attempt_heartbeat_at: Option<DateTime<Utc>>,
+    pub attempt_failure_message: Option<String>,
+    pub attempt_progress_percent: Option<i32>,
 
     // per-document billing rollup — summed across every execution
     // attributed to this document (ingest_attempt + graph_extraction_attempt).
@@ -1741,6 +1760,8 @@ pub async fn list_document_page_rows(
             a.failure_code as attempt_failure_code,
             a.retryable as attempt_retryable,
             a.heartbeat_at as attempt_heartbeat_at,
+            a.failure_message as attempt_failure_message,
+            a.progress_percent as attempt_progress_percent,
             coalesce(c.cost_total, 0) as cost_total,
             coalesce(c.cost_currency_code, 'USD') as cost_currency_code
         from page p
@@ -1772,7 +1793,8 @@ pub async fn list_document_page_rows(
     );
 
     // Bind order: $1 library_id, $2 include_deleted, $3 search,
-    //             $4 cursor_ts, $5 cursor_id, $6 fetch_limit, $7 status_filter.
+    //             $4 cursor_ts, $5 cursor_id, $6 fetch_limit,
+    //             $7 status_filter.
     //
     // `persistent(false)` forces each execution to re-plan using
     // concrete parameter values. Postgres caches prepared-statement
@@ -2114,7 +2136,9 @@ fn metadata_version_terms(normalized_query: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::metadata_search_terms;
+    use uuid::Uuid;
+
+    use super::{NewContentChunk, canonical_content_chunk_id, metadata_search_terms};
 
     #[test]
     fn metadata_search_terms_extracts_filename_token_from_mixed_query() {
@@ -2143,5 +2167,49 @@ mod tests {
         assert!(terms.version.is_empty());
         let terms = metadata_search_terms("Alpha 1.2");
         assert_eq!(terms.version, vec!["1.2"]);
+    }
+
+    #[test]
+    fn canonical_content_chunk_id_is_stable_for_same_revision_chunk_and_text() {
+        let revision_id = Uuid::parse_str("019e1dd5-70d8-7f70-a7a0-7605bda658d9").unwrap();
+        let chunk = NewContentChunk {
+            revision_id,
+            chunk_index: 7,
+            start_offset: 12,
+            end_offset: 48,
+            token_count: Some(9),
+            normalized_text: "Alpha Suite stores project settings.",
+            text_checksum: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            occurred_at: None,
+            occurred_until: None,
+        };
+        let same_identity = NewContentChunk { token_count: Some(11), ..chunk.clone() };
+
+        assert_eq!(canonical_content_chunk_id(&chunk), canonical_content_chunk_id(&same_identity));
+    }
+
+    #[test]
+    fn canonical_content_chunk_id_changes_when_content_identity_changes() {
+        let revision_id = Uuid::parse_str("019e1dd5-70d8-7f70-a7a0-7605bda658d9").unwrap();
+        let chunk = NewContentChunk {
+            revision_id,
+            chunk_index: 7,
+            start_offset: 12,
+            end_offset: 48,
+            token_count: Some(9),
+            normalized_text: "Alpha Suite stores project settings.",
+            text_checksum: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            occurred_at: None,
+            occurred_until: None,
+        };
+        let different_checksum = NewContentChunk {
+            text_checksum: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ..chunk.clone()
+        };
+
+        assert_ne!(
+            canonical_content_chunk_id(&chunk),
+            canonical_content_chunk_id(&different_checksum)
+        );
     }
 }

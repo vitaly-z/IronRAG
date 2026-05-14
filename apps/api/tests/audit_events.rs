@@ -467,10 +467,11 @@ impl AuditEventsFixture {
                 .await
                 .context("failed to resolve provider catalog")?
                 .with_context(|| format!("missing provider catalog for {provider_kind}"))?;
-        let model_catalog = ai_repository::get_model_catalog_by_provider_and_name(
+        let model_catalog = ai_repository::get_model_catalog_by_provider_name_and_capability(
             self.pool(),
             provider_kind,
             model_name,
+            "chat",
         )
         .await
         .context("failed to resolve model catalog")?

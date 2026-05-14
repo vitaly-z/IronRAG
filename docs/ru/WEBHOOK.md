@@ -10,7 +10,7 @@
 
 ## Обзор
 
-IronRAG отправляет исходящие webhooks, уведомляя внешние системы об изменениях состояния. Приём входящих событий от vendor-систем (Confluence, MediaWiki, Notion и др.) — ответственность внешней middleware-прослойки, которая напрямую вызывает канонический HTTP API IronRAG (upload / replace / delete).
+IronRAG отправляет исходящие webhooks, уведомляя внешние системы об изменениях состояния. Приём входящих событий от vendor-систем (Confluence, MediaWiki, Notion и др.) — ответственность внешней middleware-прослойки, которая напрямую вызывает HTTP API IronRAG (upload / replace / delete).
 
 **Outbound** — `webhook_subscription` регистрирует HTTPS-эндпоинты, получающие HMAC-подписанные события об изменениях состояния IronRAG (`revision.ready`, `document.deleted`). Доставка durable: каждая отправка — `ingest_job` с `job_kind=webhook_delivery`, существующий пул воркеров обрабатывает lease/heartbeat/retry. На неудачу — экспоненциальный backoff до 8 попыток (cap 6 часов), затем `abandoned`.
 
@@ -40,7 +40,7 @@ Content-Type: application/json
 |------|---------|
 | `workspace_id` | Scope. Доставляются только события из этого workspace |
 | `library_id` | Опционально. Если указан — только события из этой library; null = все libraries в workspace |
-| `event_types` | Непустой массив канонических event names |
+| `event_types` | Непустой массив event names |
 | `secret` | HMAC-SHA256 ключ для исходящих подписей |
 | `custom_headers` | Свободные HTTP-заголовки, добавляемые к каждой отправке |
 | `active` | По умолчанию `true`; `false` → подписка приостановлена |
@@ -135,7 +135,7 @@ Replay-защита: получатели ДОЛЖНЫ отклонять delive
 
 ## Детект изменений только-картинок
 
-Когда PDF, DOCX или PPTX заменяет встроенную картинку без изменения OCR-текста, существующий `text_checksum` не изменился бы и канонический chunk-reuse plan пропустил бы re-embedding. Чтобы это исправить, IronRAG считает revision-level `image_checksum` (canonical sort всех байтов извлечённых картинок, затем SHA-256). Когда `parent.image_checksum != new.image_checksum`, chunk-reuse plan байпасится и embeddings + graph extraction пересчитываются полностью для этой ревизии. Семантика `text_checksum` сохранена (только текст).
+Когда PDF, DOCX или PPTX заменяет встроенную картинку без изменения OCR-текста, существующий `text_checksum` не изменился бы и стандартный chunk-reuse plan пропустил бы re-embedding. Чтобы это исправить, IronRAG считает revision-level `image_checksum` (sort всех байтов извлечённых картинок, затем SHA-256). Когда `parent.image_checksum != new.image_checksum`, chunk-reuse plan байпасится и embeddings + graph extraction пересчитываются полностью для этой ревизии. Семантика `text_checksum` сохранена (только текст).
 
 ## Операционные заметки
 
@@ -167,4 +167,4 @@ def verify_and_forward(secret: bytes, header: str, body: bytes):
         )
 ```
 
-Для приёма vendor-событий (обновление страницы Confluence → замена документа в IronRAG) — см. внешний middleware-проект; канонический вход — API IronRAG upload/replace/delete.
+Для приёма vendor-событий (обновление страницы Confluence → замена документа в IronRAG) — см. внешний middleware-проект; вход — API IronRAG upload/replace/delete.

@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -37,7 +37,8 @@ use crate::{
         graph::extract::{
             GraphExtractionSubTypeHintEntry, GraphExtractionSubTypeHintGroup,
             GraphExtractionSubTypeHints, build_graph_extraction_cache_fingerprint,
-            extract_chunk_graph_candidates, extraction_lifecycle_from_record,
+            canonical_graph_extraction_normalized_json, extract_chunk_graph_candidates,
+            extraction_lifecycle_from_record, repair_graph_extraction_candidate_set,
         },
         graph::projection::resolve_projection_scope,
         ingest::cancellation::ensure_not_cancelled,
@@ -55,9 +56,12 @@ use crate::{
     },
     shared::extraction::file_extract::{
         FileExtractError, FileExtractionPlan, FileExtractionRequest, UploadAdmissionError,
-        UploadFileKind, build_runtime_file_extraction_plan, validate_upload_file_admission,
+        UploadFileKind, augment_docling_output_with_vision_picture_ocr,
+        build_docling_pdf_extraction_plan, build_runtime_file_extraction_plan,
+        docling_embedded_picture_vision_enabled, validate_upload_file_admission,
     },
     shared::extraction::{
+        ExtractionOutput,
         record_jsonl::RECORD_JSONL_SOURCE_FORMAT,
         structured_document::StructuredBlockKind,
         table_graph::{TableGraphProfile, build_table_graph_profile},
@@ -76,7 +80,8 @@ use super::{
     EditableDocumentContext, InlineMutationContext, MaterializeRevisionGraphCandidatesCommand,
     PendingChunkInsert, PreparedRevisionPersistenceSummary, PromoteHeadCommand,
     ReprocessRevisionSource, RevisionAdmissionMetadata, RevisionGraphCandidateMaterialization,
-    locate_chunk_offsets, map_revision_row, map_structured_revision_data, sha256_hex_text,
+    locate_chunk_offsets, map_revision_row, map_structured_revision_data,
+    map_structured_revision_row, sha256_hex_text,
 };
 
 fn validate_extraction_plan(
@@ -152,19 +157,6 @@ impl ContentService {
         file_bytes: &[u8],
     ) -> Result<FileExtractionPlan, UploadAdmissionError> {
         let file_size_bytes = u64::try_from(file_bytes.len()).unwrap_or(u64::MAX);
-        // Vision binding is only needed for image files routed to the vision engine.
-        // Text, markup, code, CSV, and Docling-owned document formats must not be
-        // blocked by the absence of a vision binding.
-        let vision_binding = state
-            .canonical_services
-            .ai_catalog
-            .resolve_active_runtime_binding(state, library_id, AiBindingPurpose::Vision)
-            .await
-            .unwrap_or(None);
-        let vision_provider = vision_binding.as_ref().map(|binding| ProviderModelSelection {
-            provider_kind: binding.provider_kind.clone(),
-            model_name: binding.model_name.clone(),
-        });
         let recognition_policy =
             resolve_library_recognition_policy(state, library_id).await.map_err(|error| {
                 UploadAdmissionError::from_file_extract_error(
@@ -182,6 +174,16 @@ impl ContentService {
                     },
                 )
             })?;
+        let vision_binding = state
+            .canonical_services
+            .ai_catalog
+            .resolve_active_runtime_binding(state, library_id, AiBindingPurpose::Vision)
+            .await
+            .unwrap_or(None);
+        let vision_provider = vision_binding.as_ref().map(|binding| ProviderModelSelection {
+            provider_kind: binding.provider_kind.clone(),
+            model_name: binding.model_name.clone(),
+        });
         let plan = build_runtime_file_extraction_plan(FileExtractionRequest {
             gateway: state.llm_gateway.as_ref(),
             vision_provider: vision_provider.as_ref(),
@@ -208,6 +210,83 @@ impl ContentService {
         })?;
         validate_extraction_plan(file_name, mime_type, file_size_bytes, &plan)?;
         Ok(plan)
+    }
+
+    pub async fn build_runtime_pdf_docling_extraction_plan_from_output(
+        &self,
+        state: &AppState,
+        library_id: Uuid,
+        file_name: &str,
+        mime_type: Option<&str>,
+        file_size_bytes: u64,
+        mut output: ExtractionOutput,
+    ) -> Result<FileExtractionPlan, UploadAdmissionError> {
+        self.augment_runtime_docling_output(state, library_id, &mut output).await.map_err(
+            |error| {
+                UploadAdmissionError::from_file_extract_error(
+                    file_name,
+                    mime_type,
+                    file_size_bytes,
+                    &error,
+                )
+            },
+        )?;
+
+        let plan = build_docling_pdf_extraction_plan(output);
+        validate_extraction_plan(file_name, mime_type, file_size_bytes, &plan)?;
+        Ok(plan)
+    }
+
+    pub async fn augment_runtime_docling_output(
+        &self,
+        state: &AppState,
+        library_id: Uuid,
+        output: &mut ExtractionOutput,
+    ) -> Result<(), FileExtractError> {
+        let recognition_policy = match resolve_library_recognition_policy(state, library_id).await {
+            Ok(policy) => policy,
+            Err(error) => {
+                output.extracted_images.clear();
+                return Err(FileExtractError::ExtractionFailed {
+                    file_kind: UploadFileKind::Pdf,
+                    message: format!(
+                        "failed to load recognition policy for docling embedded picture OCR: {error}"
+                    ),
+                });
+            }
+        };
+        if !docling_embedded_picture_vision_enabled(&recognition_policy) {
+            output.extracted_images.clear();
+            return Ok(());
+        }
+        let vision_binding = state
+            .canonical_services
+            .ai_catalog
+            .resolve_active_runtime_binding(state, library_id, AiBindingPurpose::Vision)
+            .await
+            .unwrap_or(None);
+        let Some(vision_binding) = vision_binding else {
+            output.extracted_images.clear();
+            return Err(FileExtractError::ExtractionFailed {
+                file_kind: UploadFileKind::Pdf,
+                message: "vision recognition policy is active but no Vision binding is configured"
+                    .to_string(),
+            });
+        };
+        let vision_provider = ProviderModelSelection {
+            provider_kind: vision_binding.provider_kind.clone(),
+            model_name: vision_binding.model_name.clone(),
+        };
+        augment_docling_output_with_vision_picture_ocr(
+            output,
+            UploadFileKind::Pdf,
+            state.llm_gateway.as_ref(),
+            Some(&vision_provider),
+            vision_binding.api_key.as_deref(),
+            vision_binding.provider_base_url.as_deref(),
+            Some(&vision_binding.extra_parameters_json),
+        )
+        .await
     }
 
     pub(crate) fn validate_inline_file_admission(
@@ -916,6 +995,93 @@ impl ContentService {
                 .await
                 .map_err(|e| ApiError::internal_with_log(e, "internal"))?
                 .ok_or_else(|| ApiError::resource_not_found("revision", revision_id))?;
+        if let Some(structured_revision) = state
+            .arango_document_store
+            .get_structured_revision(revision_id)
+            .await
+            .map_err(|e| ApiError::internal_with_log(e, "internal"))?
+        {
+            let artifact_identity_matches = structured_revision.revision_id == revision_id
+                && structured_revision.document_id == revision.document_id
+                && structured_revision.workspace_id == revision.workspace_id
+                && structured_revision.library_id == revision.library_id;
+            let extraction_shape_matches = structured_revision.normalization_profile
+                == extraction_plan.normalization_profile
+                && structured_revision.source_format
+                    == extraction_plan.source_format_metadata.source_format;
+            if structured_revision.preparation_state == "prepared"
+                && structured_revision.chunk_count > 0
+                && artifact_identity_matches
+                && extraction_shape_matches
+            {
+                let expected_chunk_count = i64::from(structured_revision.chunk_count);
+                let expected_fact_count = i64::from(structured_revision.typed_fact_count.max(0));
+                let postgres_chunk_count = content_repository::count_chunks_by_revision(
+                    &state.persistence.postgres,
+                    revision_id,
+                )
+                .await
+                .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
+                let arango_chunk_count = state
+                    .arango_document_store
+                    .count_chunks_by_revision(revision_id)
+                    .await
+                    .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
+                let arango_fact_count = state
+                    .arango_document_store
+                    .count_technical_facts_by_revision(revision_id)
+                    .await
+                    .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
+                if postgres_chunk_count == expected_chunk_count
+                    && arango_chunk_count == expected_chunk_count
+                    && arango_fact_count == expected_fact_count
+                {
+                    let normalization_profile = structured_revision.normalization_profile.clone();
+                    let prepared_revision = map_structured_revision_row(structured_revision);
+                    info!(
+                        revision_id = %revision_id,
+                        document_id = %revision.document_id,
+                        library_id = %revision.library_id,
+                        chunk_count = expected_chunk_count,
+                        technical_fact_count = expected_fact_count,
+                        "structured revision persistence resume reused prepared artifacts"
+                    );
+                    return Ok(PreparedRevisionPersistenceSummary {
+                        prepared_revision,
+                        chunk_count: usize::try_from(expected_chunk_count).unwrap_or(usize::MAX),
+                        technical_fact_count: usize::try_from(expected_fact_count)
+                            .unwrap_or(usize::MAX),
+                        technical_conflict_count: 0,
+                        normalization_profile,
+                        prepare_structure_elapsed_ms: 0,
+                        chunk_content_elapsed_ms: 0,
+                        extract_technical_facts_elapsed_ms: 0,
+                    });
+                }
+                warn!(
+                    revision_id = %revision_id,
+                    document_id = %revision.document_id,
+                    library_id = %revision.library_id,
+                    expected_chunk_count,
+                    postgres_chunk_count,
+                    arango_chunk_count,
+                    expected_fact_count,
+                    arango_fact_count,
+                    "structured revision persistence resume found incomplete artifacts; rebuilding prepared structure"
+                );
+            } else {
+                warn!(
+                    revision_id = %revision_id,
+                    document_id = %revision.document_id,
+                    library_id = %revision.library_id,
+                    artifact_preparation_state = %structured_revision.preparation_state,
+                    artifact_chunk_count = structured_revision.chunk_count,
+                    artifact_identity_matches,
+                    extraction_shape_matches,
+                    "structured revision persistence resume skipped existing artifact; rebuilding prepared structure"
+                );
+            }
+        }
         let source_text = extraction_plan.source_text.clone().unwrap_or_default();
         let normalized_text =
             extraction_plan.normalized_text.clone().unwrap_or_else(|| source_text.clone());
@@ -1039,15 +1205,6 @@ impl ContentService {
             .await
             .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
 
-        ensure_not_cancelled(cancellation_token)?;
-        let _ =
-            content_repository::delete_chunks_by_revision(&state.persistence.postgres, revision_id)
-                .await
-                .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
-        ensure_not_cancelled(cancellation_token)?;
-        let _ =
-            state.canonical_services.knowledge.delete_revision_chunks(state, revision_id).await?;
-        ensure_not_cancelled(cancellation_token)?;
         let mut next_search_char = 0usize;
         let mut pending_chunks = Vec::with_capacity(prepared.chunk_windows.len());
         let mut knowledge_chunks = Vec::with_capacity(prepared.chunk_windows.len());
@@ -1102,10 +1259,29 @@ impl ContentService {
                 occurred_until: chunk.occurred_until,
             })
             .collect::<Vec<_>>();
-        let created_chunks =
-            content_repository::create_chunks(&state.persistence.postgres, &postgres_chunks)
+        ensure_not_cancelled(cancellation_token)?;
+        let existing_chunks =
+            content_repository::list_chunks_by_revision(&state.persistence.postgres, revision_id)
                 .await
                 .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
+        ensure_not_cancelled(cancellation_token)?;
+        let created_chunks = if content_chunks_match_prepared(&existing_chunks, &postgres_chunks) {
+            existing_chunks
+        } else {
+            let _ = content_repository::delete_chunks_by_revision(
+                &state.persistence.postgres,
+                revision_id,
+            )
+            .await
+            .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
+            ensure_not_cancelled(cancellation_token)?;
+            content_repository::create_chunks(&state.persistence.postgres, &postgres_chunks)
+                .await
+                .map_err(|e| ApiError::internal_with_log(e, "internal"))?
+        };
+        ensure_not_cancelled(cancellation_token)?;
+        let _ =
+            state.canonical_services.knowledge.delete_revision_chunks(state, revision_id).await?;
         ensure_not_cancelled(cancellation_token)?;
         let mut block_to_chunk_ids = std::collections::BTreeMap::<Uuid, Vec<Uuid>>::new();
         for (chunk, pending_chunk) in created_chunks.into_iter().zip(pending_chunks.iter()) {
@@ -1242,6 +1418,25 @@ impl ContentService {
                 ApiError::resource_not_found("knowledge_document", revision.document_id)
             })?;
         ensure_not_cancelled(cancellation_token)?;
+        let canceled_orphans =
+            repositories::cancel_processing_runtime_graph_extractions_for_document(
+                &state.persistence.postgres,
+                command.library_id,
+                document.document_id,
+                "graph extraction restarted before this chunk completed",
+            )
+            .await
+            .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
+        if canceled_orphans > 0 {
+            info!(
+                library_id = %command.library_id,
+                revision_id = %command.revision_id,
+                document_id = %document.document_id,
+                canceled_orphans,
+                "graph extraction resume canceled orphaned processing chunk rows"
+            );
+        }
+        ensure_not_cancelled(cancellation_token)?;
         let all_chunks = state
             .arango_document_store
             .list_chunks_by_revision(command.revision_id)
@@ -1363,6 +1558,7 @@ impl ContentService {
         let reused_chunk_ids = cache_plan.reused_chunk_ids;
         let reused_entity_count = cache_plan.reused_entity_count;
         let reused_relation_count = cache_plan.reused_relation_count;
+        let reused_prompt_hash_mismatch_count = cache_plan.reused_prompt_hash_mismatch_count;
 
         if !reused_chunk_ids.is_empty() {
             tracing::info!(
@@ -1370,6 +1566,7 @@ impl ContentService {
                 total_chunks = chunk_count,
                 selected_graph_chunks = selected_graph_chunk_count,
                 reused = reused_chunk_ids.len(),
+                reused_prompt_hash_mismatches = reused_prompt_hash_mismatch_count,
                 reused_entities = reused_entity_count,
                 reused_relations = reused_relation_count,
                 "graph extraction cache: reusing ready extraction output",
@@ -1395,6 +1592,7 @@ impl ContentService {
         let table_graph_context = std::sync::Arc::new(table_graph_context);
         let graph_chunk_policy = std::sync::Arc::new(graph_chunk_policy);
 
+        let total_to_extract = chunks.len();
         let per_chunk_stream = stream::iter(chunks.into_iter().map(|chunk| {
             let state = state.clone();
             let graph_runtime_context = graph_runtime_context.clone();
@@ -1534,23 +1732,71 @@ impl ContentService {
         // small counters are consumed and dropped as soon as the future
         // completes.
         let fold_cancellation_token = cancellation_token.clone();
-        let aggregate = per_chunk_stream
-            .buffer_unordered(graph_extract_parallelism)
-            .try_fold(ChunkExtractAggregate::default(), move |mut acc, item| {
-                let cancellation_token = fold_cancellation_token.clone();
-                async move {
-                    ensure_not_cancelled(&cancellation_token)?;
-                    acc.extracted_entities =
-                        acc.extracted_entities.saturating_add(item.extracted_entities);
-                    acc.extracted_relations =
-                        acc.extracted_relations.saturating_add(item.extracted_relations);
-                    acc.prompt_tokens += item.prompt_tokens;
-                    acc.completion_tokens += item.completion_tokens;
-                    acc.total_tokens += item.total_tokens;
-                    Ok(acc)
+
+        // Progress tracking: log every 30 seconds during large extractions.
+        let progress_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let progress_reporter = {
+            let counter = progress_counter.clone();
+            let revision_id = command.revision_id;
+            let library_id = command.library_id;
+            let total = total_to_extract; // captured before `chunks` was consumed above
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    let done = counter.load(std::sync::atomic::Ordering::Relaxed) as usize;
+                    if done >= total {
+                        break;
+                    }
+                    tracing::info!(
+                        library_id = %library_id,
+                        revision_id = %revision_id,
+                        progress_pct = done * 100 / total.max(1),
+                        done,
+                        total,
+                        "extract_graph: chunk progress"
+                    );
                 }
             })
-            .await?;
+        };
+
+        let idle_timeout = std::time::Duration::from_secs(
+            state.settings.runtime_graph_extract_idle_timeout_seconds.max(1),
+        );
+        let aggregate_result: anyhow::Result<ChunkExtractAggregate> = async {
+            let mut aggregate = ChunkExtractAggregate::default();
+            let buffered = per_chunk_stream.buffer_unordered(graph_extract_parallelism);
+            futures::pin_mut!(buffered);
+            loop {
+                let item = match tokio::time::timeout(idle_timeout, buffered.try_next()).await {
+                    Ok(Ok(Some(item))) => item,
+                    Ok(Ok(None)) => break,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(anyhow::anyhow!(
+                            "graph extraction idle timeout: no chunk completed for revision {} within {}s",
+                            command.revision_id,
+                            idle_timeout.as_secs()
+                        ));
+                    }
+                };
+
+                ensure_not_cancelled(&fold_cancellation_token)?;
+                aggregate.extracted_entities = aggregate
+                    .extracted_entities
+                    .saturating_add(item.extracted_entities);
+                aggregate.extracted_relations = aggregate
+                    .extracted_relations
+                    .saturating_add(item.extracted_relations);
+                aggregate.prompt_tokens += item.prompt_tokens;
+                aggregate.completion_tokens += item.completion_tokens;
+                aggregate.total_tokens += item.total_tokens;
+                progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(aggregate)
+        }
+        .await;
+        progress_reporter.abort();
+        let aggregate = aggregate_result?;
 
         let extracted_entities = aggregate.extracted_entities;
         let extracted_relations = aggregate.extracted_relations;
@@ -1573,6 +1819,7 @@ impl ContentService {
             model_name: Some(model_name),
             usage_json,
             reused_chunks: reused_chunk_ids.len(),
+            reused_prompt_hash_mismatches: reused_prompt_hash_mismatch_count,
             reused_entities: reused_entity_count,
             reused_relations: reused_relation_count,
             record_stream_source_units_skipped,
@@ -1633,7 +1880,7 @@ impl ContentService {
             );
             let text_checksum = sha256_hex_text(&chunk.normalized_text);
             let Some(record) =
-                crate::infra::repositories::find_ready_runtime_graph_extraction_record_by_cache_key(
+                crate::infra::repositories::find_ready_runtime_graph_extraction_record_by_semantic_cache_key(
                     &state.persistence.postgres,
                     command.library_id,
                     &text_checksum,
@@ -1644,14 +1891,32 @@ impl ContentService {
                 )
                 .await
                 .map_err(|e| {
-                    ApiError::internal_with_log(
-                        e,
-                        "graph_cache: find_ready_runtime_graph_extraction_record_by_cache_key",
-                    )
+                        ApiError::internal_with_log(
+                            e,
+                            "graph_cache: find_ready_runtime_graph_extraction_record_by_semantic_cache_key",
+                        )
                 })?
             else {
                 continue;
             };
+            if record.prompt_hash != fingerprint.prompt_hash {
+                plan.reused_prompt_hash_mismatch_count =
+                    plan.reused_prompt_hash_mismatch_count.saturating_add(1);
+            }
+
+            let original_counts = graph_candidate_counts(&record.normalized_output_json);
+            let repaired_candidate_set =
+                serde_json::from_value(record.normalized_output_json.clone())
+                    .map(repair_graph_extraction_candidate_set)
+                    .unwrap_or_default();
+            if original_counts.0.saturating_add(original_counts.1) > 0
+                && repaired_candidate_set.entities.is_empty()
+                && repaired_candidate_set.relations.is_empty()
+            {
+                continue;
+            }
+            let repaired_normalized_output_json =
+                canonical_graph_extraction_normalized_json(repaired_candidate_set);
 
             ensure_not_cancelled(cancellation_token)?;
             if record.chunk_id != chunk.chunk_id {
@@ -1671,7 +1936,7 @@ impl ContentService {
                         prompt_hash: record.prompt_hash.clone(),
                         status: ASYNC_OP_STATUS_READY.to_string(),
                         raw_output_json,
-                        normalized_output_json: record.normalized_output_json.clone(),
+                        normalized_output_json: repaired_normalized_output_json.clone(),
                         glean_pass_count: 0,
                         error_message: None,
                     },
@@ -1691,10 +1956,34 @@ impl ContentService {
                 {
                     continue;
                 }
+                if repaired_normalized_output_json != record.normalized_output_json {
+                    crate::infra::repositories::update_runtime_graph_extraction_record_safe(
+                        &state.persistence.postgres,
+                        record.id,
+                        &crate::infra::repositories::UpdateRuntimeGraphExtractionRecordInput {
+                            provider_kind: record.provider_kind.clone(),
+                            model_name: record.model_name.clone(),
+                            prompt_hash: record.prompt_hash.clone(),
+                            status: record.status.clone(),
+                            raw_output_json: record.raw_output_json.clone(),
+                            normalized_output_json: repaired_normalized_output_json.clone(),
+                            glean_pass_count: record.glean_pass_count,
+                            error_message: record.error_message.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ApiError::internal_with_log(
+                            e,
+                            "graph_cache: update_runtime_graph_extraction_record_safe",
+                        )
+                    })?;
+                    ensure_not_cancelled(cancellation_token)?;
+                }
             }
 
             let (entity_count, relation_count) =
-                graph_candidate_counts(&record.normalized_output_json);
+                graph_candidate_counts(&repaired_normalized_output_json);
             plan.reused_entity_count = plan.reused_entity_count.saturating_add(entity_count);
             plan.reused_relation_count = plan.reused_relation_count.saturating_add(relation_count);
             plan.reused_chunk_ids.insert(chunk.chunk_id);
@@ -1724,6 +2013,7 @@ struct CachedGraphExtractionMaterialization<'a> {
 #[derive(Debug, Default)]
 struct GraphExtractionCachePlan {
     reused_chunk_ids: BTreeSet<Uuid>,
+    reused_prompt_hash_mismatch_count: usize,
     reused_entity_count: usize,
     reused_relation_count: usize,
 }
@@ -1752,6 +2042,23 @@ fn graph_cache_reuse_raw_output(
         );
     }
     raw_output_json
+}
+
+fn content_chunks_match_prepared(
+    existing_chunks: &[content_repository::ContentChunkRow],
+    prepared_chunks: &[content_repository::NewContentChunk<'_>],
+) -> bool {
+    existing_chunks.len() == prepared_chunks.len()
+        && existing_chunks.iter().zip(prepared_chunks.iter()).all(|(existing, prepared)| {
+            existing.revision_id == prepared.revision_id
+                && existing.chunk_index == prepared.chunk_index
+                && existing.start_offset == prepared.start_offset
+                && existing.end_offset == prepared.end_offset
+                && existing.token_count == prepared.token_count
+                && existing.text_checksum == prepared.text_checksum
+                && existing.occurred_at == prepared.occurred_at
+                && existing.occurred_until == prepared.occurred_until
+        })
 }
 
 fn graph_candidate_counts(normalized_output_json: &serde_json::Value) -> (usize, usize) {

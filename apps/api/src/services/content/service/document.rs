@@ -1572,9 +1572,11 @@ pub struct ContentDocumentListEntry {
     pub status: DocumentStatus,
     pub readiness: DocumentReadiness,
     pub stage: Option<String>,
+    pub progress_percent: Option<i32>,
     pub processing_started_at: Option<DateTime<Utc>>,
     pub processing_finished_at: Option<DateTime<Utc>>,
     pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
     pub retryable: bool,
     pub source_kind: Option<String>,
     pub source_uri: Option<String>,
@@ -1755,6 +1757,10 @@ fn build_document_list_entry(
 
     let failure_code =
         row.attempt_failure_code.clone().or_else(|| row.mutation_failure_code.clone());
+    let progress_percent = derive_document_list_progress_percent(
+        status,
+        row.attempt_progress_percent.unwrap_or_default(),
+    );
 
     ContentDocumentListEntry {
         id: row.id,
@@ -1768,9 +1774,11 @@ fn build_document_list_entry(
         status,
         readiness,
         stage,
+        progress_percent,
         processing_started_at,
         processing_finished_at,
         failure_code,
+        failure_message: row.attempt_failure_message.clone(),
         retryable: row.attempt_retryable.unwrap_or(false),
         source_kind: row
             .revision_content_source_kind
@@ -1788,6 +1796,19 @@ fn build_document_list_entry(
 
 fn revision_text_state_is_readable(state: &str) -> bool {
     crate::domains::content::revision_text_state_is_readable(state)
+}
+
+fn derive_document_list_progress_percent(
+    status: DocumentStatus,
+    attempt_progress_percent: i32,
+) -> Option<i32> {
+    match status {
+        DocumentStatus::Ready => Some(100),
+        DocumentStatus::Queued => Some(0),
+        DocumentStatus::Processing | DocumentStatus::Failed | DocumentStatus::Canceled => {
+            Some(attempt_progress_percent.clamp(0, 99))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1839,6 +1860,8 @@ mod tests {
             attempt_failure_code: None,
             attempt_retryable: None,
             attempt_heartbeat_at: None,
+            attempt_failure_message: None,
+            attempt_progress_percent: None,
             cost_total: Decimal::ZERO,
             cost_currency_code: "USD".to_string(),
         }
@@ -1898,6 +1921,44 @@ mod tests {
 
         assert_eq!(entry.status, DocumentStatus::Ready);
         assert_eq!(entry.readiness, DocumentReadiness::Readable);
+    }
+
+    #[test]
+    fn list_entry_uses_attempt_processing_progress() {
+        let mut row = list_row(Some("leased"), Some("running"));
+        row.attempt_current_stage = Some("extract_graph".to_string());
+        row.attempt_progress_percent = Some(76);
+        let revision = revision("readable", "ready", "ready");
+
+        let entry = build_document_list_entry(&row, None, Some(&revision));
+
+        assert_eq!(entry.status, DocumentStatus::Processing);
+        assert_eq!(entry.progress_percent, Some(76));
+    }
+
+    #[test]
+    fn list_entry_marks_ready_documents_as_complete() {
+        let row = list_row(None, None);
+        let revision = revision("readable", "ready", "ready");
+
+        let entry = build_document_list_entry(&row, None, Some(&revision));
+
+        assert_eq!(entry.status, DocumentStatus::Ready);
+        assert_eq!(entry.progress_percent, Some(100));
+    }
+
+    #[test]
+    fn list_entry_surfaces_failed_mutation_message() {
+        let mut row = list_row(None, Some("failed"));
+        row.mutation_failure_code = Some("parser_failed".to_string());
+        row.attempt_failure_message = Some("Parser failed on page 2".to_string());
+        let revision = revision("pending", "pending", "pending");
+
+        let entry = build_document_list_entry(&row, None, Some(&revision));
+
+        assert_eq!(entry.status, DocumentStatus::Failed);
+        assert_eq!(entry.failure_code.as_deref(), Some("parser_failed"));
+        assert_eq!(entry.failure_message.as_deref(), Some("Parser failed on page 2"));
     }
 
     #[test]

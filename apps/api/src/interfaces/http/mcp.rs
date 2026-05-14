@@ -53,8 +53,22 @@ pub(super) const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(super) const MCP_SERVER_NAME: &str = "ironrag-mcp-memory";
 pub(super) const MCP_SERVER_VERSION: &str = "0.1.0";
 
-pub const MCP_ANSWER_TOOL_NAMES: &[&str] =
-    &["list_workspaces", "list_libraries", "grounded_answer"];
+pub const MCP_ANSWER_TOOL_NAMES: &[&str] = &[
+    "list_workspaces",
+    "list_libraries",
+    "grounded_answer",
+    "search_documents",
+    "read_document",
+    "list_documents",
+    "search_entities",
+    "get_graph_topology",
+    "list_relations",
+    "get_communities",
+    "get_runtime_execution",
+    "get_runtime_execution_trace",
+    "get_web_ingest_run",
+    "list_web_ingest_run_pages",
+];
 
 pub const MCP_DIAGNOSTICS_TOOL_NAMES: &[&str] = &[
     "list_workspaces",

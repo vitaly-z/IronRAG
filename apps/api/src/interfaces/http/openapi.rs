@@ -5,11 +5,8 @@ use axum::{
     routing::get,
 };
 
-use crate::app::state::AppState;
-
-const OPENAPI_SPEC: &str = include_str!("../../../contracts/openapi.gen.yaml");
-/// `OpenAPI` `paths` in the contract are absolute from the host (`/v1/...`). The server URL must be
-/// the API origin **without** a `/v1` suffix, otherwise Swagger UI concatenates `/v1` + `/v1/...`.
+use crate::{app::state::AppState, openapi::ApiDoc};
+use utoipa::OpenApi;
 const RELATIVE_SERVER_URL: &str = "/";
 const CONFIGURED_SERVER_DESCRIPTION: &str = "Public API origin";
 const RELATIVE_SERVER_DESCRIPTION: &str = "Same origin (paths include /v1)";
@@ -33,10 +30,11 @@ pub async fn get_openapi_spec(State(state): State<AppState>) -> (HeaderMap, Stri
     response_headers
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/yaml; charset=utf-8"));
     response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, max-age=0"));
-    (
-        response_headers,
-        render_openapi_spec(OPENAPI_SPEC, state.settings.openapi_public_origin.as_deref()),
-    )
+    let spec = ApiDoc::openapi()
+        .to_yaml()
+        .unwrap_or_else(|e| format!("error: failed to serialize OpenAPI spec: {e}"));
+
+    (response_headers, render_openapi_spec(&spec, state.settings.openapi_public_origin.as_deref()))
 }
 
 fn render_openapi_spec(spec: &str, openapi_public_origin: Option<&str>) -> String {
@@ -57,7 +55,6 @@ fn public_origin_to_server_url(origin: &str) -> String {
     if base.is_empty() {
         return RELATIVE_SERVER_URL.to_string();
     }
-    // Paths in `ironrag.openapi.yaml` already start with `/v1/`; strip a redundant `/v1` suffix.
     base.strip_suffix("/v1").map_or_else(
         || base.to_string(),
         |stripped| {
@@ -67,22 +64,55 @@ fn public_origin_to_server_url(origin: &str) -> String {
     )
 }
 
+/// Replaces the `servers:` block in the YAML string.  The block runs from
+/// the `servers:` key through the last line that starts with whitespace
+/// (a continued list item).  The replacement block is injected in its place.
 fn replace_servers_block(spec: &str, servers_block: &str) -> String {
     let Some(servers_start) = spec.find("servers:\n") else {
         return spec.to_string();
     };
-    let Some(security_start) = spec.find("\nsecurity:\n") else {
-        return spec.to_string();
-    };
-    if servers_start >= security_start {
-        return spec.to_string();
-    }
+    // Find the end of the servers block: scan forward from the
+    // `servers:` key line, skipping continuation lines (those that
+    // start with whitespace or are empty).  The first non-continuation
+    // line marks the end of the block.
+    let block_body_start = servers_start + "servers:\n".len();
+    let after_servers = &spec[block_body_start..];
+    let block_end = scan_yaml_block_end(after_servers, spec, block_body_start);
 
     let mut rendered = String::with_capacity(spec.len() + servers_block.len());
     rendered.push_str(&spec[..servers_start]);
     rendered.push_str(servers_block);
-    rendered.push_str(&spec[security_start + 1..]);
+    if block_end < spec.len() {
+        rendered.push_str(&spec[block_end..]);
+    }
     rendered
+}
+
+/// Returns the absolute byte offset of the first line in `chunk` that
+/// is NOT a YAML block continuation (indented / empty).  `full_spec`
+/// and `chunk_start` are used to return an absolute offset into the
+/// full document.
+fn scan_yaml_block_end(chunk: &str, full_spec: &str, chunk_start: usize) -> usize {
+    let mut pos = 0usize;
+    while pos < chunk.len() {
+        let line = &chunk[pos..];
+        let line_end = match line.find('\n') {
+            Some(n) => n,
+            None => return full_spec.len(),
+        };
+        let content = &line[..line_end];
+        if content.is_empty()
+            || content.starts_with(' ')
+            || content.starts_with('\t')
+            || content.starts_with("- ")
+            || content == "-"
+        {
+            pos += line_end + 1;
+            continue;
+        }
+        return chunk_start + pos;
+    }
+    full_spec.len()
 }
 
 #[cfg(test)]

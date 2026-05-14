@@ -21,50 +21,16 @@ export function useInspectorQueries(selectedDoc: DocumentItem | null) {
     refetchInterval: isSelectedTerminal ? false : SELECTED_DETAIL_REFRESH_MS,
     refetchIntervalInBackground: false,
   });
-  const segmentsQuery = useQuery({
-    ...queries.listContentPreparedSegmentsOptions({
-      path: { documentId: selectedDoc?.id ?? "" },
-      query: { limit: 1 },
-    }),
-    enabled: !!selectedDoc?.id,
-    staleTime: 0,
-    refetchInterval: isSelectedTerminal ? false : SELECTED_DETAIL_REFRESH_MS,
-    refetchIntervalInBackground: false,
-  });
-  const factsQuery = useQuery({
-    ...queries.listContentTechnicalFactsOptions({
-      path: { documentId: selectedDoc?.id ?? "" },
-    }),
-    enabled: !!selectedDoc?.id,
-    staleTime: 0,
-    refetchInterval: isSelectedTerminal ? false : SELECTED_DETAIL_REFRESH_MS,
-    refetchIntervalInBackground: false,
-  });
   const fetchSelectedDetail = useCallback(
     async (documentId: string) => {
-      await Promise.all([
-        queryClient.invalidateQueries({
-          queryKey: queries.getContentDocumentOptions({ path: { documentId } }).queryKey,
-        }),
-        queryClient.invalidateQueries({
-          queryKey: queries.listContentPreparedSegmentsOptions({
-            path: { documentId },
-            query: { limit: 1 },
-          }).queryKey,
-        }),
-        queryClient.invalidateQueries({
-          queryKey: queries.listContentTechnicalFactsOptions({
-            path: { documentId },
-          }).queryKey,
-        }),
-      ]);
+      await queryClient.invalidateQueries({
+        queryKey: queries.getContentDocumentOptions({ path: { documentId } }).queryKey,
+      });
     },
     [queryClient],
   );
   return {
     fetchSelectedDetail,
-    inspectorFacts: factsQuery.data?.total ?? null,
     inspectorLifecycle: docQuery.data?.lifecycle ?? null,
-    inspectorSegments: segmentsQuery.data?.total ?? null,
   };
 }

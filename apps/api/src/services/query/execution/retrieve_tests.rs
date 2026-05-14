@@ -10,14 +10,15 @@ use super::super::{
 };
 use super::{
     DOCUMENT_IDENTITY_SCORE_FLOOR, RuntimeChunkScoreKind, apply_graph_evidence_texts_to_chunks,
-    canonical_document_revision_id, chunk_answer_source_text, document_identity_chunk_score,
-    entity_bio_chunk_score, graph_evidence_chunk_hits_from_rows, graph_evidence_chunk_score,
-    graph_evidence_context_line, graph_evidence_targets, graph_evidence_targets_for_query,
-    graph_target_entity_profiles, latest_version_documents, map_chunk_hit, merge_chunks,
-    merge_entity_bio_chunks, merge_graph_evidence_chunks, merge_query_ir_focus_chunks,
-    query_ir_focus_search_queries, query_ir_lexical_focus_queries,
-    rank_graph_evidence_context_rows, retain_canonical_document_head_chunks,
-    retain_entity_bio_candidates, truncate_bundle,
+    canonical_document_revision_id, chunk_answer_source_text, combine_chunk_retrieval_lanes,
+    combine_lexical_query_results, combine_query_ir_focus_search_results,
+    document_identity_chunk_score, entity_bio_chunk_score, graph_evidence_chunk_hits_from_rows,
+    graph_evidence_chunk_score, graph_evidence_context_line, graph_evidence_targets,
+    graph_evidence_targets_for_query, graph_target_entity_profiles, latest_version_documents,
+    map_chunk_hit, merge_chunks, merge_entity_bio_chunks, merge_graph_evidence_chunks,
+    merge_query_ir_focus_chunks, query_ir_focus_chunk_score, query_ir_focus_search_queries,
+    query_ir_lexical_focus_queries, rank_graph_evidence_context_rows,
+    retain_canonical_document_head_chunks, retain_entity_bio_candidates, truncate_bundle,
 };
 use crate::domains::query_ir::{
     ComparisonSpec, DocumentHint, EntityMention, EntityRole, LiteralKind, LiteralSpan, QueryAct,
@@ -1178,6 +1179,140 @@ fn vector_search_always_runs_regardless_of_exact_literal_flag() {
     assert!(!should_skip_vector_search(&literal_plan));
     literal_plan.intent_profile.exact_literal_technical = true;
     assert!(!should_skip_vector_search(&literal_plan));
+}
+
+#[test]
+fn chunk_retrieval_lanes_continue_when_vector_lane_fails() {
+    let lexical_chunk = runtime_chunk("lexical", 0.8);
+
+    let outcome = combine_chunk_retrieval_lanes(
+        Err(anyhow::anyhow!("vector backend unavailable")),
+        Ok((vec![lexical_chunk.clone()], 3, 42)),
+    )
+    .expect("lexical lane should keep retrieval usable");
+
+    assert_eq!(outcome.degraded_lane_count, 1);
+    assert!(outcome.vector_hits.is_empty());
+    assert_eq!(outcome.lexical_hits.len(), 1);
+    assert_eq!(outcome.lexical_hits[0].chunk_id, lexical_chunk.chunk_id);
+    assert_eq!(outcome.lexical_query_count, 3);
+    assert_eq!(outcome.lexical_elapsed_ms, 42);
+}
+
+#[test]
+fn chunk_retrieval_lanes_continue_when_lexical_lane_fails() {
+    let vector_chunk = runtime_chunk("vector", 0.9);
+
+    let outcome = combine_chunk_retrieval_lanes(
+        Ok((vec![vector_chunk.clone()], 17)),
+        Err(anyhow::anyhow!("lexical backend unavailable")),
+    )
+    .expect("vector lane should keep retrieval usable");
+
+    assert_eq!(outcome.degraded_lane_count, 1);
+    assert_eq!(outcome.vector_hits.len(), 1);
+    assert_eq!(outcome.vector_hits[0].chunk_id, vector_chunk.chunk_id);
+    assert!(outcome.lexical_hits.is_empty());
+    assert_eq!(outcome.vector_elapsed_ms, 17);
+}
+
+#[test]
+fn chunk_retrieval_lanes_fail_when_both_lanes_fail() {
+    let result = combine_chunk_retrieval_lanes(
+        Err(anyhow::anyhow!("vector backend unavailable")),
+        Err(anyhow::anyhow!("lexical backend unavailable")),
+    );
+    let error = match result {
+        Ok(_) => panic!("both failed lanes must fail retrieval"),
+        Err(error) => error,
+    };
+
+    let message = format!("{error:#}");
+    assert!(message.contains("all chunk retrieval lanes failed"));
+    assert!(message.contains("vector backend unavailable"));
+    assert!(message.contains("lexical backend unavailable"));
+}
+
+#[test]
+fn lexical_query_results_keep_successful_subqueries_when_one_fails() {
+    let first = runtime_chunk("first", 0.9);
+    let second = runtime_chunk("second", 0.7);
+
+    let hits = combine_lexical_query_results(
+        vec![
+            Ok(vec![first.clone()]),
+            Err(anyhow::anyhow!("one lexical subquery failed")),
+            Ok(vec![second.clone()]),
+        ],
+        3,
+        8,
+    )
+    .expect("successful lexical subqueries should keep the lane usable");
+
+    let ids = hits.into_iter().map(|chunk| chunk.chunk_id).collect::<BTreeSet<_>>();
+    assert_eq!(ids, BTreeSet::from([first.chunk_id, second.chunk_id]));
+}
+
+#[test]
+fn lexical_query_results_fail_when_all_subqueries_fail() {
+    let result = combine_lexical_query_results(
+        vec![
+            Err(anyhow::anyhow!("first lexical subquery failed")),
+            Err(anyhow::anyhow!("second lexical subquery failed")),
+        ],
+        2,
+        8,
+    );
+    let error = match result {
+        Ok(_) => panic!("all failed lexical subqueries must fail the lane"),
+        Err(error) => error,
+    };
+
+    let message = format!("{error:#}");
+    assert!(message.contains("all lexical chunk search queries failed"));
+    assert!(message.contains("first lexical subquery failed"));
+    assert!(message.contains("second lexical subquery failed"));
+}
+
+#[test]
+fn query_ir_focus_search_results_keep_successful_subqueries_when_one_fails() {
+    let first = Uuid::now_v7();
+    let second = Uuid::now_v7();
+
+    let hits = combine_query_ir_focus_search_results(
+        vec![
+            Ok(vec![(first, 0.0)]),
+            Err(anyhow::anyhow!("one focus subquery failed")),
+            Ok(vec![(second, 0.7)]),
+        ],
+        3,
+    )
+    .expect("successful focus subqueries should keep the additive lane usable");
+
+    let ids = hits.iter().map(|(chunk_id, _)| *chunk_id).collect::<BTreeSet<_>>();
+    assert_eq!(ids, BTreeSet::from([first, second]));
+    assert_eq!(hits[0].1, query_ir_focus_chunk_score(0));
+    assert_eq!(hits[1].1, 0.7);
+}
+
+#[test]
+fn query_ir_focus_search_results_fail_when_all_subqueries_fail() {
+    let result = combine_query_ir_focus_search_results(
+        vec![
+            Err(anyhow::anyhow!("first focus subquery failed")),
+            Err(anyhow::anyhow!("second focus subquery failed")),
+        ],
+        2,
+    );
+    let error = match result {
+        Ok(_) => panic!("all failed focus subqueries must fail the focus lane"),
+        Err(error) => error,
+    };
+
+    let message = format!("{error:#}");
+    assert!(message.contains("all query-IR focus chunk searches failed"));
+    assert!(message.contains("first focus subquery failed"));
+    assert!(message.contains("second focus subquery failed"));
 }
 
 fn sample_document_row(file_name: &str, title: &str) -> KnowledgeDocumentRow {

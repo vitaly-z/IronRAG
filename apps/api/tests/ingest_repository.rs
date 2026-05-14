@@ -314,6 +314,8 @@ async fn ingest_attempts_and_stage_events_round_trip_with_ordered_queries() -> R
                 finished_at: None,
                 failure_class: None,
                 failure_code: None,
+                failure_message: None,
+                progress_percent: 80,
                 retryable: false,
             },
         )
@@ -334,6 +336,8 @@ async fn ingest_attempts_and_stage_events_round_trip_with_ordered_queries() -> R
                 finished_at: None,
                 failure_class: None,
                 failure_code: None,
+                failure_message: None,
+                progress_percent: 10,
                 retryable: true,
             },
         )
@@ -360,6 +364,8 @@ async fn ingest_attempts_and_stage_events_round_trip_with_ordered_queries() -> R
                 finished_at: Some(Utc::now() + Duration::seconds(60)),
                 failure_class: Some("upstream_timeout".to_string()),
                 failure_code: Some("timeout".to_string()),
+                failure_message: Some("upstream timed out".to_string()),
+                progress_percent: 25,
                 retryable: true,
             },
         )

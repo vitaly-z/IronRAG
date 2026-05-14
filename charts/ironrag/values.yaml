@@ -81,6 +81,16 @@ app:
     graph: true
     vectorIndexes: true
 
+observability:
+  enabled: true
+  otlpEndpoint: ""
+  otlpProtocol: grpc
+  resourceAttributes: service.namespace=ironrag
+  tracesExporter: otlp
+  metricsExporter: otlp
+  logsExporter: otlp
+  metricsTemporality: cumulative
+
 startup:
   mode: startup_job
   backoffLimit: 3

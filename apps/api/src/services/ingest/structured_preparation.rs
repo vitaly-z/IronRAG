@@ -341,7 +341,7 @@ fn build_structured_blocks(
 
     for block in &mut blocks {
         ensure_not_cancelled(cancellation_token)?;
-        if detect_boilerplate(&block.text) {
+        if detect_boilerplate(block.block_kind, &block.text) {
             block.is_boilerplate = true;
         }
     }
@@ -349,7 +349,10 @@ fn build_structured_blocks(
     Ok(blocks)
 }
 
-fn detect_boilerplate(text: &str) -> bool {
+fn detect_boilerplate(block_kind: StructuredBlockKind, text: &str) -> bool {
+    if matches!(block_kind, StructuredBlockKind::Table | StructuredBlockKind::TableRow) {
+        return false;
+    }
     let lower = text.to_ascii_lowercase();
 
     // 5+ HTTP links
@@ -745,6 +748,14 @@ mod tests {
             row_block.normalized_text,
             "Sheet: people | Row 1 | Name: Alice | Email: alice@example.com"
         );
+        assert!(
+            prepared
+                .chunk_windows
+                .iter()
+                .any(|chunk| chunk.chunk_kind == StructuredBlockKind::TableRow
+                    && chunk.normalized_text.contains("Name: Alice")),
+            "table rows must produce queryable chunks"
+        );
     }
 
     #[test]
@@ -931,7 +942,10 @@ mod tests {
     #[test]
     fn detect_boilerplate_catches_nav_links() {
         assert!(
-            super::detect_boilerplate("Home | About | Contact | Blog | FAQ | Support"),
+            super::detect_boilerplate(
+                StructuredBlockKind::Paragraph,
+                "Home | About | Contact | Blog | FAQ | Support",
+            ),
             "pipe-separated nav links should be detected as boilerplate"
         );
     }
@@ -939,7 +953,10 @@ mod tests {
     #[test]
     fn detect_boilerplate_catches_breadcrumbs() {
         assert!(
-            super::detect_boilerplate("Documentation > API Reference > Authentication > OAuth"),
+            super::detect_boilerplate(
+                StructuredBlockKind::Paragraph,
+                "Documentation > API Reference > Authentication > OAuth",
+            ),
             "breadcrumb pattern should be detected as boilerplate"
         );
     }
@@ -947,7 +964,10 @@ mod tests {
     #[test]
     fn detect_boilerplate_catches_cookie_banner() {
         assert!(
-            super::detect_boilerplate("We use cookies to improve your experience. Accept cookies"),
+            super::detect_boilerplate(
+                StructuredBlockKind::Paragraph,
+                "We use cookies to improve your experience. Accept cookies",
+            ),
             "cookie banner text should be detected as boilerplate"
         );
     }
@@ -956,6 +976,7 @@ mod tests {
     fn detect_boilerplate_skips_normal_text() {
         assert!(
             !super::detect_boilerplate(
+                StructuredBlockKind::Paragraph,
                 "FastAPI is a modern, fast web framework for building APIs with Python."
             ),
             "normal technical text should not be detected as boilerplate"
@@ -965,8 +986,19 @@ mod tests {
     #[test]
     fn detect_boilerplate_catches_copyright() {
         assert!(
-            super::detect_boilerplate("Copyright © 2024 Acme Inc. All rights reserved."),
+            super::detect_boilerplate(
+                StructuredBlockKind::Paragraph,
+                "Copyright © 2024 Acme Inc. All rights reserved.",
+            ),
             "copyright notice should be detected as boilerplate"
+        );
+    }
+
+    #[test]
+    fn detect_boilerplate_preserves_pipe_tables() {
+        assert!(
+            !super::detect_boilerplate(StructuredBlockKind::TableRow, "| Name | Value | Status |"),
+            "table rows must not be dropped as navigation boilerplate"
         );
     }
 }

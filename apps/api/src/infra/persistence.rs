@@ -1,9 +1,9 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use redis::Client as RedisClient;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 
 use crate::app::config::Settings;
 use crate::infra::arangodb::{
@@ -30,6 +30,8 @@ const CANONICAL_BASELINE_TABLES: [&str; 9] = [
     "ai_model_catalog",
     "ai_price_catalog",
 ];
+
+static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Clone)]
 pub struct Persistence {
@@ -127,7 +129,39 @@ pub async fn run_postgres_migrations(postgres: &PgPool) -> anyhow::Result<()> {
     // `migration N was previously applied but is missing in the resolved
     // migrations` at startup, nudge this function before rebuilding so
     // the proc macro re-scans `./migrations`.
-    sqlx::migrate!("./migrations").run(postgres).await?;
+    POSTGRES_MIGRATOR.run(postgres).await?;
+    Ok(())
+}
+
+pub async fn validate_postgres_migration_state(postgres: &PgPool) -> anyhow::Result<()> {
+    let rows = sqlx::query("select version, checksum, success from _sqlx_migrations")
+        .fetch_all(postgres)
+        .await?;
+    let mut applied = HashMap::<i64, Vec<u8>>::with_capacity(rows.len());
+    for row in rows {
+        let version: i64 = row.get("version");
+        let success: bool = row.get("success");
+        anyhow::ensure!(success, "migration {version} is marked dirty");
+        applied.insert(version, row.get("checksum"));
+    }
+
+    for migration in
+        POSTGRES_MIGRATOR.iter().filter(|migration| migration.migration_type.is_up_migration())
+    {
+        let Some(applied_checksum) = applied.remove(&migration.version) else {
+            anyhow::bail!("migration {} has not been applied", migration.version);
+        };
+        anyhow::ensure!(
+            applied_checksum.as_slice() == migration.checksum.as_ref(),
+            "migration {} was previously applied but has been modified",
+            migration.version
+        );
+    }
+
+    if let Some(version) = applied.keys().min().copied() {
+        anyhow::bail!("migration {version} was previously applied but is missing in the binary");
+    }
+
     Ok(())
 }
 

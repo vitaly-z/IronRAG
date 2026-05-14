@@ -19,7 +19,7 @@ import type {
 } from '@/shared/types';
 import { mapModelList } from '@/features/admin/model/aiAdapter';
 import {
-  PURPOSE_ORDER,
+  OPTIONAL_PURPOSES,
   REQUIRED_RUNTIME_PURPOSE_ORDER,
   compactScopeQuery,
   localScopeQuery,
@@ -249,7 +249,17 @@ export function BindingsSection({
               : entry,
           ),
       );
-      toast.success(t('admin.aiPanel.messages.bindingSaved'));
+      if (binding.embeddingDimensionChanged) {
+        toast.warning(
+          t('admin.aiPanel.messages.bindingEmbeddingDimensionChanged', {
+            previous: binding.embeddingPreviousDimensions ?? '?',
+            current: binding.embeddingNewDimensions ?? '?',
+          }),
+          { duration: 12000 },
+        );
+      } else {
+        toast.success(t('admin.aiPanel.messages.bindingSaved'));
+      }
     },
     onError: (err, variables, context) => {
       if (context) {
@@ -349,8 +359,8 @@ export function BindingsSection({
     selectedScope !== 'instance'
     && instanceBindings.length === 0
     && localCredentials.length + localPresets.length + bindingsForScope.length > 0;
-  const optionalPurposes = PURPOSE_ORDER.filter(purpose => !REQUIRED_RUNTIME_PURPOSE_ORDER.includes(purpose));
   const configuredRequiredBindings = REQUIRED_RUNTIME_PURPOSE_ORDER.filter(purpose => resolveBinding(purpose).effectiveBinding).length;
+  const configuredOptionalBindings = OPTIONAL_PURPOSES.filter(purpose => resolveBinding(purpose).effectiveBinding).length;
   const renderPurpose = (purpose: AIPurpose) => {
     const resolved = resolveBinding(purpose);
     return (
@@ -381,6 +391,34 @@ export function BindingsSection({
       />
     );
   };
+  const renderPurposeGroup = ({
+    title,
+    description,
+    purposes,
+    configuredCount,
+  }: {
+    title: string;
+    description?: string;
+    purposes: AIPurpose[];
+    configuredCount: number;
+  }) => (
+    <section className="space-y-2">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="text-sm font-bold tracking-tight">{title}</h3>
+          <Badge variant="outline">{configuredCount}/{purposes.length}</Badge>
+        </div>
+        {description && (
+          <p className="mt-1 max-w-4xl text-sm leading-5 text-muted-foreground">
+            {description}
+          </p>
+        )}
+      </div>
+      <div className="overflow-hidden rounded-md border border-border/70 bg-card">
+        {purposes.map(renderPurpose)}
+      </div>
+    </section>
+  );
 
   return (
     <DataState query={bindingsState}>
@@ -391,24 +429,17 @@ export function BindingsSection({
               {t('admin.aiPanel.notices.missingInstanceBaseline')}
             </div>
           )}
-          <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-sm font-bold tracking-tight">{t('admin.aiPanel.sections.requiredBindingsTitle')}</h3>
-            <Badge variant="outline">{configuredRequiredBindings}/{REQUIRED_RUNTIME_PURPOSE_ORDER.length}</Badge>
-          </div>
-
-          <div className="overflow-hidden rounded-md border border-border/70 bg-card">
-            {REQUIRED_RUNTIME_PURPOSE_ORDER.map(renderPurpose)}
-          </div>
-
-          <details className="overflow-hidden rounded-md border border-border/70 bg-card">
-            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-sm font-semibold text-muted-foreground">
-              <span>{t('admin.aiPanel.sections.optionalBindingsTitle')}</span>
-              <Badge variant="outline">{optionalPurposes.length}</Badge>
-            </summary>
-            <div className="border-t border-border/70">
-              {optionalPurposes.map(renderPurpose)}
-            </div>
-          </details>
+          {renderPurposeGroup({
+            title: t('admin.aiPanel.sections.requiredBindingsTitle'),
+            purposes: REQUIRED_RUNTIME_PURPOSE_ORDER,
+            configuredCount: configuredRequiredBindings,
+          })}
+          {renderPurposeGroup({
+            title: t('admin.aiPanel.sections.optionalBindingsTitle'),
+            description: t('admin.aiPanel.sections.optionalBindingsDescription'),
+            purposes: OPTIONAL_PURPOSES,
+            configuredCount: configuredOptionalBindings,
+          })}
         </div>
       )}
     </DataState>

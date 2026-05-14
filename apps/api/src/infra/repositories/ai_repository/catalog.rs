@@ -113,10 +113,11 @@ pub async fn get_provider_catalog_by_kind(
     .await
 }
 
-pub async fn get_model_catalog_by_provider_and_name(
+pub async fn get_model_catalog_by_provider_name_and_capability(
     postgres: &PgPool,
     provider_kind: &str,
     model_name: &str,
+    capability_kind: &str,
 ) -> Result<Option<AiModelCatalogRow>, sqlx::Error> {
     sqlx::query_as::<_, AiModelCatalogRow>(
         "select
@@ -134,14 +135,15 @@ pub async fn get_model_catalog_by_provider_and_name(
          where apc.provider_kind = $1
            and apc.lifecycle_state = 'active'
            and amc.model_name = $2
+           and amc.capability_kind = $3::ai_model_capability_kind
            and amc.lifecycle_state = 'active'
          order by
-            amc.capability_kind asc,
             amc.id asc
          limit 1",
     )
     .bind(provider_kind)
     .bind(model_name)
+    .bind(capability_kind)
     .fetch_optional(postgres)
     .await
 }

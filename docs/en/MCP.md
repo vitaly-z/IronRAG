@@ -56,9 +56,9 @@ If your IronRAG instance is behind another domain or TLS terminator, replace the
 4. In `Admin -> MCP`, copy the ready-made snippet for your client.
 
 `tools/list` is grant-filtered. If a token cannot do something, the tool is not advertised.
-The canonical JSON-RPC surface is intentionally small: `initialize`, `tools/list`, `tools/call`, and `notifications/initialized`. IronRAG does not expose an empty `resources/*` surface.
-Tool arguments use canonical camelCase fields only.
-Catalog targets use canonical refs instead of opaque UUIDs: `workspace` is `<workspace>`, and `library` is `<workspace>/<library>`. Discovery responses expose these values as `ref`.
+The JSON-RPC surface is intentionally small: `initialize`, `tools/list`, `tools/call`, and `notifications/initialized`. IronRAG does not expose an empty `resources/*` surface.
+Tool arguments use camelCase fields only.
+Catalog targets use stable refs instead of opaque UUIDs: `workspace` is `<workspace>`, and `library` is `<workspace>/<library>`. Discovery responses expose these values as `ref`.
 
 ## Tools
 
@@ -66,7 +66,7 @@ Catalog targets use canonical refs instead of opaque UUIDs: `workspace` is `<wor
 
 | Tool | Description | Required parameters |
 |------|-------------|---------------------|
-| `grounded_answer` | Ask a natural-language question and get a grounded answer with canonical evidence references — **the same pipeline the built-in UI assistant uses** (QueryCompiler → hybrid retrieval → graph-aware context → answer generation → verifier). Prefer this over `search_documents` + `read_document` whenever the user expects an answer, not a hit list. | `library`, `query` |
+| `grounded_answer` | Ask a natural-language question and get a grounded answer with evidence references — **the same pipeline the built-in UI assistant uses** (QueryCompiler → hybrid retrieval → graph-aware context → answer generation → verifier). Prefer this over `search_documents` + `read_document` whenever the user expects an answer, not a hit list. | `library`, `query` |
 
 Response shape: tool text contains the answer; structured output contains `executionDetail`, the same assistant execution DTO the UI consumes, with chunk, prepared-segment, technical-fact, graph-entity, graph-relation, verifier, runtime, request, and response fields. Top-level `runtimeExecutionId`, `executionId`, and `conversationId` are shortcuts for trace lookup. An MCP client receives exactly the answer a user would see in the UI for the same library and question — MCP and UI share the same grounded-answer pipeline, no parallel implementation.
 
@@ -81,14 +81,14 @@ Response shape: tool text contains the answer; structured output contains `execu
 
 | Tool | Description | Required parameters |
 |------|-------------|---------------------|
-| `create_workspace` | Create a workspace (system-admin only). The request uses the canonical workspace ref; `title` is optional display text. | `workspace` |
-| `create_library` | Create a library inside one workspace. The request uses the canonical library ref; `title` is optional display text. | `library` |
+| `create_workspace` | Create a workspace (system-admin only). The request uses the stable workspace ref; `title` is optional display text. | `workspace` |
+| `create_library` | Create a library inside one workspace. The request uses the stable library ref; `title` is optional display text. | `library` |
 
 ### Documents
 
 | Tool | Description | Required parameters |
 |------|-------------|---------------------|
-| `search_documents` | Search library memory and return document-level candidates. Optionally scope the search to one or more canonical library refs via `libraries`. | `query` |
+| `search_documents` | Search library memory and return document-level candidates. Optionally scope the search to one or more library refs via `libraries`. | `query` |
 | `read_document` | Read one document in full or as an excerpt. | `documentId` |
 | `list_documents` | List documents in a library, optionally filtered by processing status. | `library` (optional) |
 | `upload_documents` | Create one or more new documents in a library. | `library`, `documents` |
@@ -121,7 +121,7 @@ Response shape: tool text contains the answer; structured output contains `execu
 | `get_runtime_execution` | Load the runtime lifecycle summary for one runtime execution. | `runtimeExecutionId` |
 | `get_runtime_execution_trace` | Load the full stage, action, and policy trace for one runtime execution. | `runtimeExecutionId` |
 
-Under the hood, MCP calls the same canonical services as the web app: Postgres for control state, ArangoDB for graph and document truth, and Redis-backed workers for ingestion.
+Under the hood, MCP calls the same services as the web app: Postgres for control state, ArangoDB for graph and document truth, and Redis-backed workers for ingestion.
 
 ## Graph Tool Quality Contract
 
@@ -138,12 +138,12 @@ Under the hood, MCP calls the same canonical services as the web app: Postgres f
 - Read-only tokens are useful for assistants that should only search and read.
 - Write-enabled tokens can upload documents or update existing content when you want an agent to maintain the knowledge base.
 - Tool visibility follows grants, so clients only see the operations they are allowed to use.
-- When a token is scoped to exactly one workspace or library, MCP tools can infer the canonical `workspace` or `library` ref from the token scope instead of forcing the agent to pass it every time.
+- When a token is scoped to exactly one workspace or library, MCP tools can infer the `workspace` or `library` ref from the token scope instead of forcing the agent to pass it every time.
 
 ## What the client gets
 
 - The same searchable documents and grounded retrieval used by the built-in assistant UI.
-- The same canonical document state used by uploads, updates, search, and graph-backed exploration.
+- The same document state used by uploads, updates, search, and graph-backed exploration.
 - A practical way to connect internal bots, support assistants, or personal agents to a controlled knowledge base without building a separate adapter layer.
 
 ## OpenAI Codex CLI
@@ -249,6 +249,23 @@ Or via the CLI:
 
 ```bash
 openclaw mcp set ironrag '{"url":"http://127.0.0.1:19000/v1/mcp","headers":{"Authorization":"Bearer irt_..."}}'
+```
+
+## Hermes
+
+`~/.hermes/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "ironrag": {
+      "url": "http://127.0.0.1:19000/v1/mcp",
+      "headers": {
+        "Authorization": "Bearer ${IRONRAG_MCP_TOKEN}"
+      }
+    }
+  }
+}
 ```
 
 If your client accepts raw HTTP MCP configuration, the endpoint URL plus the bearer token header is enough — Streamable HTTP is the standard remote transport and no adapter layer is required.

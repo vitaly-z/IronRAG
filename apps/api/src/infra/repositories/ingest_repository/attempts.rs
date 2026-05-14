@@ -17,6 +17,8 @@ pub struct IngestAttemptRow {
     pub finished_at: Option<DateTime<Utc>>,
     pub failure_class: Option<String>,
     pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub progress_percent: i32,
     pub retryable: bool,
 }
 
@@ -34,6 +36,8 @@ pub struct NewIngestAttempt {
     pub finished_at: Option<DateTime<Utc>>,
     pub failure_class: Option<String>,
     pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub progress_percent: i32,
     pub retryable: bool,
 }
 
@@ -48,6 +52,8 @@ pub struct UpdateIngestAttempt {
     pub finished_at: Option<DateTime<Utc>>,
     pub failure_class: Option<String>,
     pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub progress_percent: i32,
     pub retryable: bool,
 }
 
@@ -70,6 +76,8 @@ pub async fn create_ingest_attempt(
             finished_at,
             failure_class,
             failure_code,
+            failure_message,
+            progress_percent,
             retryable
         )
         values (
@@ -86,7 +94,9 @@ pub async fn create_ingest_attempt(
             $11,
             $12,
             $13,
-            $14
+            $14,
+            $15,
+            $16
         )
         returning
             id,
@@ -102,6 +112,8 @@ pub async fn create_ingest_attempt(
             finished_at,
             failure_class,
             failure_code,
+            failure_message,
+            progress_percent,
             retryable",
     )
     .bind(Uuid::now_v7())
@@ -117,6 +129,8 @@ pub async fn create_ingest_attempt(
     .bind(input.finished_at)
     .bind(&input.failure_class)
     .bind(&input.failure_code)
+    .bind(&input.failure_message)
+    .bind(input.progress_percent)
     .bind(input.retryable)
     .fetch_one(postgres)
     .await
@@ -141,6 +155,8 @@ pub async fn get_ingest_attempt_by_id(
             finished_at,
             failure_class,
             failure_code,
+            failure_message,
+            progress_percent,
             retryable
          from ingest_attempt
          where id = $1",
@@ -169,6 +185,8 @@ pub async fn list_ingest_attempts_by_job(
             finished_at,
             failure_class,
             failure_code,
+            failure_message,
+            progress_percent,
             retryable
          from ingest_attempt
          where job_id = $1
@@ -200,6 +218,8 @@ pub async fn list_ingest_attempts_by_jobs(
             finished_at,
             failure_class,
             failure_code,
+            failure_message,
+            progress_percent,
             retryable
          from ingest_attempt
          where job_id = ANY($1)
@@ -229,6 +249,8 @@ pub async fn get_latest_ingest_attempt_by_job(
             finished_at,
             failure_class,
             failure_code,
+            failure_message,
+            progress_percent,
             retryable
          from ingest_attempt
          where job_id = $1
@@ -263,6 +285,8 @@ pub async fn list_latest_ingest_attempts_by_job_ids(
             finished_at,
             failure_class,
             failure_code,
+            failure_message,
+            progress_percent,
             retryable
          from ingest_attempt
          where job_id = any($1)
@@ -289,7 +313,9 @@ pub async fn update_ingest_attempt(
              finished_at = $8,
              failure_class = $9,
              failure_code = $10,
-             retryable = $11
+             failure_message = $11,
+             progress_percent = $12,
+             retryable = $13
          where id = $1
          returning
             id,
@@ -305,6 +331,8 @@ pub async fn update_ingest_attempt(
             finished_at,
             failure_class,
             failure_code,
+            failure_message,
+            progress_percent,
             retryable",
     )
     .bind(attempt_id)
@@ -317,6 +345,63 @@ pub async fn update_ingest_attempt(
     .bind(input.finished_at)
     .bind(&input.failure_class)
     .bind(&input.failure_code)
+    .bind(&input.failure_message)
+    .bind(input.progress_percent)
+    .bind(input.retryable)
+    .fetch_optional(postgres)
+    .await
+}
+
+pub async fn finalize_leased_ingest_attempt(
+    postgres: &PgPool,
+    attempt_id: Uuid,
+    input: &UpdateIngestAttempt,
+) -> Result<Option<IngestAttemptRow>, sqlx::Error> {
+    sqlx::query_as::<_, IngestAttemptRow>(
+        "update ingest_attempt
+         set worker_principal_id = $2,
+             lease_token = $3,
+             knowledge_generation_id = $4,
+             attempt_state = $5::ingest_attempt_state,
+             current_stage = $6,
+             heartbeat_at = $7,
+             finished_at = $8,
+             failure_class = $9,
+             failure_code = $10,
+             failure_message = $11,
+             progress_percent = $12,
+             retryable = $13
+         where id = $1 and attempt_state = 'leased'
+         returning
+            id,
+            job_id,
+            attempt_number,
+            worker_principal_id,
+            lease_token,
+            knowledge_generation_id,
+            attempt_state::text as attempt_state,
+            current_stage,
+            started_at,
+            heartbeat_at,
+            finished_at,
+            failure_class,
+            failure_code,
+            failure_message,
+            progress_percent,
+            retryable",
+    )
+    .bind(attempt_id)
+    .bind(input.worker_principal_id)
+    .bind(&input.lease_token)
+    .bind(input.knowledge_generation_id)
+    .bind(&input.attempt_state)
+    .bind(&input.current_stage)
+    .bind(input.heartbeat_at)
+    .bind(input.finished_at)
+    .bind(&input.failure_class)
+    .bind(&input.failure_code)
+    .bind(&input.failure_message)
+    .bind(input.progress_percent)
     .bind(input.retryable)
     .fetch_optional(postgres)
     .await
@@ -326,8 +411,8 @@ pub async fn touch_attempt_heartbeat(
     postgres: &PgPool,
     attempt_id: Uuid,
     current_stage: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "update ingest_attempt
          set heartbeat_at = now(),
              current_stage = coalesce($2, current_stage)
@@ -337,5 +422,28 @@ pub async fn touch_attempt_heartbeat(
     .bind(current_stage)
     .execute(postgres)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn touch_attempt_heartbeat_and_load_job_state(
+    postgres: &PgPool,
+    attempt_id: Uuid,
+    current_stage: Option<&str>,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "with touched_attempt as (
+             update ingest_attempt
+             set heartbeat_at = now(),
+                 current_stage = coalesce($2, current_stage)
+             where id = $1 and attempt_state = 'leased'
+             returning job_id
+         )
+         select j.queue_state::text
+         from touched_attempt a
+         join ingest_job j on j.id = a.job_id",
+    )
+    .bind(attempt_id)
+    .bind(current_stage)
+    .fetch_optional(postgres)
+    .await
 }

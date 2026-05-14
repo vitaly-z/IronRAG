@@ -380,17 +380,47 @@ impl SearchService {
         let embedding_model_key = model_catalog_id.to_string();
         let parallelism = state.settings.ingestion_embedding_parallelism.max(1);
         let freshness_generation = revision.revision_number;
-        let reused_chunk_ids = match reuse_chunk_vectors_from_parent_revision(
+        let mut reused_chunk_ids = match load_current_revision_chunk_vector_ids(
             state,
             revision_id,
             chunks.as_slice(),
-            model_catalog_id,
             &embedding_model_key,
             freshness_generation,
         )
         .await
         {
             Ok(reused_chunk_ids) => reused_chunk_ids,
+            Err(error) => {
+                return fail_embed_chunks_after_cleanup(state, revision_id, error).await;
+            }
+        };
+        if !reused_chunk_ids.is_empty() {
+            tracing::info!(
+                revision_id = %revision_id,
+                reused = reused_chunk_ids.len(),
+                total_chunks = chunks.len(),
+                "embed_chunk resume: reusing current revision chunk vectors",
+            );
+        }
+        let chunks_missing_current_vectors = chunks
+            .iter()
+            .filter(|chunk| !reused_chunk_ids.contains(&chunk.chunk_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let reused_chunk_ids = match reuse_chunk_vectors_from_parent_revision(
+            state,
+            revision_id,
+            chunks_missing_current_vectors.as_slice(),
+            model_catalog_id,
+            &embedding_model_key,
+            freshness_generation,
+        )
+        .await
+        {
+            Ok(parent_reused_chunk_ids) => {
+                reused_chunk_ids.extend(parent_reused_chunk_ids);
+                reused_chunk_ids
+            }
             Err(error) => {
                 return fail_embed_chunks_after_cleanup(state, revision_id, error).await;
             }
@@ -1044,6 +1074,35 @@ fn embedding_dimensions(vector: &[f32]) -> AnyhowResult<i32> {
         return Err(anyhow!("embedding vector must not be empty"));
     }
     i32::try_from(vector.len()).context("embedding vector dimension overflowed i32")
+}
+
+async fn load_current_revision_chunk_vector_ids(
+    state: &AppState,
+    revision_id: Uuid,
+    chunks: &[KnowledgeChunkRow],
+    embedding_model_key: &str,
+    freshness_generation: i64,
+) -> AnyhowResult<BTreeSet<Uuid>> {
+    let mut reused_chunk_ids = BTreeSet::new();
+    for chunk_batch in chunks.chunks(CHUNK_VECTOR_REUSE_SOURCE_BATCH_SIZE) {
+        let chunk_ids = chunk_batch.iter().map(|chunk| chunk.chunk_id).collect::<Vec<_>>();
+        let vectors = state
+            .arango_search_store
+            .list_chunk_vectors_by_chunks(&chunk_ids, embedding_model_key, VECTOR_KIND_CHUNK)
+            .await
+            .with_context(|| {
+                format!("failed to load current chunk vectors for revision {revision_id}")
+            })?;
+        for vector in vectors {
+            if vector.revision_id == revision_id
+                && vector.freshness_generation == freshness_generation
+                && vector.vector_kind == VECTOR_KIND_CHUNK
+            {
+                reused_chunk_ids.insert(vector.chunk_id);
+            }
+        }
+    }
+    Ok(reused_chunk_ids)
 }
 
 async fn reuse_chunk_vectors_from_parent_revision(

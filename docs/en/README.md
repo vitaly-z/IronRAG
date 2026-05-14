@@ -29,7 +29,7 @@ flowchart TD
   Upload["Upload (UI / API / MCP / web crawl)"]:::entry
   Detect{"file kind + recognition policy"}:::decision
   Native["native parsers<br/>text / md / html / code / xls"]:::worker
-  Docling["Docling CPU<br/>PDF / DOCX / PPTX / image OCR"]:::worker
+  Docling["Docling CPU<br/>PDF page checkpoints / DOCX / PPTX / image OCR"]:::worker
   Vision["vision binding<br/>raster OCR alternative"]:::worker
   MissingVision["fail loud — no vision binding"]:::fail
   Chunk["chunk_content + structured blocks"]:::worker
@@ -62,7 +62,19 @@ Recognition policy is per-library
 `{"rasterImageEngine":"docling"}` or `{"rasterImageEngine":"vision"}`).
 New libraries inherit
 `IRONRAG_RECOGNITION_DEFAULT_RASTER_IMAGE_ENGINE=docling`. Missing vision
-bindings fail loud — there is no silent fallback.
+bindings fail loud when the policy selects `vision`; there is no silent
+provider fallback.
+
+Stored PDFs are restart-safe: completed Docling page ranges are persisted as
+ingest units and reused after worker restarts, backend restarts, lease recovery,
+or transient network loss. Chunk embeddings and graph-extraction outputs are
+also reused from stable checksums when a job resumes.
+
+Assistant turns are durable as well: UI streaming carries activity for the
+same persisted query execution, and a browser or proxy transport drop after
+work starts is recovered by reading the completed session result rather than
+submitting the prompt again. LLM debug snapshots are stored per execution, so
+the provider context remains inspectable after reloads and cached replays.
 
 ## Grounded query at a glance
 
@@ -101,7 +113,7 @@ can enter a broken retrieval state.
 
 | Store | Role |
 |---|---|
-| **PostgreSQL** | Catalog (workspaces, libraries, documents, revisions), AI catalog (providers, models, presets, prices), bindings, IAM, sessions, query executions, billing. Authoritative for everything except the knowledge graph itself. |
+| **PostgreSQL** | Catalog (workspaces, libraries, documents, revisions), durable ingest units, AI catalog (providers, models, presets, prices), bindings, IAM, sessions, query executions, billing. Authoritative for everything except the knowledge graph itself. |
 | **ArangoDB** | Knowledge graph (nodes, edges, evidence), document store, chunk vectors (3072-dim cosine), structured-block search, technical-fact index. |
 | **Redis** | Graph topology cache, IR cache, answer-context cache, prewarm coordination. |
 | **Filesystem / S3** | Source-document blobs (configurable; bundled `s4core` provides a built-in S3-compatible blob store). |
@@ -109,7 +121,7 @@ can enter a broken retrieval state.
 ## Multi-provider router
 
 Bindings select a `(provider_credential, model_preset)` pair per
-canonical pipeline purpose (`extract_text`, `extract_graph`,
+pipeline purpose (`extract_text`, `extract_graph`,
 `embed_chunk`, `query_compile`, `query_retrieve`, `query_answer`,
 `vision`). The catalog ships seven provider profiles — OpenAI,
 DeepSeek, Qwen / DashScope-intl, GPTunnel, OpenRouter, RouterAI,
@@ -133,9 +145,9 @@ single purpose without disturbing the rest.
 ### MCP clients
 
 The MCP server is transport-agnostic. Documented client integrations:
-Claude Desktop, Claude Code, Cursor, VS Code (Continue / Cline /
-Roo), Zed, Hermes / Lobe-style chat agents, and the IronRAG CLI's
-local `grounded_answer` invocation. Token scope gates the tool
+Claude Desktop, Claude Code, Cursor, Codex, VS Code (Continue / Cline /
+Roo), Zed, OpenClaw, Hermes, Lobe-style chat agents, and the IronRAG
+CLI's local `grounded_answer` invocation. Token scope gates the tool
 surface; see [IAM.md](./IAM.md).
 
 See [../../README.md](../../README.md) for the operator-facing

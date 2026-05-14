@@ -34,6 +34,7 @@ use crate::infra::arangodb::{
 
 const STRUCTURED_BLOCK_INSERT_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const STRUCTURED_BLOCK_INSERT_MAX_BATCH_ROWS: usize = 2_000;
+const KNOWLEDGE_CHUNK_INSERT_BATCH_ROWS: usize = 250;
 const KNOWLEDGE_CHUNK_WINDOW_FETCH_LIMIT: usize = 2_000;
 const KNOWLEDGE_CHUNK_WINDOW_FETCH_CONCURRENCY: usize = 4;
 const KNOWLEDGE_CHUNK_REVISION_TERM_LIMIT: usize = 24;
@@ -68,6 +69,36 @@ pub struct LibraryGenerationSignals {
     pub has_ready_graph: bool,
     #[serde(default)]
     pub latest_created_at: Option<DateTime<Utc>>,
+}
+
+fn knowledge_chunk_insert_payload(row: &KnowledgeChunkRow) -> serde_json::Value {
+    serde_json::json!({
+        "_key": row.key,
+        "chunk_id": row.chunk_id,
+        "workspace_id": row.workspace_id,
+        "library_id": row.library_id,
+        "document_id": row.document_id,
+        "revision_id": row.revision_id,
+        "chunk_index": row.chunk_index,
+        "chunk_kind": row.chunk_kind,
+        "content_text": row.content_text,
+        "normalized_text": row.normalized_text,
+        "span_start": row.span_start,
+        "span_end": row.span_end,
+        "token_count": row.token_count,
+        "support_block_ids": row.support_block_ids,
+        "section_path": row.section_path,
+        "heading_trail": row.heading_trail,
+        "literal_digest": row.literal_digest,
+        "chunk_state": row.chunk_state,
+        "text_generation": row.text_generation,
+        "vector_generation": row.vector_generation,
+        "quality_score": row.quality_score,
+        "window_text": row.window_text,
+        "raptor_level": row.raptor_level,
+        "occurred_at": row.occurred_at,
+        "occurred_until": row.occurred_until,
+    })
 }
 
 #[derive(Clone)]
@@ -676,7 +707,9 @@ impl ArangoDocumentStore {
                     vector_generation: @vector_generation,
                     quality_score: @quality_score,
                     window_text: @window_text,
-                    raptor_level: @raptor_level
+                    raptor_level: @raptor_level,
+                    occurred_at: @occurred_at,
+                    occurred_until: @occurred_until
                  }
                  UPDATE {
                     chunk_kind: @chunk_kind,
@@ -694,7 +727,9 @@ impl ArangoDocumentStore {
                     vector_generation: @vector_generation,
                     quality_score: @quality_score,
                     window_text: @window_text,
-                    raptor_level: @raptor_level
+                    raptor_level: @raptor_level,
+                    occurred_at: @occurred_at,
+                    occurred_until: @occurred_until
                  }
                  IN @@collection
                  RETURN NEW",
@@ -723,6 +758,8 @@ impl ArangoDocumentStore {
                     "quality_score": row.quality_score,
                     "window_text": row.window_text,
                     "raptor_level": row.raptor_level,
+                    "occurred_at": row.occurred_at,
+                    "occurred_until": row.occurred_until,
                 }),
             )
             .await
@@ -738,51 +775,25 @@ impl ArangoDocumentStore {
             return Ok(Vec::new());
         }
 
-        let payload_rows = rows
-            .iter()
-            .map(|row| {
-                serde_json::json!({
-                    "_key": row.key,
-                    "chunk_id": row.chunk_id,
-                    "workspace_id": row.workspace_id,
-                    "library_id": row.library_id,
-                    "document_id": row.document_id,
-                    "revision_id": row.revision_id,
-                    "chunk_index": row.chunk_index,
-                    "chunk_kind": row.chunk_kind,
-                    "content_text": row.content_text,
-                    "normalized_text": row.normalized_text,
-                    "span_start": row.span_start,
-                    "span_end": row.span_end,
-                    "token_count": row.token_count,
-                    "support_block_ids": row.support_block_ids,
-                    "section_path": row.section_path,
-                    "heading_trail": row.heading_trail,
-                    "literal_digest": row.literal_digest,
-                    "chunk_state": row.chunk_state,
-                    "text_generation": row.text_generation,
-                    "vector_generation": row.vector_generation,
-                    "quality_score": row.quality_score,
-                    "window_text": row.window_text,
-                    "raptor_level": row.raptor_level,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let cursor = self
-            .client
-            .query_json(
-                "FOR row IN @rows
-                 INSERT row INTO @@collection
-                 RETURN NEW",
-                serde_json::json!({
-                    "@collection": KNOWLEDGE_CHUNK_COLLECTION,
-                    "rows": payload_rows,
-                }),
-            )
-            .await
-            .context("failed to insert knowledge chunks")?;
-        decode_many_results(cursor)
+        let mut inserted = Vec::with_capacity(rows.len());
+        for chunk in rows.chunks(KNOWLEDGE_CHUNK_INSERT_BATCH_ROWS) {
+            let payload_rows = chunk.iter().map(knowledge_chunk_insert_payload).collect::<Vec<_>>();
+            let cursor = self
+                .client
+                .query_json(
+                    "FOR row IN @rows
+                     INSERT row INTO @@collection
+                     RETURN NEW",
+                    serde_json::json!({
+                        "@collection": KNOWLEDGE_CHUNK_COLLECTION,
+                        "rows": payload_rows,
+                    }),
+                )
+                .await
+                .context("failed to insert knowledge chunks")?;
+            inserted.extend(decode_many_results(cursor)?);
+        }
+        Ok(inserted)
     }
 
     /// List all non-RAPTOR chunks for a library (used by RAPTOR tree builder).
@@ -861,7 +872,6 @@ impl ArangoDocumentStore {
                 "FOR chunk IN @@collection
                  FILTER chunk.revision_id == @revision_id
                  SORT chunk.chunk_index ASC, chunk.chunk_id ASC
-                 LIMIT 2000
                  RETURN chunk",
                 serde_json::json!({
                     "@collection": KNOWLEDGE_CHUNK_COLLECTION,
@@ -871,6 +881,25 @@ impl ArangoDocumentStore {
             .await
             .context("failed to list knowledge chunks by revision")?;
         decode_many_results(cursor)
+    }
+
+    pub async fn count_chunks_by_revision(&self, revision_id: Uuid) -> anyhow::Result<i64> {
+        let cursor = self
+            .client
+            .query_json(
+                "FOR chunk IN @@collection
+                 FILTER chunk.revision_id == @revision_id
+                 FILTER chunk.chunk_state == 'ready'
+                 COLLECT WITH COUNT INTO count
+                 RETURN count",
+                serde_json::json!({
+                    "@collection": KNOWLEDGE_CHUNK_COLLECTION,
+                    "revision_id": revision_id,
+                }),
+            )
+            .await
+            .context("failed to count knowledge chunks by revision")?;
+        decode_single_result(cursor)
     }
 
     pub async fn list_chunks_by_revision_matching_terms(

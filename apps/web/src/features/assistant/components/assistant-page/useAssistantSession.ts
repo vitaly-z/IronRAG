@@ -28,13 +28,16 @@ import type {
   LlmContextDebugResponse,
 } from '@/shared/api/query';
 import { errorMessage } from '@/shared/lib/errorMessage';
-import type { AssistantMessage, AssistantSession } from '@/shared/types';
+import type {
+  AssistantAgentActivityEvent,
+  AssistantMessage,
+  AssistantSession,
+} from '@/shared/types';
 import {
   applyTurnResultToMessages,
   createPendingAssistantMessage,
   createUserMessage,
   EMPTY_MESSAGES,
-  isTransientNetworkReject,
   latestEvidenceFromMessages,
   resolveStateAction,
   type RetryableAssistantTurn,
@@ -111,6 +114,16 @@ function sessionListItemFromConversation(
   };
 }
 
+function appendPendingActivity(
+  message: AssistantMessage,
+  event: AssistantAgentActivityEvent,
+): AssistantMessage {
+  return {
+    ...message,
+    activityEvents: [...(message.activityEvents ?? []), event].slice(-24),
+  };
+}
+
 export function useAssistantSession({
   workspaceId,
   libraryId,
@@ -137,6 +150,10 @@ export function useAssistantSession({
     libraryScopeKey,
     null,
   );
+  const [debugError, setDebugError] = useScopedState<string | null>(
+    libraryScopeKey,
+    null,
+  );
   const libraryScopeRef = useRef<string | null>(libraryScopeKey);
   const activeSessionRef = useRef<string | null>(activeSession);
   const debugRequestRef = useRef(0);
@@ -152,8 +169,9 @@ export function useAssistantSession({
     activeSessionRef.current = activeSession;
     debugRequestRef.current += 1;
     setDebugContext(null);
+    setDebugError(null);
     setDebugLoadingId(null);
-  }, [activeSession, setDebugContext, setDebugLoadingId]);
+  }, [activeSession, setDebugContext, setDebugError, setDebugLoadingId]);
 
   const sessionsQueryOptions = queries.listQuerySessionsOptions(
     libraryId ? { query: { libraryId } } : undefined,
@@ -261,16 +279,25 @@ export function useAssistantSession({
         );
       }
 
-      let result: AssistantTurnExecutionResponse;
-      try {
-        result = await queryApi.createTurn(sessionId, variables.questionText);
-      } catch (err: unknown) {
-        if (isTransientNetworkReject(errorMessage(err, ''))) {
-          result = await queryApi.createTurn(sessionId, variables.questionText);
-        } else {
-          throw err;
-        }
-      }
+      const result = await queryApi.createTurnStream(
+        sessionId,
+        variables.questionText,
+        (event) => {
+          if (
+            libraryScopeRef.current !== variables.requestScope ||
+            activeSessionRef.current !== sessionId
+          ) {
+            return;
+          }
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === variables.pendingMessage.id
+                ? appendPendingActivity(message, event)
+                : message,
+            ),
+          );
+        },
+      );
 
       return {
         pendingMessageId: variables.pendingMessage.id,
@@ -348,16 +375,35 @@ export function useAssistantSession({
     },
     onError: (err, variables, context) => {
       const rawMessage = errorMessage(err, t('assistant.unknownError'));
+      const inlineError = t('assistant.turnFailedInline', { error: rawMessage });
       if (context) {
-        queryClient.setQueryData(
-          variables.sessionsQueryKey,
-          context.previousSessions,
-        );
         if (libraryScopeRef.current === variables.requestScope) {
-          setOptimisticSessionId(null);
-          activeSessionRef.current = context.previousActiveSession;
-          setActiveSession(context.previousActiveSession);
-          setMessages(context.previousMessages);
+          const activeIsUnresolvedOptimistic =
+            variables.optimisticSessionId !== null &&
+            activeSessionRef.current === variables.optimisticSessionId;
+          if (activeIsUnresolvedOptimistic) {
+            queryClient.setQueryData(
+              variables.sessionsQueryKey,
+              context.previousSessions,
+            );
+            setOptimisticSessionId(null);
+            activeSessionRef.current = context.previousActiveSession;
+            setActiveSession(context.previousActiveSession);
+          }
+          setMessages((current) => {
+            const hasPendingMessage = current.some(
+              (message) => message.id === variables.pendingMessage.id,
+            );
+            if (!hasPendingMessage) return context.previousMessages;
+            return current.map((message) =>
+              message.id === variables.pendingMessage.id
+                ? {
+                    ...message,
+                    content: inlineError,
+                  }
+                : message,
+            );
+          });
           setRetryable({
             question: variables.questionText,
             diagnosis: rawMessage,
@@ -402,7 +448,8 @@ export function useAssistantSession({
     setMessages([]);
     setRetryable(null);
     setDebugContext(null);
-  }, [setActiveSession, setDebugContext, setMessages, setRetryable]);
+    setDebugError(null);
+  }, [setActiveSession, setDebugContext, setDebugError, setMessages, setRetryable]);
 
   const openDebugFor = useCallback(
     async (executionId: string) => {
@@ -410,6 +457,7 @@ export function useAssistantSession({
       debugRequestRef.current = requestId;
       const requestSession = activeSessionRef.current;
       setDebugLoadingId(executionId);
+      setDebugError(null);
       try {
         const snapshot = await queryApi.getExecutionLlmContext(executionId);
         if (
@@ -423,7 +471,9 @@ export function useAssistantSession({
           debugRequestRef.current === requestId &&
           activeSessionRef.current === requestSession
         ) {
-          toast.error(errorMessage(err, t('assistant.llmContextUnavailable')));
+          const message = errorMessage(err, t('assistant.llmContextUnavailable'));
+          setDebugError(message);
+          toast.error(message);
         }
       } finally {
         if (
@@ -434,7 +484,7 @@ export function useAssistantSession({
         }
       }
     },
-    [setDebugContext, setDebugLoadingId, t],
+    [setDebugContext, setDebugError, setDebugLoadingId, t],
   );
 
   const sendQuestion = useCallback(
@@ -503,6 +553,7 @@ export function useAssistantSession({
   return {
     activeSession,
     debugContext,
+    debugError,
     debugLoadingId,
     isExecuting,
     latestEvidence,
@@ -515,6 +566,7 @@ export function useAssistantSession({
     sessionSearch,
     sessions,
     setDebugContext,
+    setDebugError,
     setSessionSearch,
     sendQuestion,
   };

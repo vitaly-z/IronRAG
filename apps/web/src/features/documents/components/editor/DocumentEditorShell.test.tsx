@@ -149,6 +149,7 @@ describe('DocumentEditorShell', () => {
           onOpenChange={props?.onOpenChange ?? vi.fn()}
           onSave={props?.onSave ?? vi.fn()}
           open={props?.open ?? true}
+          readOnly={props?.readOnly ?? false}
           saving={props?.saving ?? false}
           sourceFormat={props?.sourceFormat ?? 'xlsx'}
           t={i18n.t.bind(i18n)}
@@ -250,6 +251,24 @@ describe('DocumentEditorShell', () => {
 
     expect(container.querySelector('textarea')?.value).toBe(largeSource);
     expect(getLatestEditorConfig()?.content).toBe('');
+  });
+
+  it('opens non-editable documents in a read-only viewer without save controls', async () => {
+    editorState.markdown = '# Prepared PDF\n\nExtracted text.';
+
+    await renderShell({
+      documentName: 'guide.pdf',
+      markdown: '# Prepared PDF\n\nExtracted text.',
+      readOnly: true,
+      sourceFormat: 'pdf',
+    });
+
+    expect(container.textContent).toContain('Document Viewer');
+    expect(container.textContent).toContain('Read-only');
+    expect(container.textContent).not.toContain('Save And Reprocess');
+    expect(container.textContent).not.toContain('Bullets');
+    expect(getLatestEditorConfig()?.editable).toBe(false);
+    expect(mockEditor.setEditable).toHaveBeenCalledWith(false);
   });
 
   it('becomes dirty only after a real content update', async () => {

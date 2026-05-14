@@ -1,23 +1,20 @@
 //! Per-library debounce for graph maintenance passes (entity resolution,
 //! community detection, community summary generation).
 //!
-//! Every `content_mutation` ingest job finishes by running a library-wide
-//! maintenance pass: entity resolution, community detection, and a batch
-//! of LLM calls for community summaries. That work is idempotent and
-//! operates on the whole graph, so running it once per completed job
-//! scales as O(jobs × library-size). Under a full queue burst on any
-//! reasonably sized library the maintenance loop becomes the dominant
-//! CPU sink — each finishing job kicks another pass while the previous
-//! pass is still running.
+//! A background worker loop runs a library-wide maintenance pass: entity
+//! resolution, community detection, and a batch of LLM calls for community
+//! summaries. That work is idempotent and operates on the whole graph, so
+//! keeping it out of the per-document ingest critical path prevents one large
+//! graph from holding an ingest lease after the document projection is already
+//! ready.
 //!
 //! This module squashes that burst down to a single pass per library
-//! per [`MAINTENANCE_INTERVAL`] window. The first ingest job to finish
-//! in a window claims the slot via [`try_acquire_graph_maintenance_slot`]
-//! and runs the full pass; subsequent jobs see the slot already claimed
-//! and skip the block entirely. The maintenance work remains correct —
-//! it only has to *eventually* catch up with the graph state, and the
-//! final job in a queue burst is guaranteed to trigger one more pass
-//! after the slot expires.
+//! per [`MAINTENANCE_INTERVAL`] window. The worker loop claims the slot via
+//! [`try_acquire_graph_maintenance_slot`] and runs the full pass; concurrent
+//! ticks see the slot already claimed and skip the block entirely. The
+//! maintenance work remains correct because graph projection is committed
+//! before document finalization and maintenance only has to eventually catch
+//! up with that canonical graph state.
 //!
 //! The throttle lives in process-local state (a `Mutex<HashMap>`)
 //! because it guards a process-local CPU hot path — cross-worker
@@ -43,10 +40,6 @@ fn last_run() -> &'static Mutex<HashMap<Uuid, Instant>> {
     LAST_RUN.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Minimum wall-clock gap between two maintenance passes on the same
-/// library. Chosen to comfortably exceed one pass on the reference
-/// library; smaller libraries finish well inside the window and end up
-/// running at whatever natural rate ingest jobs arrive.
 /// How long a maintenance slot stays claimed once it has been acquired.
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 

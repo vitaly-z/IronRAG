@@ -6,16 +6,22 @@
 
 use std::{
     ffi::OsStr,
+    future::Future,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{Arc, LazyLock},
     time::Duration,
 };
+
+#[cfg(target_family = "unix")]
+use std::os::unix::process::ExitStatusExt;
 
 use base64::Engine as _;
 use serde::Deserialize;
 use tempfile::TempDir;
 use thiserror::Error;
 use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::Command,
     sync::{OwnedSemaphorePermit, Semaphore},
     time::timeout,
@@ -26,8 +32,9 @@ use crate::shared::extraction::{
 };
 
 const DEFAULT_EXTRACT_BIN: &str = "ironrag-docling-extract";
-const DEFAULT_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_MAX_CONCURRENCY: usize = 1;
+const DEFAULT_PAGE_BATCH_SIZE: u32 = 5;
 const STDERR_PREVIEW_LIMIT: usize = 4_000;
 
 static DOCLING_CONCURRENCY: LazyLock<Arc<Semaphore>> =
@@ -61,6 +68,24 @@ pub enum DoclingExtractionError {
 
     #[error("docling concurrency limiter is closed")]
     LimiterClosed,
+
+    #[error("docling page extraction failed for page {page}: {message}")]
+    PageExtractionFailed { page: u32, message: String },
+
+    #[error("docling paginated merge failed: {0}")]
+    PaginatedMergeFailed(String),
+
+    #[error("docling pdf page count is unavailable")]
+    PdfPageCountUnavailable,
+}
+
+#[derive(Debug, Error)]
+pub enum DoclingBatchStreamError {
+    #[error(transparent)]
+    Extraction(#[from] DoclingExtractionError),
+
+    #[error("docling page batch handler failed: {0}")]
+    Batch(anyhow::Error),
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -83,11 +108,36 @@ struct DoclingExtractionPayload {
     timings: serde_json::Value,
     /// Embedded picture items extracted from the source. Each entry
     /// carries the cropped picture bytes (base64-encoded PNG) so the
-    /// caller can route them through the active `vision` binding for
-    /// higher-quality OCR than the local rapidocr/tesseract fallback.
+    /// caller can route them through the active `vision` binding when the
+    /// library policy chooses provider-backed OCR instead of local CPU OCR.
     /// The `index` matches the placeholder ordinal in `markdown`.
     #[serde(default)]
     pictures: Vec<DoclingExtractionPicture>,
+}
+
+/// Lightweight page-count response from `--page-count`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DoclingPageCountPayload {
+    #[serde(default)]
+    page_count: Option<u32>,
+}
+
+/// Batch response from `--pages START-END`. Contains per-page payloads
+/// produced in a single Python process (RapidOCR loaded once).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DoclingBatchPayload {
+    #[serde(default)]
+    page_range: Option<String>,
+    pages: Vec<DoclingExtractionPayload>,
+}
+
+pub struct DoclingPageRangeExtraction {
+    pub start_page: u32,
+    pub end_page: u32,
+    pub elapsed_ms: i64,
+    pub output: ExtractionOutput,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -116,8 +166,227 @@ pub async fn extract_document(
     let _permit = acquire_docling_permit().await?;
     let temp_dir = tempfile::tempdir().map_err(DoclingExtractionError::TempDir)?;
     let input_path = write_input_file(&temp_dir, file_name, mime_type, source_format, &file_bytes)?;
-    let payload = run_docling(&input_path).await?;
+
+    if source_format == "pdf" {
+        return extract_document_paginated(&input_path, file_name, mime_type, source_format).await;
+    }
+
+    let payload = run_docling(&input_path, &[]).await?;
     build_output(payload, file_name, mime_type, source_format)
+}
+
+pub async fn extract_pdf_page_count(
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+    source_format: &str,
+    file_bytes: &[u8],
+) -> Result<Option<u32>, DoclingExtractionError> {
+    let temp_dir = tempfile::tempdir().map_err(DoclingExtractionError::TempDir)?;
+    let input_path = write_input_file(&temp_dir, file_name, mime_type, source_format, file_bytes)?;
+    run_docling_page_count(&input_path).await
+}
+
+pub async fn extract_pdf_page_ranges_streamed<F, Fut>(
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+    source_format: &str,
+    file_bytes: &[u8],
+    start_page: u32,
+    end_page: u32,
+    batch_size: u32,
+    on_batch: F,
+) -> Result<(), DoclingBatchStreamError>
+where
+    F: FnMut(DoclingPageRangeExtraction) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let _permit = acquire_docling_permit().await?;
+    let temp_dir = tempfile::tempdir().map_err(DoclingExtractionError::TempDir)?;
+    let input_path = write_input_file(&temp_dir, file_name, mime_type, source_format, file_bytes)?;
+    run_docling_page_batches(
+        &input_path,
+        file_name,
+        mime_type,
+        source_format,
+        start_page,
+        end_page,
+        batch_size,
+        on_batch,
+    )
+    .await
+}
+
+pub fn configured_page_batch_size() -> u32 {
+    page_batch_size()
+}
+
+pub fn configured_max_concurrency() -> usize {
+    docling_max_concurrency()
+}
+
+/// Extracts a PDF through the page-range Docling path, merging results into
+/// a single output for callers that do not own durable ingest-unit state.
+async fn extract_document_paginated(
+    input_path: &Path,
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+    source_format: &str,
+) -> Result<ExtractionOutput, DoclingExtractionError> {
+    let page_count = run_docling_page_count(input_path)
+        .await?
+        .filter(|value| *value > 0)
+        .ok_or(DoclingExtractionError::PdfPageCountUnavailable)?;
+
+    let batch_size = page_batch_size();
+    let batch_count = page_count.div_ceil(batch_size);
+    tracing::info!(
+        page_count,
+        batch_size,
+        batch_count,
+        "docling: starting batched page-at-a-time extraction"
+    );
+
+    let mut merged_markdown = String::new();
+    let mut merged_text = String::new();
+    let mut merged_pictures: Vec<DoclingExtractionPicture> = Vec::new();
+    let mut all_warnings: Vec<String> = Vec::new();
+    let mut total_seconds = 0.0_f64;
+    let mut status: Option<String> = None;
+    let mut input_format: Option<String> = None;
+    let mut picture_index_offset: usize = 0;
+
+    for batch_idx in 0..batch_count {
+        let start = batch_idx * batch_size + 1;
+        let end = ((batch_idx + 1) * batch_size).min(page_count);
+
+        // Use --pages START-END for batches > 1 page, --page N for single page
+        let (payloads, batch_elapsed): (Vec<DoclingExtractionPayload>, f64) = if start == end {
+            let payload =
+                run_docling(input_path, &["--page", &start.to_string()]).await.map_err(|e| {
+                    DoclingExtractionError::PageExtractionFailed {
+                        page: start,
+                        message: e.to_string(),
+                    }
+                })?;
+            let ts = payload.timings.get("totalSeconds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            (vec![payload], ts)
+        } else {
+            let mut batch = run_docling_batch(input_path, start, end).await.map_err(|e| {
+                DoclingExtractionError::PageExtractionFailed { page: start, message: e.to_string() }
+            })?;
+            let ts = batch
+                .pages
+                .first()
+                .and_then(|p| p.timings.get("totalSeconds"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let payload = merge_batch_payload(&mut batch, start, end);
+            (vec![payload], ts)
+        };
+
+        for payload in payloads {
+            if !merged_markdown.is_empty() {
+                merged_markdown.push_str("\n\n");
+                merged_text.push_str("\n\n");
+            }
+            merged_markdown.push_str(&payload.markdown);
+            if let Some(ref text) = payload.text {
+                merged_text.push_str(text);
+            }
+
+            for mut pic in payload.pictures {
+                pic.index += picture_index_offset;
+                merged_pictures.push(pic);
+            }
+            picture_index_offset = merged_pictures.len();
+
+            all_warnings.extend(payload.warnings);
+            status = payload.status.or(status.clone());
+            input_format = payload.input_format.or(input_format.clone());
+        }
+
+        total_seconds += batch_elapsed;
+
+        if batch_count > 1 {
+            tracing::info!(
+                batch = batch_idx + 1,
+                batch_count,
+                pages = format!("{start}-{end}"),
+                "docling: batch complete"
+            );
+        }
+    }
+
+    tracing::info!(page_count, total_seconds, "docling: page-at-a-time extraction complete");
+
+    let merged_payload = DoclingExtractionPayload {
+        markdown: merged_markdown,
+        text: Some(merged_text),
+        page_count: Some(page_count),
+        status,
+        input_format,
+        docling_version: None,
+        warnings: all_warnings,
+        timings: serde_json::json!({"totalSeconds": total_seconds, "paginated": true, "pageCount": page_count}),
+        pictures: merged_pictures,
+    };
+
+    build_output(merged_payload, file_name, mime_type, source_format)
+}
+
+fn merge_batch_payload(
+    batch: &mut DoclingBatchPayload,
+    start_page: u32,
+    end_page: u32,
+) -> DoclingExtractionPayload {
+    let mut merged_markdown = String::new();
+    let mut merged_text = String::new();
+    let mut merged_pictures: Vec<DoclingExtractionPicture> = Vec::new();
+    let mut all_warnings: Vec<String> = Vec::new();
+    let mut total_seconds = 0.0_f64;
+    let mut status: Option<String> = None;
+    let mut input_format: Option<String> = None;
+    let mut picture_index_offset: usize = 0;
+
+    for payload in batch.pages.drain(..) {
+        if !merged_markdown.is_empty() {
+            merged_markdown.push_str("\n\n");
+            merged_text.push_str("\n\n");
+        }
+        merged_markdown.push_str(&payload.markdown);
+        if let Some(ref text) = payload.text {
+            merged_text.push_str(text);
+        }
+
+        for mut picture in payload.pictures {
+            picture.index += picture_index_offset;
+            merged_pictures.push(picture);
+        }
+        picture_index_offset = merged_pictures.len();
+
+        all_warnings.extend(payload.warnings);
+        total_seconds +=
+            payload.timings.get("totalSeconds").and_then(|value| value.as_f64()).unwrap_or(0.0);
+        status = payload.status.or(status);
+        input_format = payload.input_format.or(input_format);
+    }
+
+    let page_count = end_page.saturating_sub(start_page).saturating_add(1);
+    DoclingExtractionPayload {
+        markdown: merged_markdown,
+        text: Some(merged_text),
+        page_count: Some(page_count),
+        status,
+        input_format,
+        docling_version: None,
+        warnings: all_warnings,
+        timings: serde_json::json!({
+            "totalSeconds": total_seconds,
+            "paginated": true,
+            "pageRange": format!("{start_page}-{end_page}"),
+        }),
+        pictures: merged_pictures,
+    }
 }
 
 async fn acquire_docling_permit() -> Result<OwnedSemaphorePermit, DoclingExtractionError> {
@@ -143,9 +412,166 @@ fn write_input_file(
 
 async fn run_docling(
     input_path: &Path,
+    extra_args: &[&str],
 ) -> Result<DoclingExtractionPayload, DoclingExtractionError> {
+    // Log current process RSS so operators can correlate OOM kills with
+    // pre-extraction baseline memory usage.
+    if let Some(rss_mb) = current_rss_mb() {
+        if rss_mb > 3000 {
+            tracing::warn!(rss_mb, "docling: worker RSS is high before extraction — OOM likely");
+        } else {
+            tracing::info!(rss_mb, "docling: worker RSS before extraction");
+        }
+    }
+
+    let output = run_docling_raw(input_path, extra_args).await?;
+    serde_json::from_slice(&output.stdout).map_err(DoclingExtractionError::InvalidJson)
+}
+
+/// Queries the page count of a PDF via `--page-count`. Returns `None`
+/// when the extractor reports that page counting is unsupported.
+async fn run_docling_page_count(input_path: &Path) -> Result<Option<u32>, DoclingExtractionError> {
+    let timeout_secs: u64 = 30;
+    let mut command = Command::new(docling_extract_bin());
+    command.arg("--page-count").arg(input_path).kill_on_drop(true);
+
+    let output = timeout(Duration::from_secs(timeout_secs), command.output())
+        .await
+        .map_err(|_| DoclingExtractionError::Timeout(timeout_secs))?
+        .map_err(DoclingExtractionError::Spawn)?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let payload: DoclingPageCountPayload =
+        serde_json::from_slice(&output.stdout).map_err(DoclingExtractionError::InvalidJson)?;
+    Ok(payload.page_count)
+}
+
+/// Returns a human-readable hint when a process was terminated by a signal.
+/// On Unix, maps common signals like SIGKILL (9) and SIGTERM (15) to
+/// operator-visible diagnostics.
+/// Calls `--pages START-END` to extract a range of pages in a single
+/// Python process, reusing the loaded RapidOCR model across pages.
+async fn run_docling_batch(
+    input_path: &Path,
+    start_page: u32,
+    end_page: u32,
+) -> Result<DoclingBatchPayload, DoclingExtractionError> {
+    let range = format!("{start_page}-{end_page}");
+    let output = run_docling_raw(input_path, &["--pages", &range]).await?;
+    serde_json::from_slice(&output.stdout).map_err(DoclingExtractionError::InvalidJson)
+}
+
+async fn run_docling_page_batches<F, Fut>(
+    input_path: &Path,
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+    source_format: &str,
+    start_page: u32,
+    end_page: u32,
+    batch_size: u32,
+    mut on_batch: F,
+) -> Result<(), DoclingBatchStreamError>
+where
+    F: FnMut(DoclingPageRangeExtraction) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let timeout_secs = docling_timeout_secs();
+    let range = format!("{start_page}-{end_page}");
+    let mut command = Command::new(docling_extract_bin());
+    command
+        .arg("--page-batches")
+        .arg(batch_size.to_string())
+        .arg(range)
+        .arg(input_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().map_err(DoclingExtractionError::Spawn)?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        DoclingExtractionError::Spawn(std::io::Error::other("docling batch stdout was not piped"))
+    })?;
+    let stderr_task = child.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes).await;
+            bytes
+        })
+    });
+
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = timeout(Duration::from_secs(timeout_secs), lines.next_line())
+        .await
+        .map_err(|_| {
+            let _ = child.start_kill();
+            DoclingExtractionError::Timeout(timeout_secs)
+        })?
+        .map_err(DoclingExtractionError::Spawn)?
+    {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut payload: DoclingBatchPayload =
+            serde_json::from_str(line).map_err(DoclingExtractionError::InvalidJson)?;
+        let (range_start, range_end) =
+            parse_page_range(payload.page_range.as_deref()).map_err(|message| {
+                DoclingExtractionError::PaginatedMergeFailed(format!(
+                    "docling streamed batch has invalid pageRange: {message}"
+                ))
+            })?;
+        let merged_payload = merge_batch_payload(&mut payload, range_start, range_end);
+        let elapsed_ms = merged_payload
+            .timings
+            .get("totalSeconds")
+            .and_then(serde_json::Value::as_f64)
+            .map(|seconds| (seconds * 1000.0).round() as i64)
+            .unwrap_or_default();
+        let output = build_output(merged_payload, file_name, mime_type, source_format)?;
+        on_batch(DoclingPageRangeExtraction {
+            start_page: range_start,
+            end_page: range_end,
+            elapsed_ms,
+            output,
+        })
+        .await
+        .map_err(DoclingBatchStreamError::Batch)?;
+    }
+
+    let status = child.wait().await.map_err(DoclingExtractionError::Spawn)?;
+    let stderr_bytes = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if !status.success() {
+        let signal_hint = signal_exit_hint(&status);
+        let status =
+            status.code().map_or_else(|| format!("signal{signal_hint}"), |code| code.to_string());
+        let stderr =
+            String::from_utf8(stderr_bytes).map_err(DoclingExtractionError::InvalidUtf8)?;
+        return Err(DoclingExtractionError::ProcessFailed {
+            status,
+            stderr: truncate_for_error(&stderr),
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Low-level docling invocation returning raw output for custom parsing.
+async fn run_docling_raw(
+    input_path: &Path,
+    extra_args: &[&str],
+) -> Result<std::process::Output, DoclingExtractionError> {
     let timeout_secs = docling_timeout_secs();
     let mut command = Command::new(docling_extract_bin());
+    for arg in extra_args {
+        command.arg(arg);
+    }
     command.arg(input_path).kill_on_drop(true);
 
     let output = timeout(Duration::from_secs(timeout_secs), command.output())
@@ -154,8 +580,11 @@ async fn run_docling(
         .map_err(DoclingExtractionError::Spawn)?;
 
     if !output.status.success() {
-        let status =
-            output.status.code().map_or_else(|| "signal".to_string(), |code| code.to_string());
+        let signal_hint = signal_exit_hint(&output.status);
+        let status = output
+            .status
+            .code()
+            .map_or_else(|| format!("signal{signal_hint}"), |code| code.to_string());
         let stderr =
             String::from_utf8(output.stderr).map_err(DoclingExtractionError::InvalidUtf8)?;
         return Err(DoclingExtractionError::ProcessFailed {
@@ -164,7 +593,60 @@ async fn run_docling(
         });
     }
 
-    serde_json::from_slice(&output.stdout).map_err(DoclingExtractionError::InvalidJson)
+    Ok(output)
+}
+
+fn parse_page_range(raw: Option<&str>) -> Result<(u32, u32), String> {
+    let raw = raw.ok_or_else(|| "missing pageRange".to_string())?;
+    let (start, end) =
+        raw.split_once('-').ok_or_else(|| format!("expected START-END, got {raw}"))?;
+    let start_page = start.parse::<u32>().map_err(|_| format!("invalid start page {start}"))?;
+    let end_page = end.parse::<u32>().map_err(|_| format!("invalid end page {end}"))?;
+    if start_page == 0 || end_page < start_page {
+        return Err(format!("invalid page range {raw}"));
+    }
+    Ok((start_page, end_page))
+}
+
+fn page_batch_size() -> u32 {
+    std::env::var("IRONRAG_DOCLING_PAGE_BATCH_SIZE")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PAGE_BATCH_SIZE)
+}
+
+/// Returns the current process RSS in megabytes, or `None` if the platform
+/// does not support `/proc/self/statm` (non-Linux).
+fn current_rss_mb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        // statm reports pages; typical page size is 4 KiB.
+        Some(pages * 4 / 1024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn signal_exit_hint(status: &std::process::ExitStatus) -> &'static str {
+    #[cfg(target_family = "unix")]
+    {
+        match status.signal() {
+            Some(9) => " (SIGKILL — likely out of memory)",
+            Some(15) => " (SIGTERM)",
+            Some(_) => " (terminated by signal)",
+            None => "",
+        }
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = status;
+        ""
+    }
 }
 
 fn build_output(

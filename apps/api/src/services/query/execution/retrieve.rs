@@ -1169,31 +1169,13 @@ async fn load_query_ir_focus_chunks(
                 temporal_end,
             )
             .await
+            .map(|rows| {
+                rows.into_iter().map(|row| (row.chunk_id, row.score as f32)).collect::<Vec<_>>()
+            })
             .with_context(|| format!("failed to run query-IR focus chunk search: {focus_query}"))
     });
     let per_query_results: Vec<Result<Vec<_>, anyhow::Error>> = join_all(per_query_futures).await;
-    let mut hits = Vec::new();
-    let mut seen = HashSet::new();
-    for result in per_query_results {
-        for hit in result? {
-            if hits.len() >= QUERY_IR_FOCUS_CHUNK_CAP {
-                break;
-            }
-            if seen.insert(hit.chunk_id) {
-                let fallback_score = query_ir_focus_chunk_score(hits.len());
-                let raw_score = hit.score as f32;
-                let score = if raw_score.is_finite() && raw_score > 0.0 {
-                    raw_score
-                } else {
-                    fallback_score
-                };
-                hits.push((hit.chunk_id, score));
-            }
-        }
-        if hits.len() >= QUERY_IR_FOCUS_CHUNK_CAP {
-            break;
-        }
-    }
+    let hits = combine_query_ir_focus_search_results(per_query_results, search_queries.len())?;
     if hits.is_empty() {
         return Ok(Vec::new());
     }
@@ -1329,11 +1311,8 @@ pub(crate) async fn retrieve_document_chunks(
         });
         let per_query_results: Vec<Result<Vec<RuntimeMatchedChunk>, anyhow::Error>> =
             join_all(per_query_futures).await;
-        let mut lexical_hits: Vec<RuntimeMatchedChunk> = Vec::new();
-        for result in per_query_results {
-            let query_hits = result?;
-            lexical_hits = merge_chunks(lexical_hits, query_hits, lexical_limit);
-        }
+        let lexical_hits =
+            combine_lexical_query_results(per_query_results, lexical_query_count, lexical_limit)?;
         Ok::<(Vec<RuntimeMatchedChunk>, usize, u128), anyhow::Error>((
             lexical_hits,
             lexical_query_count,
@@ -1341,19 +1320,23 @@ pub(crate) async fn retrieve_document_chunks(
         ))
     };
 
-    let ((vector_hits, vector_elapsed_ms), (lexical_hits, lexical_query_count, lexical_elapsed_ms)) =
-        tokio::try_join!(vector_future, lexical_future)?;
+    let (vector_result, lexical_result) = tokio::join!(vector_future, lexical_future);
+    let lane_outcome = combine_chunk_retrieval_lanes(vector_result, lexical_result)?;
     tracing::info!(
         stage = "retrieval.chunks_fanout",
-        vector_elapsed_ms,
-        vector_hits = vector_hits.len(),
-        lexical_elapsed_ms,
-        lexical_query_count,
-        lexical_hits = lexical_hits.len(),
+        vector_elapsed_ms = lane_outcome.vector_elapsed_ms,
+        vector_hits = lane_outcome.vector_hits.len(),
+        lexical_elapsed_ms = lane_outcome.lexical_elapsed_ms,
+        lexical_query_count = lane_outcome.lexical_query_count,
+        lexical_hits = lane_outcome.lexical_hits.len(),
+        degraded_lane_count = lane_outcome.degraded_lane_count,
         "vector + lexical chunk fan-out"
     );
-    let mut chunks =
-        merge_chunks(vector_hits, lexical_hits, limit.max(initial_table_row_count.unwrap_or(0)));
+    let mut chunks = merge_chunks(
+        lane_outcome.vector_hits,
+        lane_outcome.lexical_hits,
+        limit.max(initial_table_row_count.unwrap_or(0)),
+    );
     let document_identity_chunks = load_document_identity_chunks_for_targets(
         state,
         document_index,
@@ -1396,7 +1379,7 @@ pub(crate) async fn retrieve_document_chunks(
         let merged_limit = limit.saturating_add(ENTITY_BIO_CHUNK_CAP);
         chunks = merge_entity_bio_chunks(chunks, entity_bio_chunks, merged_limit);
     }
-    let query_ir_focus_chunks = load_query_ir_focus_chunks(
+    let query_ir_focus_chunks_result = load_query_ir_focus_chunks(
         state,
         library_id,
         question,
@@ -1407,13 +1390,28 @@ pub(crate) async fn retrieve_document_chunks(
         temporal_start,
         temporal_end,
     )
-    .await?;
-    if !query_ir_focus_chunks.is_empty() {
-        chunks = merge_query_ir_focus_chunks(
-            chunks,
-            query_ir_focus_chunks,
-            query_ir_focus_context_top_k(limit),
-        );
+    .await;
+    match query_ir_focus_chunks_result {
+        Ok(query_ir_focus_chunks) if !query_ir_focus_chunks.is_empty() => {
+            chunks = merge_query_ir_focus_chunks(
+                chunks,
+                query_ir_focus_chunks,
+                query_ir_focus_context_top_k(limit),
+            );
+        }
+        Ok(_) => {}
+        Err(error) if !chunks.is_empty() => {
+            let summary = format!("{error:#}");
+            tracing::warn!(
+                stage = "retrieval.query_ir_focus_failed",
+                error = %summary,
+                retrieval_degraded = true,
+                failed_source = "query_ir_focus",
+                retained_chunk_count = chunks.len(),
+                "query-IR focus retrieval failed; continuing with primary retrieved chunks"
+            );
+        }
+        Err(error) => return Err(error),
     }
     // Diversify by document: cap at `MAX_CHUNKS_PER_DOCUMENT` chunks per
     // document_id in the final hit list. Without this, analyzer collisions
@@ -1513,6 +1511,159 @@ pub(crate) async fn retrieve_document_chunks(
     }
 
     Ok(chunks)
+}
+
+fn combine_lexical_query_results(
+    per_query_results: Vec<anyhow::Result<Vec<RuntimeMatchedChunk>>>,
+    lexical_query_count: usize,
+    lexical_limit: usize,
+) -> anyhow::Result<Vec<RuntimeMatchedChunk>> {
+    let mut lexical_hits: Vec<RuntimeMatchedChunk> = Vec::new();
+    let mut failed_query_count = 0usize;
+    let mut failures = Vec::new();
+    for result in per_query_results {
+        match result {
+            Ok(query_hits) => {
+                lexical_hits = merge_chunks(lexical_hits, query_hits, lexical_limit);
+            }
+            Err(error) => {
+                failed_query_count += 1;
+                let summary = format!("{error:#}");
+                tracing::warn!(
+                    stage = "retrieval.lexical_query_failed",
+                    error = %summary,
+                    retrieval_degraded = true,
+                    failed_source = "lexical_query",
+                    failed_query_count,
+                    lexical_query_count,
+                    "lexical chunk search query failed; continuing with other lexical queries"
+                );
+                failures.push(summary);
+            }
+        }
+    }
+    if lexical_query_count > 0 && failed_query_count == lexical_query_count {
+        anyhow::bail!("all lexical chunk search queries failed: {}", failures.join("; "));
+    }
+    Ok(lexical_hits)
+}
+
+fn combine_query_ir_focus_search_results(
+    per_query_results: Vec<anyhow::Result<Vec<(Uuid, f32)>>>,
+    focus_query_count: usize,
+) -> anyhow::Result<Vec<(Uuid, f32)>> {
+    let mut hits = Vec::new();
+    let mut seen = HashSet::new();
+    let mut failed_query_count = 0usize;
+    let mut failures = Vec::new();
+
+    for result in per_query_results {
+        match result {
+            Ok(query_hits) => {
+                for (chunk_id, raw_score) in query_hits {
+                    if hits.len() >= QUERY_IR_FOCUS_CHUNK_CAP {
+                        break;
+                    }
+                    if seen.insert(chunk_id) {
+                        let fallback_score = query_ir_focus_chunk_score(hits.len());
+                        let score = if raw_score.is_finite() && raw_score > 0.0 {
+                            raw_score
+                        } else {
+                            fallback_score
+                        };
+                        hits.push((chunk_id, score));
+                    }
+                }
+            }
+            Err(error) => {
+                failed_query_count += 1;
+                let summary = format!("{error:#}");
+                tracing::warn!(
+                    stage = "retrieval.query_ir_focus_query_failed",
+                    error = %summary,
+                    retrieval_degraded = true,
+                    failed_source = "query_ir_focus",
+                    failed_query_count,
+                    focus_query_count,
+                    "query-IR focus chunk search query failed; continuing with other focus queries"
+                );
+                failures.push(summary);
+            }
+        }
+        if hits.len() >= QUERY_IR_FOCUS_CHUNK_CAP {
+            break;
+        }
+    }
+
+    if focus_query_count > 0 && failed_query_count == focus_query_count {
+        anyhow::bail!("all query-IR focus chunk searches failed: {}", failures.join("; "));
+    }
+
+    Ok(hits)
+}
+
+struct ChunkRetrievalLaneOutcome {
+    vector_hits: Vec<RuntimeMatchedChunk>,
+    vector_elapsed_ms: u128,
+    lexical_hits: Vec<RuntimeMatchedChunk>,
+    lexical_query_count: usize,
+    lexical_elapsed_ms: u128,
+    degraded_lane_count: usize,
+}
+
+fn combine_chunk_retrieval_lanes(
+    vector_result: anyhow::Result<(Vec<RuntimeMatchedChunk>, u128)>,
+    lexical_result: anyhow::Result<(Vec<RuntimeMatchedChunk>, usize, u128)>,
+) -> anyhow::Result<ChunkRetrievalLaneOutcome> {
+    let mut degraded_lane_count = 0usize;
+    let mut failures = Vec::new();
+
+    let (vector_hits, vector_elapsed_ms) = match vector_result {
+        Ok(result) => result,
+        Err(error) => {
+            degraded_lane_count += 1;
+            let summary = format!("{error:#}");
+            tracing::warn!(
+                stage = "retrieval.vector_failed",
+                error = %summary,
+                retrieval_degraded = true,
+                failed_lane = "vector",
+                "vector chunk retrieval failed; continuing with lexical lane if available"
+            );
+            failures.push(format!("vector: {summary}"));
+            (Vec::new(), 0)
+        }
+    };
+
+    let (lexical_hits, lexical_query_count, lexical_elapsed_ms) = match lexical_result {
+        Ok(result) => result,
+        Err(error) => {
+            degraded_lane_count += 1;
+            let summary = format!("{error:#}");
+            tracing::warn!(
+                stage = "retrieval.lexical_failed",
+                error = %summary,
+                retrieval_degraded = true,
+                failed_lane = "lexical",
+                "lexical chunk retrieval failed; continuing with vector lane if available"
+            );
+            failures.push(format!("lexical: {summary}"));
+            (Vec::new(), 0, 0)
+        }
+    };
+
+    if degraded_lane_count == 2 {
+        anyhow::bail!("all chunk retrieval lanes failed: {}", failures.join("; "));
+    }
+
+    Ok(ChunkRetrievalLaneOutcome {
+        vector_hits,
+        vector_elapsed_ms,
+        lexical_hits,
+        lexical_query_count,
+        lexical_elapsed_ms,
+        degraded_lane_count,
+    })
 }
 
 fn retain_entity_bio_candidates(

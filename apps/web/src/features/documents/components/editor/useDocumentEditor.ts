@@ -8,13 +8,14 @@ import type { DocumentItem } from '@/shared/types';
 import { buildEditorBlocks, serializeEditorBlocks, serializeSourceTextForEditor } from './documentEditorBlocks';
 import { isCodeLikeSourceFormat, isPlainTextSourceFormat } from './editorSurfaceMode';
 
-type EditAvailability = {
+type EditorAvailability = {
   enabled: boolean;
+  readOnly: boolean;
   reason: string | null;
 };
 
 type UseDocumentEditorOptions = {
-  editAvailability: (doc: DocumentItem | null) => EditAvailability;
+  editorAvailability: (doc: DocumentItem | null) => EditorAvailability;
   errorMessage: (error: unknown, fallback: string) => string;
   onDocumentSaved: (documentId: string) => Promise<void>;
   onDocumentSelected: (doc: DocumentItem) => void | Promise<void>;
@@ -23,7 +24,7 @@ type UseDocumentEditorOptions = {
 };
 
 export function useDocumentEditor({
-  editAvailability,
+  editorAvailability,
   errorMessage,
   onDocumentSaved,
   onDocumentSelected,
@@ -36,6 +37,7 @@ export function useDocumentEditor({
   const [editorMarkdown, setEditorMarkdown] = useState('');
   const [editorError, setEditorError] = useState<string | null>(null);
   const [editorDocument, setEditorDocument] = useState<DocumentItem | null>(null);
+  const [editorReadOnly, setEditorReadOnly] = useState(false);
 
   const resetEditor = useCallback(() => {
     setEditorOpen(false);
@@ -44,6 +46,7 @@ export function useDocumentEditor({
     setEditorError(null);
     setEditorLoading(false);
     setEditorSaving(false);
+    setEditorReadOnly(false);
   }, []);
 
   const handleEditorOpenChange = useCallback(
@@ -59,7 +62,7 @@ export function useDocumentEditor({
 
   const openEditor = useCallback(
     async (doc: DocumentItem) => {
-      const availability = editAvailability(doc);
+      const availability = editorAvailability(doc);
       if (!availability.enabled) {
         toast.error(availability.reason ?? t('documents.editUnavailableGeneric'));
         return;
@@ -73,6 +76,7 @@ export function useDocumentEditor({
       setEditorMarkdown('');
       setEditorError(null);
       setEditorLoading(true);
+      setEditorReadOnly(availability.readOnly);
       setEditorOpen(true);
 
       try {
@@ -87,7 +91,7 @@ export function useDocumentEditor({
       }
     },
     [
-      editAvailability,
+      editorAvailability,
       errorMessage,
       onDocumentSelected,
       selectedDocumentId,
@@ -98,6 +102,11 @@ export function useDocumentEditor({
   const saveEditor = useCallback(
     async (markdown: string) => {
       if (!editorDocument) {
+        return;
+      }
+
+      const availability = editorAvailability(editorDocument);
+      if (availability.readOnly) {
         return;
       }
 
@@ -118,7 +127,7 @@ export function useDocumentEditor({
         setEditorSaving(false);
       }
     },
-    [editorDocument, errorMessage, onDocumentSaved, resetEditor, t],
+    [editorAvailability, editorDocument, errorMessage, onDocumentSaved, resetEditor, t],
   );
 
   return {
@@ -127,6 +136,7 @@ export function useDocumentEditor({
     editorLoading,
     editorMarkdown,
     editorOpen,
+    editorReadOnly,
     editorSaving,
     handleEditorOpenChange,
     openEditor,

@@ -6,7 +6,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::graph_extraction_cache_hash;
 use super::parse::{
-    normalize_graph_extraction_output, parse_graph_extraction_output,
+    canonical_graph_extraction_normalized_json, normalize_graph_extraction_output,
+    parse_graph_extraction_output, repair_graph_extraction_normalized_json,
     sanitize_graph_extraction_candidate_set,
 };
 use super::prompt::{
@@ -379,6 +380,431 @@ fn drops_empty_candidates_and_rejects_noncanonical_relation_labels() {
     assert_eq!(normalized.entities[0].aliases, vec!["Delta Provider".to_string()]);
     assert_eq!(normalized.relations.len(), 1);
     assert_eq!(normalized.relations[0].relation_type, "builds_on");
+}
+
+#[test]
+fn repairs_utf8_mojibake_graph_candidate_strings() {
+    fn latin1_mojibake(value: &str) -> String {
+        value.as_bytes().iter().map(|byte| char::from(*byte)).collect()
+    }
+
+    let source_label = latin1_mojibake("\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}");
+    let target_label = latin1_mojibake("\u{041f}\u{043e}\u{043b}\u{0435}");
+    let subtype =
+        latin1_mojibake("\u{043f}\u{0430}\u{0440}\u{0430}\u{043c}\u{0435}\u{0442}\u{0440}");
+    let summary = latin1_mojibake(
+        "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430} — \u{043e}\u{043f}\u{0438}\u{0441}\u{0430}\u{043d}\u{0438}\u{0435} \u{043f}\u{043e}\u{043b}\u{044f}",
+    );
+    let output = serde_json::json!({
+        "entities": [
+            {
+                "label": source_label,
+                "node_type": "attribute",
+                "aliases": [target_label],
+                "sub_type": subtype,
+                "summary": summary
+            }
+        ],
+        "relations": [
+            {
+                "source_label": latin1_mojibake("\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}"),
+                "target_label": latin1_mojibake("\u{041f}\u{043e}\u{043b}\u{0435}"),
+                "relation_type": "describes",
+                "summary": latin1_mojibake("\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430} — \u{043e}\u{043f}\u{0438}\u{0441}\u{0430}\u{043d}\u{0438}\u{0435} \u{043f}\u{043e}\u{043b}\u{044f}")
+            }
+        ]
+    });
+
+    let normalized =
+        parse_graph_extraction_output(&output.to_string()).expect("parse graph extraction");
+
+    assert_eq!(normalized.entities.len(), 1);
+    assert_eq!(normalized.entities[0].label, "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}");
+    assert_eq!(normalized.entities[0].aliases, vec!["\u{041f}\u{043e}\u{043b}\u{0435}"]);
+    assert_eq!(
+        normalized.entities[0].sub_type.as_deref(),
+        Some("\u{043f}\u{0430}\u{0440}\u{0430}\u{043c}\u{0435}\u{0442}\u{0440}")
+    );
+    assert_eq!(
+        normalized.entities[0].summary.as_deref(),
+        Some(
+            "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430} — \u{043e}\u{043f}\u{0438}\u{0441}\u{0430}\u{043d}\u{0438}\u{0435} \u{043f}\u{043e}\u{043b}\u{044f}"
+        )
+    );
+    assert_eq!(normalized.relations.len(), 1);
+    assert_eq!(
+        normalized.relations[0].source_label,
+        "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}"
+    );
+    assert_eq!(normalized.relations[0].target_label, "\u{041f}\u{043e}\u{043b}\u{0435}");
+    assert_eq!(
+        normalized.relations[0].summary.as_deref(),
+        Some(
+            "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430} — \u{043e}\u{043f}\u{0438}\u{0441}\u{0430}\u{043d}\u{0438}\u{0435} \u{043f}\u{043e}\u{043b}\u{044f}"
+        )
+    );
+}
+
+#[test]
+fn repairs_provider_output_that_misdecoded_full_json_as_latin1() {
+    fn latin1_mojibake(value: &str) -> String {
+        value.as_bytes().iter().map(|byte| char::from(*byte)).collect()
+    }
+
+    let clean_output = serde_json::json!({
+        "entities": [
+            {
+                "label": "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}",
+                "node_type": "attribute",
+                "aliases": [],
+                "sub_type": "field_name",
+                "summary": "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430} — \u{043e}\u{043f}\u{0438}\u{0441}\u{0430}\u{043d}\u{0438}\u{0435} \u{043f}\u{043e}\u{043b}\u{044f}"
+            }
+        ],
+        "relations": [
+            {
+                "source_label": "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}",
+                "target_label": "\u{041f}\u{043e}\u{043b}\u{0435}",
+                "relation_type": "describes",
+                "summary": "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430} \u{043e}\u{043f}\u{0438}\u{0441}\u{044b}\u{0432}\u{0430}\u{0435}\u{0442} \u{043f}\u{043e}\u{043b}\u{0435}"
+            }
+        ]
+    })
+    .to_string();
+
+    let normalized = parse_graph_extraction_output(&latin1_mojibake(&clean_output))
+        .expect("parse graph extraction");
+
+    assert_eq!(normalized.entities.len(), 1);
+    assert_eq!(normalized.entities[0].label, "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}");
+    assert_eq!(
+        normalized.entities[0].summary.as_deref(),
+        Some(
+            "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430} — \u{043e}\u{043f}\u{0438}\u{0441}\u{0430}\u{043d}\u{0438}\u{0435} \u{043f}\u{043e}\u{043b}\u{044f}"
+        )
+    );
+    assert_eq!(normalized.relations.len(), 1);
+    assert_eq!(
+        normalized.relations[0].source_label,
+        "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}"
+    );
+    assert_eq!(normalized.relations[0].target_label, "\u{041f}\u{043e}\u{043b}\u{0435}");
+}
+
+#[test]
+fn repairs_escaped_live_mojibake_graph_candidate_strings() {
+    let normalized = parse_graph_extraction_output(
+        r#"{
+          "entities": [
+            {
+              "label": "\u00d0\u009f\u00d0\u00be\u00d0\u00bb\u00d0\u00b5: \u00d0\u0092\u00d1\u008b\u00d1\u0081\u00d0\u00ba\u00d0\u00b0\u00d0\u00ba\u00d0\u00b8\u00d0\u00b2\u00d0\u00b0\u00d1\u0082\u00d1\u008c",
+              "node_type": "attribute",
+              "aliases": [],
+              "sub_type": "field_name",
+              "summary": "\u00d0\u009d\u00d0\u00b0\u00d0\u00b7\u00d0\u00b2\u00d0\u00b0\u00d0\u00bd\u00d0\u00b8\u00d0\u00b5 \u00d0\u00bf\u00d0\u00be\u00d0\u00bb\u00d1\u008f"
+            }
+          ],
+          "relations": []
+        }"#,
+    )
+    .expect("parse graph extraction");
+
+    assert_eq!(normalized.entities.len(), 1);
+    assert_eq!(
+        normalized.entities[0].label,
+        "\u{041f}\u{043e}\u{043b}\u{0435}: \u{0412}\u{044b}\u{0441}\u{043a}\u{0430}\u{043a}\u{0438}\u{0432}\u{0430}\u{0442}\u{044c}"
+    );
+    assert_eq!(
+        normalized.entities[0].summary.as_deref(),
+        Some(
+            "\u{041d}\u{0430}\u{0437}\u{0432}\u{0430}\u{043d}\u{0438}\u{0435} \u{043f}\u{043e}\u{043b}\u{044f}"
+        )
+    );
+}
+
+#[test]
+fn repairs_live_mojibake_candidate_with_code_spans() {
+    let normalized = parse_graph_extraction_output(
+        r#"{
+          "entities": [
+            {
+              "label": "name",
+              "node_type": "attribute",
+              "aliases": [],
+              "sub_type": "field_name",
+              "summary": "\u00d0\u009f\u00d0\u00be\u00d0\u00bb\u00d0\u00b5 `name` \u00e2\u0080\u0094 \u00d1\u0081\u00d1\u0082\u00d1\u0080\u00d0\u00be\u00d0\u00ba\u00d0\u00be\u00d0\u00b2\u00d0\u00be\u00d0\u00b5 \u00d0\u00bf\u00d0\u00be\u00d0\u00bb\u00d0\u00b5."
+            },
+            {
+              "label": "\u00d0\u00a1\u00d1\u0082\u00d1\u0080\u00d0\u00be\u00d0\u00ba\u00d0\u00b0",
+              "node_type": "attribute",
+              "aliases": [],
+              "sub_type": "data_type",
+              "summary": "\u00d0\u00a2\u00d0\u00b8\u00d0\u00bf \u00d0\u00b4\u00d0\u00b0\u00d0\u00bd\u00d0\u00bd\u00d1\u008b\u00d1\u0085 `\u00d0\u00a1\u00d1\u0082\u00d1\u0080\u00d0\u00be\u00d0\u00ba\u00d0\u00b0`."
+            }
+          ],
+          "relations": [
+            {
+              "source_label": "name",
+              "target_label": "\u00d0\u00a1\u00d1\u0082\u00d1\u0080\u00d0\u00be\u00d0\u00ba\u00d0\u00b0",
+              "relation_type": "has_mode",
+              "summary": "\u00d0\u009f\u00d0\u00be\u00d0\u00bb\u00d0\u00b5 `name` \u00d0\u00b8\u00d0\u00bc\u00d0\u00b5\u00d0\u00b5\u00d1\u0082 \u00d1\u0082\u00d0\u00b8\u00d0\u00bf \u00d0\u00b4\u00d0\u00b0\u00d0\u00bd\u00d0\u00bd\u00d1\u008b\u00d1\u0085."
+            }
+          ]
+        }"#,
+    )
+    .expect("parse graph extraction");
+
+    assert_eq!(normalized.entities.len(), 2);
+    assert_eq!(
+        normalized.entities[0].summary.as_deref(),
+        Some(
+            "\u{041f}\u{043e}\u{043b}\u{0435} `name` — \u{0441}\u{0442}\u{0440}\u{043e}\u{043a}\u{043e}\u{0432}\u{043e}\u{0435} \u{043f}\u{043e}\u{043b}\u{0435}."
+        )
+    );
+    assert_eq!(normalized.entities[1].label, "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}");
+    assert_eq!(
+        normalized.entities[1].summary.as_deref(),
+        Some(
+            "\u{0422}\u{0438}\u{043f} \u{0434}\u{0430}\u{043d}\u{043d}\u{044b}\u{0445} `\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}`."
+        )
+    );
+    assert_eq!(normalized.relations.len(), 1);
+    assert_eq!(
+        normalized.relations[0].target_label,
+        "\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}"
+    );
+    assert_eq!(
+        normalized.relations[0].summary.as_deref(),
+        Some(
+            "\u{041f}\u{043e}\u{043b}\u{0435} `name` \u{0438}\u{043c}\u{0435}\u{0435}\u{0442} \u{0442}\u{0438}\u{043f} \u{0434}\u{0430}\u{043d}\u{043d}\u{044b}\u{0445}."
+        )
+    );
+}
+
+#[test]
+fn repairs_live_mojibake_candidate_with_mixed_script_label() {
+    let normalized = parse_graph_extraction_output(
+        r#"{
+          "entities": [
+            {
+              "label": "\u00d0\u00a1\u00d0\u00be\u00d0\u00be\u00d0\u00b1\u00d1\u0089\u00d0\u00b5\u00d0\u00bd\u00d0\u00b8\u00d0\u00b5 TransferCallReturned",
+              "node_type": "artifact",
+              "aliases": [],
+              "sub_type": "message",
+              "summary": "\u00d0\u00a1\u00d0\u00be\u00d0\u00be\u00d0\u00b1\u00d1\u0089\u00d0\u00b5\u00d0\u00bd\u00d0\u00b8\u00d0\u00b5 TransferCallReturned, \u00d1\u0083\u00d0\u00ba\u00d0\u00b0\u00d0\u00b7\u00d0\u00b0\u00d0\u00bd\u00d0\u00bd\u00d0\u00be\u00d0\u00b5 \u00d0\u00b2 \u00d0\u00bf\u00d0\u00b5\u00d1\u0080\u00d0\u00b5\u00d1\u0087\u00d0\u00bd\u00d0\u00b5."
+            },
+            {
+              "label": "\u00d0\u00a1\u00d0\u00be\u00d0\u00be\u00d0\u00b1\u00d1\u0089\u00d0\u00b5\u00d0\u00bd\u00d0\u00b8\u00d0\u00b5 TransferSucceed",
+              "node_type": "artifact",
+              "aliases": [],
+              "sub_type": "message",
+              "summary": "\u00d0\u00a1\u00d0\u00be\u00d0\u00be\u00d0\u00b1\u00d1\u0089\u00d0\u00b5\u00d0\u00bd\u00d0\u00b8\u00d0\u00b5 TransferSucceed."
+            }
+          ],
+          "relations": [
+            {
+              "source_label": "\u00d0\u00a1\u00d0\u00be\u00d0\u00be\u00d0\u00b1\u00d1\u0089\u00d0\u00b5\u00d0\u00bd\u00d0\u00b8\u00d0\u00b5 TransferCallReturned",
+              "target_label": "\u00d0\u00a1\u00d0\u00be\u00d0\u00be\u00d0\u00b1\u00d1\u0089\u00d0\u00b5\u00d0\u00bd\u00d0\u00b8\u00d0\u00b5 TransferSucceed",
+              "relation_type": "followed_by",
+              "summary": "\u00d0\u0092 \u00d1\u0082\u00d0\u00b5\u00d0\u00ba\u00d1\u0081\u00d1\u0082\u00d0\u00b5 \u00d0\u00bf\u00d0\u00b5\u00d1\u0080\u00d0\u00b5\u00d1\u0087\u00d0\u00b8\u00d1\u0081\u00d0\u00bb\u00d0\u00b5\u00d0\u00bd\u00d0\u00b8\u00d0\u00b5."
+            }
+          ]
+        }"#,
+    )
+    .expect("parse graph extraction");
+
+    assert_eq!(normalized.entities.len(), 2);
+    assert_eq!(
+        normalized.entities[0].label,
+        "\u{0421}\u{043e}\u{043e}\u{0431}\u{0449}\u{0435}\u{043d}\u{0438}\u{0435} TransferCallReturned"
+    );
+    assert_eq!(
+        normalized.entities[0].summary.as_deref(),
+        Some(
+            "\u{0421}\u{043e}\u{043e}\u{0431}\u{0449}\u{0435}\u{043d}\u{0438}\u{0435} TransferCallReturned, \u{0443}\u{043a}\u{0430}\u{0437}\u{0430}\u{043d}\u{043d}\u{043e}\u{0435} \u{0432} \u{043f}\u{0435}\u{0440}\u{0435}\u{0447}\u{043d}\u{0435}."
+        )
+    );
+    assert_eq!(normalized.relations.len(), 1);
+    assert_eq!(
+        normalized.relations[0].source_label,
+        "\u{0421}\u{043e}\u{043e}\u{0431}\u{0449}\u{0435}\u{043d}\u{0438}\u{0435} TransferCallReturned"
+    );
+    assert_eq!(
+        normalized.relations[0].target_label,
+        "\u{0421}\u{043e}\u{043e}\u{0431}\u{0449}\u{0435}\u{043d}\u{0438}\u{0435} TransferSucceed"
+    );
+    assert_eq!(
+        normalized.relations[0].summary.as_deref(),
+        Some(
+            "\u{0412} \u{0442}\u{0435}\u{043a}\u{0441}\u{0442}\u{0435} \u{043f}\u{0435}\u{0440}\u{0435}\u{0447}\u{0438}\u{0441}\u{043b}\u{0435}\u{043d}\u{0438}\u{0435}."
+        )
+    );
+}
+
+#[test]
+fn canonical_normalized_json_drops_unrepairable_encoding_damage() {
+    let normalized = GraphExtractionCandidateSet {
+        entities: vec![GraphEntityCandidate {
+            label: "\u{0081}".to_string(),
+            node_type: RuntimeNodeType::Attribute,
+            sub_type: None,
+            aliases: Vec::new(),
+            summary: Some("valid".to_string()),
+        }],
+        relations: Vec::new(),
+    };
+
+    let repaired = canonical_graph_extraction_normalized_json(normalized);
+
+    assert_eq!(repaired, serde_json::json!({ "entities": [], "relations": [] }));
+}
+
+#[test]
+fn repairs_ascii_prefixed_mojibake_graph_candidate_strings() {
+    let normalized = parse_graph_extraction_output(
+        r#"{
+          "entities": [
+            {
+              "label": "3.2.5. \u00d0\u009e\u00d0\u00b1\u00d0\u00bd\u00d0\u00be\u00d0\u00b2\u00d0\u00bb\u00d0\u00b5\u00d0\u00bd\u00d0\u00b8\u00d0\u00b5 \u00d1\u0081\u00d0\u00bf\u00d0\u00b8\u00d1\u0081\u00d0\u00ba\u00d0\u00b0",
+              "node_type": "process",
+              "aliases": [],
+              "sub_type": null,
+              "summary": "\u00d0\u00bf\u00d1\u0080\u00d0\u00be\u00d1\u0086\u00d0\u00b5\u00d1\u0081\u00d1\u0081"
+            }
+          ],
+          "relations": []
+        }"#,
+    )
+    .expect("parse graph extraction");
+
+    assert_eq!(normalized.entities.len(), 1);
+    assert_eq!(
+        normalized.entities[0].label,
+        "3.2.5. \u{041e}\u{0431}\u{043d}\u{043e}\u{0432}\u{043b}\u{0435}\u{043d}\u{0438}\u{0435} \u{0441}\u{043f}\u{0438}\u{0441}\u{043a}\u{0430}"
+    );
+    assert_eq!(
+        normalized.entities[0].summary.as_deref(),
+        Some("\u{043f}\u{0440}\u{043e}\u{0446}\u{0435}\u{0441}\u{0441}")
+    );
+}
+
+#[test]
+fn repairs_mojibake_graph_summaries_with_ascii_prefixes() {
+    fn latin1_mojibake(value: &str) -> String {
+        value.as_bytes().iter().map(|byte| char::from(*byte)).collect()
+    }
+
+    let output = serde_json::json!({
+        "entities": [
+            {
+                "label": "ExampleTool",
+                "node_type": "artifact",
+                "aliases": [],
+                "sub_type": null,
+                "summary": latin1_mojibake("ExampleTool — \u{0421}\u{0438}\u{043d}\u{0442}\u{0435}\u{0442}\u{0438}\u{0447}\u{0435}\u{0441}\u{043a}\u{0430}\u{044f} \u{0441}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}.")
+            },
+            {
+                "label": latin1_mojibake("\u{0421}\u{0438}\u{043d}\u{0442}\u{0435}\u{0442}\u{0438}\u{0447}\u{0435}\u{0441}\u{043a}\u{0438}\u{0439} \u{043f}\u{0440}\u{043e}\u{0446}\u{0435}\u{0441}\u{0441}"),
+                "node_type": "process",
+                "aliases": [],
+                "sub_type": null,
+                "summary": latin1_mojibake("\u{041e}\u{043f}\u{0438}\u{0441}\u{0430}\u{043d}\u{0438}\u{0435} \u{0441}\u{0438}\u{043d}\u{0442}\u{0435}\u{0442}\u{0438}\u{0447}\u{0435}\u{0441}\u{043a}\u{043e}\u{0433}\u{043e} \u{043f}\u{0440}\u{043e}\u{0446}\u{0435}\u{0441}\u{0441}\u{0430}.")
+            }
+        ],
+        "relations": [
+            {
+                "source_label": "ExampleTool",
+                "target_label": latin1_mojibake("\u{0421}\u{0438}\u{043d}\u{0442}\u{0435}\u{0442}\u{0438}\u{0447}\u{0435}\u{0441}\u{043a}\u{0438}\u{0439} \u{043f}\u{0440}\u{043e}\u{0446}\u{0435}\u{0441}\u{0441}"),
+                "relation_type": "describes",
+                "summary": latin1_mojibake("ExampleTool — \u{043e}\u{043f}\u{0438}\u{0441}\u{044b}\u{0432}\u{0430}\u{0435}\u{0442} \u{043f}\u{0440}\u{043e}\u{0446}\u{0435}\u{0441}\u{0441}.")
+            }
+        ]
+    });
+
+    let normalized =
+        parse_graph_extraction_output(&output.to_string()).expect("parse graph extraction");
+
+    assert_eq!(
+        normalized.entities[0].summary.as_deref(),
+        Some(
+            "ExampleTool — \u{0421}\u{0438}\u{043d}\u{0442}\u{0435}\u{0442}\u{0438}\u{0447}\u{0435}\u{0441}\u{043a}\u{0430}\u{044f} \u{0441}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}."
+        )
+    );
+    assert_eq!(
+        normalized.entities[1].label,
+        "\u{0421}\u{0438}\u{043d}\u{0442}\u{0435}\u{0442}\u{0438}\u{0447}\u{0435}\u{0441}\u{043a}\u{0438}\u{0439} \u{043f}\u{0440}\u{043e}\u{0446}\u{0435}\u{0441}\u{0441}"
+    );
+    assert_eq!(
+        normalized.relations[0].target_label,
+        "\u{0421}\u{0438}\u{043d}\u{0442}\u{0435}\u{0442}\u{0438}\u{0447}\u{0435}\u{0441}\u{043a}\u{0438}\u{0439} \u{043f}\u{0440}\u{043e}\u{0446}\u{0435}\u{0441}\u{0441}"
+    );
+    assert_eq!(
+        normalized.relations[0].summary.as_deref(),
+        Some(
+            "ExampleTool — \u{043e}\u{043f}\u{0438}\u{0441}\u{044b}\u{0432}\u{0430}\u{0435}\u{0442} \u{043f}\u{0440}\u{043e}\u{0446}\u{0435}\u{0441}\u{0441}."
+        )
+    );
+}
+
+#[test]
+fn repairs_mojibake_normalized_json_payloads() {
+    let repaired = repair_graph_extraction_normalized_json(serde_json::json!({
+        "entities": [
+            {
+                "label": "3.2.5. \u{00d0}\u{009e}\u{00d0}\u{00b1}\u{00d0}\u{00bd}\u{00d0}\u{00be}\u{00d0}\u{00b2}\u{00d0}\u{00bb}\u{00d0}\u{00b5}\u{00d0}\u{00bd}\u{00d0}\u{00b8}\u{00d0}\u{00b5}",
+                "node_type": "process",
+                "aliases": [],
+                "sub_type": null,
+                "summary": "\u{00d0}\u{00bf}\u{00d1}\u{0080}\u{00d0}\u{00be}\u{00d1}\u{0086}\u{00d0}\u{00b5}\u{00d1}\u{0081}\u{00d1}\u{0081}"
+            }
+        ],
+        "relations": []
+    }));
+
+    assert_eq!(
+        repaired["entities"][0]["label"],
+        serde_json::Value::String("3.2.5. \u{041e}\u{0431}\u{043d}\u{043e}\u{0432}\u{043b}\u{0435}\u{043d}\u{0438}\u{0435}".to_string())
+    );
+    assert_eq!(
+        repaired["entities"][0]["summary"],
+        serde_json::Value::String(
+            "\u{043f}\u{0440}\u{043e}\u{0446}\u{0435}\u{0441}\u{0441}".to_string()
+        )
+    );
+}
+
+#[test]
+fn keeps_valid_non_ascii_graph_candidate_strings() {
+    let normalized = parse_graph_extraction_output(
+        r#"{
+          "entities": [
+            { "label": "Café metric", "node_type": "attribute", "aliases": ["naïve score"], "sub_type": null, "summary": "Café metric" }
+          ],
+          "relations": []
+        }"#,
+    )
+    .expect("parse graph extraction");
+
+    assert_eq!(normalized.entities.len(), 1);
+    assert_eq!(normalized.entities[0].label, "Café metric");
+    assert_eq!(normalized.entities[0].aliases, vec!["naïve score"]);
+}
+
+#[test]
+fn keeps_valid_latin1_supplement_pairs_without_repair() {
+    let normalized = parse_graph_extraction_output(
+        r#"{
+          "entities": [
+            { "label": "Â£ rate", "node_type": "attribute", "aliases": ["Â£"], "sub_type": null, "summary": "Â£ rate" }
+          ],
+          "relations": []
+        }"#,
+    )
+    .expect("parse graph extraction");
+
+    assert_eq!(normalized.entities.len(), 1);
+    assert_eq!(normalized.entities[0].label, "Â£ rate");
+    assert_eq!(normalized.entities[0].aliases, vec!["Â£"]);
 }
 
 #[test]

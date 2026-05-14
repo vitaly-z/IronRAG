@@ -33,11 +33,35 @@ pub const INGEST_STAGE_WEB_DISCOVERY: &str = "web_discovery";
 pub const INGEST_STAGE_WEB_MATERIALIZE_PAGE: &str = "web_materialize_page";
 pub const INGEST_STAGE_WEBHOOK_DELIVERY: &str = "webhook_delivery";
 
+const CONTENT_MUTATION_PROGRESS_STAGES: [&str; 7] = [
+    INGEST_STAGE_EXTRACT_CONTENT,
+    INGEST_STAGE_PREPARE_STRUCTURE,
+    INGEST_STAGE_CHUNK_CONTENT,
+    INGEST_STAGE_EXTRACT_TECHNICAL_FACTS,
+    INGEST_STAGE_EMBED_CHUNK,
+    INGEST_STAGE_EXTRACT_GRAPH,
+    INGEST_STAGE_FINALIZING,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalIngestStageMetadata {
     pub stage_name: &'static str,
     pub stage_rank: i32,
     pub lifecycle_kind: &'static str,
+}
+
+#[must_use]
+pub fn canonical_ingest_stage_progress_percent(stage_name: &str, stage_state: &str) -> Option<i32> {
+    let stage_index =
+        CONTENT_MUTATION_PROGRESS_STAGES.iter().position(|candidate| *candidate == stage_name)?;
+    let total_stages = i32::try_from(CONTENT_MUTATION_PROGRESS_STAGES.len()).ok()?;
+    let stage_index = i32::try_from(stage_index).ok()?;
+
+    match stage_state {
+        "started" | "failed" => Some((((stage_index * 100) / total_stages) + 5).min(99)),
+        "completed" => Some((((stage_index + 1) * 100) / total_stages).min(100)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +103,7 @@ pub struct FinalizeAttemptCommand {
     pub current_stage: Option<String>,
     pub failure_class: Option<String>,
     pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
     pub retryable: bool,
 }
 
@@ -376,6 +401,8 @@ impl IngestService {
                 finished_at: None,
                 failure_class: None,
                 failure_code: None,
+                failure_message: None,
+                progress_percent: 0,
                 retryable: false,
             },
         )
@@ -437,6 +464,8 @@ impl IngestService {
                 finished_at: existing.finished_at,
                 failure_class: existing.failure_class,
                 failure_code: existing.failure_code,
+                failure_message: existing.failure_message,
+                progress_percent: existing.progress_percent,
                 retryable: existing.retryable,
             },
         )
@@ -460,7 +489,26 @@ impl IngestService {
         .await
         .map_err(|e| ApiError::internal_with_log(e, "internal"))?
         .ok_or_else(|| ApiError::resource_not_found("ingest_attempt", command.attempt_id))?;
-        let row = ingest_repository::update_ingest_attempt(
+        if attempt.attempt_state != "leased" {
+            return Err(ApiError::Conflict(format!(
+                "ingest attempt {} is no longer leased; current state is {}",
+                command.attempt_id, attempt.attempt_state
+            )));
+        }
+
+        let job =
+            ingest_repository::get_ingest_job_by_id(&state.persistence.postgres, attempt.job_id)
+                .await
+                .map_err(|e| ApiError::internal_with_log(e, "internal"))?
+                .ok_or_else(|| ApiError::resource_not_found("ingest_job", attempt.job_id))?;
+        if job.queue_state != "leased" {
+            return Err(ApiError::Conflict(format!(
+                "ingest job {} is no longer leased; current state is {}",
+                job.id, job.queue_state
+            )));
+        }
+
+        let row = ingest_repository::finalize_leased_ingest_attempt(
             &state.persistence.postgres,
             command.attempt_id,
             &UpdateIngestAttempt {
@@ -475,18 +523,27 @@ impl IngestService {
                 finished_at: Some(Utc::now()),
                 failure_class: command.failure_class,
                 failure_code: failure_code.clone(),
+                failure_message: if command.attempt_state == "succeeded" {
+                    None
+                } else {
+                    command.failure_message.clone().or(attempt.failure_message)
+                },
+                progress_percent: if command.attempt_state == "succeeded" {
+                    100
+                } else {
+                    attempt.progress_percent
+                },
                 retryable: command.retryable,
             },
         )
         .await
         .map_err(|e| ApiError::internal_with_log(e, "internal"))?
-        .ok_or_else(|| ApiError::resource_not_found("ingest_attempt", command.attempt_id))?;
-
-        let job =
-            ingest_repository::get_ingest_job_by_id(&state.persistence.postgres, attempt.job_id)
-                .await
-                .map_err(|e| ApiError::internal_with_log(e, "internal"))?
-                .ok_or_else(|| ApiError::resource_not_found("ingest_job", attempt.job_id))?;
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "ingest attempt {} lost its lease before finalization",
+                command.attempt_id
+            ))
+        })?;
         let next_queue_state = match command.attempt_state.as_str() {
             "succeeded" => "completed",
             "failed" if command.retryable => "queued",
@@ -582,6 +639,8 @@ impl IngestService {
         command: RecordStageEventCommand,
     ) -> Result<IngestStageEvent, ApiError> {
         let stage_name = normalize_stage_name(&command.stage_name)?;
+        let stage_state = command.stage_state.clone();
+        let stage_message = command.message.clone();
         let attempt = ingest_repository::get_ingest_attempt_by_id(
             &state.persistence.postgres,
             command.attempt_id,
@@ -631,6 +690,22 @@ impl IngestService {
                 finished_at: attempt.finished_at,
                 failure_class: attempt.failure_class,
                 failure_code: attempt.failure_code,
+                failure_message: if stage_state == "failed" {
+                    stage_message
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|message| !message.is_empty())
+                        .map(str::to_string)
+                        .or(attempt.failure_message)
+                } else {
+                    attempt.failure_message
+                },
+                progress_percent: canonical_ingest_stage_progress_percent(
+                    &stage_name,
+                    &stage_state,
+                )
+                .map(|progress| progress.max(attempt.progress_percent))
+                .unwrap_or(attempt.progress_percent),
                 retryable: attempt.retryable,
             },
         )
@@ -741,12 +816,12 @@ pub fn canonical_ingest_stage_metadata(stage_name: &str) -> Option<CanonicalInge
         }),
         INGEST_STAGE_EMBED_CHUNK => Some(CanonicalIngestStageMetadata {
             stage_name: INGEST_STAGE_EMBED_CHUNK,
-            stage_rank: 40,
+            stage_rank: 50,
             lifecycle_kind: "embedding",
         }),
         INGEST_STAGE_EXTRACT_TECHNICAL_FACTS => Some(CanonicalIngestStageMetadata {
             stage_name: INGEST_STAGE_EXTRACT_TECHNICAL_FACTS,
-            stage_rank: 50,
+            stage_rank: 40,
             lifecycle_kind: "grounding",
         }),
         INGEST_STAGE_EXTRACT_GRAPH => Some(CanonicalIngestStageMetadata {
@@ -826,6 +901,8 @@ fn map_attempt_row(row: ingest_repository::IngestAttemptRow) -> IngestAttempt {
         finished_at: row.finished_at,
         failure_class: row.failure_class,
         failure_code: row.failure_code,
+        failure_message: row.failure_message,
+        progress_percent: row.progress_percent,
         retryable: row.retryable,
     }
 }
@@ -892,9 +969,11 @@ async fn update_linked_async_operation(
 #[cfg(test)]
 mod tests {
     use super::{
-        INGEST_STAGE_EXTRACT_TECHNICAL_FACTS, INGEST_STAGE_PREPARE_STRUCTURE,
-        INGEST_STAGE_WEB_DISCOVERY, INGEST_STAGE_WEB_MATERIALIZE_PAGE,
-        canonical_ingest_stage_metadata, normalize_stage_name,
+        INGEST_STAGE_EMBED_CHUNK, INGEST_STAGE_EXTRACT_CONTENT,
+        INGEST_STAGE_EXTRACT_TECHNICAL_FACTS, INGEST_STAGE_FINALIZING,
+        INGEST_STAGE_PREPARE_STRUCTURE, INGEST_STAGE_WEB_DISCOVERY,
+        INGEST_STAGE_WEB_MATERIALIZE_PAGE, canonical_ingest_stage_metadata,
+        canonical_ingest_stage_progress_percent, normalize_stage_name,
     };
 
     #[test]
@@ -932,11 +1011,35 @@ mod tests {
         let metadata = canonical_ingest_stage_metadata(INGEST_STAGE_EXTRACT_TECHNICAL_FACTS)
             .expect("metadata should exist");
         assert_eq!(metadata.lifecycle_kind, "grounding");
-        assert_eq!(metadata.stage_rank, 50);
+        assert_eq!(metadata.stage_rank, 40);
+
+        let embed_metadata = canonical_ingest_stage_metadata(INGEST_STAGE_EMBED_CHUNK)
+            .expect("metadata should exist");
+        assert_eq!(embed_metadata.lifecycle_kind, "embedding");
+        assert_eq!(embed_metadata.stage_rank, 50);
 
         let web_metadata = canonical_ingest_stage_metadata(INGEST_STAGE_WEB_DISCOVERY)
             .expect("metadata should exist");
         assert_eq!(web_metadata.lifecycle_kind, "web_discovery");
         assert_eq!(web_metadata.stage_rank, 15);
+    }
+
+    #[test]
+    fn exposes_content_mutation_stage_progress() {
+        assert_eq!(
+            canonical_ingest_stage_progress_percent(INGEST_STAGE_EXTRACT_CONTENT, "started"),
+            Some(5)
+        );
+        assert_eq!(
+            canonical_ingest_stage_progress_percent(
+                INGEST_STAGE_EXTRACT_TECHNICAL_FACTS,
+                "completed"
+            ),
+            Some(57)
+        );
+        assert_eq!(
+            canonical_ingest_stage_progress_percent(INGEST_STAGE_FINALIZING, "completed"),
+            Some(100)
+        );
     }
 }

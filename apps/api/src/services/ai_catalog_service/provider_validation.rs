@@ -48,12 +48,6 @@ pub(super) fn normalize_provider_base_url_input(
     let Some(candidate) = normalize_optional(value) else {
         return Ok(None);
     };
-    if !provider.base_url_policy.allow_override {
-        return Err(ApiError::BadRequest(format!(
-            "provider {} uses a hosted fixed baseUrl and does not allow baseUrl overrides",
-            provider.provider_kind
-        )));
-    }
     canonicalize_provider_base_url(provider, &candidate).map(Some)
 }
 
@@ -62,10 +56,13 @@ pub(super) fn provider_credential_base_url_for_create(
     value: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
     let base_url = normalize_provider_base_url_input(provider, value)?;
-    if !provider.base_url_policy.allow_override {
-        return Ok(None);
+    if base_url.is_some() {
+        return Ok(base_url);
     }
-    resolve_provider_base_url(provider, base_url.as_deref())
+    if matches!(provider.credential_policy.base_url_mode, ProviderBaseUrlMode::Required) {
+        return resolve_provider_base_url(provider, None);
+    }
+    Ok(None)
 }
 
 pub(super) fn provider_credential_base_url_for_update(
@@ -73,21 +70,22 @@ pub(super) fn provider_credential_base_url_for_update(
     existing: Option<&str>,
     value: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
+    let _ = existing;
     let base_url = normalize_provider_base_url_input(provider, value)?;
-    if !provider.base_url_policy.allow_override {
-        return Ok(None);
+    if base_url.is_some() {
+        return Ok(base_url);
     }
-    resolve_provider_base_url(provider, base_url.as_deref().or(existing))
+    if matches!(provider.credential_policy.base_url_mode, ProviderBaseUrlMode::Required) {
+        return resolve_provider_base_url(provider, None);
+    }
+    Ok(None)
 }
 
 pub(super) fn runtime_provider_base_url(
     provider: &ProviderCatalogEntry,
     credential_base_url: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
-    if provider.base_url_policy.allow_override {
-        return resolve_provider_base_url(provider, credential_base_url);
-    }
-    resolve_provider_base_url(provider, None)
+    resolve_provider_base_url(provider, credential_base_url)
 }
 
 pub(super) fn resolve_provider_base_url(

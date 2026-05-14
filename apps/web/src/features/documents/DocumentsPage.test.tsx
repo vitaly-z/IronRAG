@@ -118,11 +118,14 @@ vi.mock('@/features/documents/components/DocumentsPageHeader', () => ({
 
 vi.mock('@/features/documents/components/DocumentsInspectorPanel', () => ({
   DocumentsInspectorPanel: (props: {
+    editorActionReadOnly?: boolean;
     selectedDoc?: { fileName?: string } | null;
-    onEdit: () => void;
+    onOpenEditor: () => void;
   }) =>
     props.selectedDoc ? (
-      <button onClick={() => props.onEdit()}>Edit {props.selectedDoc.fileName}</button>
+      <button onClick={() => props.onOpenEditor()}>
+        {props.editorActionReadOnly ? 'View' : 'Edit'} {props.selectedDoc.fileName}
+      </button>
     ) : null,
 }));
 
@@ -158,6 +161,9 @@ function listPage(
     sourceUri?: string;
     sourceAccess?: { kind: 'stored_document' | 'external_url'; href: string };
     cost?: string;
+    progressPercent?: number;
+    failureCode?: string;
+    failureMessage?: string;
   }>,
 ) {
   return {
@@ -173,6 +179,9 @@ function listPage(
       status: raw.status ?? 'ready',
       readiness: raw.readiness ?? 'graph_ready',
       stage: 'finalizing',
+      progressPercent: raw.progressPercent,
+      failureCode: raw.failureCode,
+      failureMessage: raw.failureMessage,
       retryable: false,
       sourceKind: raw.sourceKind,
       sourceUri: raw.sourceUri,
@@ -397,6 +406,56 @@ describe('DocumentsPage', () => {
     // Library-wide cost banner (shown when totalCost > 0).
     expect(container.textContent).toContain('Library cost');
     expect(container.textContent).toContain('$3.500');
+  });
+
+  it('renders processing progress inside the blue status badge', async () => {
+    documentsApiMock.list.mockResolvedValue(
+      listPage([
+        {
+          id: 'doc-processing',
+          fileName: 'processing.pdf',
+          sourceKind: 'upload',
+          status: 'processing',
+          readiness: 'processing',
+          progressPercent: 57,
+        },
+      ]),
+    );
+
+    await renderPage();
+
+    const documentRow = Array.from(container.querySelectorAll('tr')).find((row) =>
+      row.textContent?.includes('processing.pdf'),
+    );
+    const progressBadge = documentRow?.querySelector('span[aria-label="Processing 57%"]');
+    expect(documentRow).toBeTruthy();
+    expect(progressBadge?.className).toContain('whitespace-nowrap');
+    expect(progressBadge?.className).toContain('min-w-[9.25rem]');
+    expect(documentRow?.textContent).toContain('Processing');
+    expect(documentRow?.textContent).toContain('57%');
+  });
+
+  it('renders processing status as a visible zero-percent progress badge when the backend has no progress yet', async () => {
+    documentsApiMock.list.mockResolvedValue(
+      listPage([
+        {
+          id: 'doc-processing',
+          fileName: 'processing.pdf',
+          sourceKind: 'upload',
+          status: 'processing',
+          readiness: 'processing',
+        },
+      ]),
+    );
+
+    await renderPage();
+
+    const documentRow = Array.from(container.querySelectorAll('tr')).find((row) =>
+      row.textContent?.includes('processing.pdf'),
+    );
+    expect(documentRow).toBeTruthy();
+    expect(documentRow?.textContent).toContain('Processing');
+    expect(documentRow?.textContent).toContain('0%');
   });
 
   it('loads code-like documents from raw source text instead of prepared segments', async () => {

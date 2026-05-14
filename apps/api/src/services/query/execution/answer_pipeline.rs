@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use anyhow::Context as _;
 use uuid::Uuid;
 
 use crate::{
@@ -11,6 +12,7 @@ use crate::{
     infra::arangodb::document_store::KnowledgeDocumentRow,
     interfaces::http::router_support::ApiError,
     services::query::{
+        assistant_grounding::AssistantGroundingEvidence,
         compiler::{CompileHistoryTurn, CompileQueryCommand, QueryCompilerService},
         latest_versions::query_requests_latest_versions,
     },
@@ -44,6 +46,18 @@ struct CanonicalAnswerCandidate {
     verification_stage: AnswerVerificationStage,
     debug_iterations: Vec<crate::services::query::llm_context_debug::LlmIterationDebug>,
     total_iterations: usize,
+}
+
+async fn persist_llm_context_snapshot(
+    state: &AppState,
+    snapshot: crate::services::query::llm_context_debug::LlmContextSnapshot,
+) -> anyhow::Result<()> {
+    crate::services::query::llm_context_debug::upsert_snapshot(
+        &state.persistence.postgres,
+        &snapshot,
+    )
+    .await
+    .with_context(|| format!("failed to persist LLM context snapshot {}", snapshot.execution_id))
 }
 
 pub(crate) async fn prepare_answer_query(
@@ -465,16 +479,17 @@ pub(crate) async fn generate_answer_query(
             effective_question,
             AnswerGenerationStage {
                 intent_profile: prepared.structured.intent_profile.clone(),
-                canonical_answer_chunks: Vec::new(),
+                canonical_answer_chunks: selected_runtime_answer_chunks(&prepared),
                 canonical_evidence: super::CanonicalAnswerEvidence {
                     bundle: None,
                     chunk_rows: Vec::new(),
                     structured_blocks: Vec::new(),
                     technical_facts: Vec::new(),
                 },
-                assistant_grounding:
-                    crate::services::query::assistant_grounding::AssistantGroundingEvidence::default(
-                    ),
+                assistant_grounding: selected_runtime_grounding_evidence(
+                    &prepared,
+                    AssistantGroundingEvidence::default(),
+                ),
                 answer,
                 provider: _answer_provider.clone(),
                 usage_json,
@@ -484,7 +499,8 @@ pub(crate) async fn generate_answer_query(
         )
         .await?;
         let final_answer = verification_stage.generation.answer.clone();
-        state.llm_context_debug.insert(
+        persist_llm_context_snapshot(
+            state,
             crate::services::query::llm_context_debug::LlmContextSnapshot {
                 execution_id,
                 library_id,
@@ -498,7 +514,8 @@ pub(crate) async fn generate_answer_query(
                 ),
                 agent_loop: None,
             },
-        );
+        )
+        .await?;
         return Ok(RuntimeAnswerQueryResult {
             answer: final_answer,
             provider: verification_stage.generation.provider,
@@ -562,7 +579,8 @@ pub(crate) async fn generate_answer_query(
                             "clarify path returned a question to the user"
                         );
                         let clarify_debug = clarify.debug_iterations.clone();
-                        state.llm_context_debug.insert(
+                        persist_llm_context_snapshot(
+                            state,
                             crate::services::query::llm_context_debug::LlmContextSnapshot {
                                 execution_id,
                                 library_id,
@@ -577,7 +595,8 @@ pub(crate) async fn generate_answer_query(
                                 ),
                                 agent_loop: None,
                             },
-                        );
+                        )
+                        .await?;
                         return Ok(RuntimeAnswerQueryResult {
                             answer: clarify.answer,
                             provider: clarify.provider,
@@ -633,7 +652,8 @@ pub(crate) async fn generate_answer_query(
                     "single-shot grounded-answer fast path done"
                 );
                 let mut single_debug = single.debug_iterations.clone();
-                state.llm_context_debug.insert(
+                persist_llm_context_snapshot(
+                    state,
                     crate::services::query::llm_context_debug::LlmContextSnapshot {
                         execution_id,
                         library_id,
@@ -648,7 +668,8 @@ pub(crate) async fn generate_answer_query(
                         ),
                         agent_loop: None,
                     },
-                );
+                )
+                .await?;
                 // Lightweight verify: no canonical evidence is
                 // required on the fast path because we have not
                 // loaded it. The verifier degrades to the
@@ -661,20 +682,23 @@ pub(crate) async fn generate_answer_query(
                 // retrieved evidence, which pays the full preflight
                 // cost and runs the complete verifier.
                 let verify_started = std::time::Instant::now();
+                let fast_path_chunks = selected_runtime_answer_chunks(&prepared);
+                let fast_path_grounding =
+                    selected_runtime_grounding_evidence(&prepared, single.assistant_grounding);
                 let mut verification_stage = verify_generated_answer(
                     state,
                     execution_id,
                     effective_question,
                     AnswerGenerationStage {
                         intent_profile: prepared.structured.intent_profile.clone(),
-                        canonical_answer_chunks: Vec::new(),
+                        canonical_answer_chunks: fast_path_chunks.clone(),
                         canonical_evidence: super::CanonicalAnswerEvidence {
                             bundle: None,
                             chunk_rows: Vec::new(),
                             structured_blocks: Vec::new(),
                             technical_facts: Vec::new(),
                         },
-                        assistant_grounding: single.assistant_grounding,
+                        assistant_grounding: fast_path_grounding.clone(),
                         answer: single.answer.clone(),
                         provider: single.provider.clone(),
                         usage_json: single.usage_json.clone(),
@@ -691,10 +715,8 @@ pub(crate) async fn generate_answer_query(
                             verification_stage.verification.unsupported_literals.len(),
                         "single-shot answer needs literal-fidelity revision over the same retrieved evidence"
                     );
-                    let revision_context = literal_revision_context(
-                        &prepared.answer_context,
-                        &crate::services::query::assistant_grounding::AssistantGroundingEvidence::default(),
-                    );
+                    let revision_context =
+                        literal_revision_context(&prepared.answer_context, &fast_path_grounding);
                     match crate::services::query::agent_loop::run_literal_fidelity_revision_turn(
                         state,
                         library_id,
@@ -717,15 +739,17 @@ pub(crate) async fn generate_answer_query(
                                 effective_question,
                                 AnswerGenerationStage {
                                     intent_profile: prepared.structured.intent_profile.clone(),
-                                    canonical_answer_chunks: Vec::new(),
+                                    canonical_answer_chunks: fast_path_chunks.clone(),
                                     canonical_evidence: super::CanonicalAnswerEvidence {
                                         bundle: None,
                                         chunk_rows: Vec::new(),
                                         structured_blocks: Vec::new(),
                                         technical_facts: Vec::new(),
                                     },
-                                    assistant_grounding:
-                                        crate::services::query::assistant_grounding::AssistantGroundingEvidence::default(),
+                                    assistant_grounding: selected_runtime_grounding_evidence(
+                                        &prepared,
+                                        revision.assistant_grounding,
+                                    ),
                                     answer: revision.answer.clone(),
                                     provider: revision.provider.clone(),
                                     usage_json,
@@ -763,7 +787,8 @@ pub(crate) async fn generate_answer_query(
                         total_elapsed_ms = single_shot_start.elapsed().as_millis(),
                         "single-shot grounded-answer accepted"
                     );
-                    state.llm_context_debug.insert(
+                    persist_llm_context_snapshot(
+                        state,
                         crate::services::query::llm_context_debug::LlmContextSnapshot {
                             execution_id,
                             library_id,
@@ -778,7 +803,8 @@ pub(crate) async fn generate_answer_query(
                             ),
                             agent_loop: None,
                         },
-                    );
+                    )
+                    .await?;
                     let answer_with_sources = append_source_section(
                         verification_stage.generation.answer,
                         &prepared.structured.retrieved_documents,
@@ -836,7 +862,8 @@ pub(crate) async fn generate_answer_query(
         "canonical-answer preflight loaded (escalation)"
     );
     if let Some(answer) = preflight.answer_override.clone() {
-        state.llm_context_debug.insert(
+        persist_llm_context_snapshot(
+            state,
             crate::services::query::llm_context_debug::LlmContextSnapshot {
                 execution_id,
                 library_id,
@@ -850,7 +877,8 @@ pub(crate) async fn generate_answer_query(
                 ),
                 agent_loop: None,
             },
-        );
+        )
+        .await?;
         let verification_stage = verify_generated_answer(
             state,
             execution_id,
@@ -872,7 +900,8 @@ pub(crate) async fn generate_answer_query(
             },
         )
         .await?;
-        state.llm_context_debug.insert(
+        persist_llm_context_snapshot(
+            state,
             crate::services::query::llm_context_debug::LlmContextSnapshot {
                 execution_id,
                 library_id,
@@ -886,7 +915,8 @@ pub(crate) async fn generate_answer_query(
                 ),
                 agent_loop: None,
             },
-        );
+        )
+        .await?;
         let answer_with_sources = append_source_section(
             verification_stage.generation.answer,
             &prepared.structured.retrieved_documents,
@@ -1035,7 +1065,8 @@ pub(crate) async fn generate_answer_query(
                         total_elapsed_ms = preflight_single_started.elapsed().as_millis(),
                         "canonical preflight single-shot answer accepted"
                     );
-                    state.llm_context_debug.insert(
+                    persist_llm_context_snapshot(
+                        state,
                         crate::services::query::llm_context_debug::LlmContextSnapshot {
                             execution_id,
                             library_id,
@@ -1050,7 +1081,8 @@ pub(crate) async fn generate_answer_query(
                             ),
                             agent_loop: None,
                         },
-                    );
+                    )
+                    .await?;
                     let answer_with_sources = append_source_section(
                         verification_stage.generation.answer,
                         &prepared.structured.retrieved_documents,
@@ -1141,17 +1173,23 @@ pub(crate) async fn generate_answer_query(
         warning_count = candidate.verification_stage.verification.warnings.len(),
         "finalizing grounded answer from fixed retrieved evidence without a second retrieval pass"
     );
-    state.llm_context_debug.insert(crate::services::query::llm_context_debug::LlmContextSnapshot {
-        execution_id,
-        library_id,
-        question: user_question.to_string(),
-        total_iterations: candidate.total_iterations,
-        iterations: candidate.debug_iterations,
-        final_answer: Some(candidate.verification_stage.generation.answer.clone()),
-        captured_at: chrono::Utc::now(),
-        query_ir: Some(serde_json::to_value(&prepared.query_ir).unwrap_or(serde_json::Value::Null)),
-        agent_loop: None,
-    });
+    persist_llm_context_snapshot(
+        state,
+        crate::services::query::llm_context_debug::LlmContextSnapshot {
+            execution_id,
+            library_id,
+            question: user_question.to_string(),
+            total_iterations: candidate.total_iterations,
+            iterations: candidate.debug_iterations,
+            final_answer: Some(candidate.verification_stage.generation.answer.clone()),
+            captured_at: chrono::Utc::now(),
+            query_ir: Some(
+                serde_json::to_value(&prepared.query_ir).unwrap_or(serde_json::Value::Null),
+            ),
+            agent_loop: None,
+        },
+    )
+    .await?;
     let answer_with_sources = append_source_section(
         candidate.verification_stage.generation.answer,
         &prepared.structured.retrieved_documents,
@@ -2255,9 +2293,88 @@ fn answer_needs_literal_revision(verification: &AnswerVerificationStage) -> bool
     })
 }
 
+fn selected_runtime_answer_chunks(
+    prepared: &PreparedAnswerQueryResult,
+) -> Vec<RuntimeMatchedChunk> {
+    let mut seen = HashSet::<Uuid>::new();
+    let mut chunks = Vec::<RuntimeMatchedChunk>::new();
+    for chunk in prepared
+        .structured
+        .ordered_source_units
+        .iter()
+        .chain(prepared.structured.technical_literal_chunks.iter())
+        .chain(prepared.structured.context_chunks.iter())
+    {
+        if seen.insert(chunk.chunk_id) {
+            chunks.push(chunk.clone());
+        }
+    }
+    chunks
+}
+
+fn selected_runtime_grounding_evidence(
+    prepared: &PreparedAnswerQueryResult,
+    mut grounding: AssistantGroundingEvidence,
+) -> AssistantGroundingEvidence {
+    let mut seen = grounding
+        .verification_corpus
+        .iter()
+        .map(|fragment| fragment.trim().to_string())
+        .collect::<HashSet<_>>();
+
+    push_grounding_fragment(
+        &mut grounding.verification_corpus,
+        &mut seen,
+        &prepared.structured.context_text,
+    );
+    if let Some(text) = &prepared.structured.technical_literals_text {
+        push_grounding_fragment(&mut grounding.verification_corpus, &mut seen, text);
+    }
+    for line in &prepared.structured.graph_evidence_context_lines {
+        push_grounding_fragment(&mut grounding.verification_corpus, &mut seen, line);
+    }
+    for chunk in prepared
+        .structured
+        .ordered_source_units
+        .iter()
+        .chain(prepared.structured.technical_literal_chunks.iter())
+        .chain(prepared.structured.context_chunks.iter())
+    {
+        push_grounding_fragment(&mut grounding.verification_corpus, &mut seen, &chunk.source_text);
+        push_grounding_fragment(&mut grounding.verification_corpus, &mut seen, &chunk.excerpt);
+    }
+    for document in &prepared.structured.retrieved_documents {
+        push_grounding_fragment(
+            &mut grounding.verification_corpus,
+            &mut seen,
+            &document.preview_excerpt,
+        );
+        push_grounding_fragment(&mut grounding.verification_corpus, &mut seen, &document.title);
+        if let Some(source_uri) = &document.source_uri {
+            push_grounding_fragment(&mut grounding.verification_corpus, &mut seen, source_uri);
+        }
+    }
+    push_grounding_fragment(
+        &mut grounding.verification_corpus,
+        &mut seen,
+        &prepared.answer_context,
+    );
+    grounding
+}
+
+fn push_grounding_fragment(corpus: &mut Vec<String>, seen: &mut HashSet<String>, fragment: &str) {
+    let trimmed = fragment.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if seen.insert(trimmed.to_string()) {
+        corpus.push(trimmed.to_string());
+    }
+}
+
 fn literal_revision_context(
     prompt_context: &str,
-    assistant_grounding: &crate::services::query::assistant_grounding::AssistantGroundingEvidence,
+    assistant_grounding: &AssistantGroundingEvidence,
 ) -> String {
     let mut context = prompt_context.trim().to_string();
     if assistant_grounding.verification_corpus.is_empty() {
@@ -2348,12 +2465,15 @@ mod tests {
     use super::{
         AnswerDisposition, append_source_section, classify_answer_disposition,
         classify_answer_disposition_from_evidence, classify_answer_disposition_from_groups,
+        selected_runtime_answer_chunks, selected_runtime_grounding_evidence,
+        verify_answer_against_canonical_evidence,
     };
-    use crate::domains::query::{GroupedReference, GroupedReferenceKind};
+    use crate::domains::query::{GroupedReference, GroupedReferenceKind, QueryVerificationState};
     use crate::domains::query_ir::{
         ClarificationReason, ClarificationSpec, ComparisonSpec, ConversationRefKind, EntityMention,
         EntityRole, QueryAct, QueryIR, QueryLanguage, QueryScope, UnresolvedRef,
     };
+    use crate::services::query::assistant_grounding::AssistantGroundingEvidence;
     use crate::services::query::execution::{ConsolidationDiagnostics, FocusReason};
 
     fn sample_ir(confidence: f32, needs_clarification: Option<ClarificationReason>) -> QueryIR {
@@ -2516,6 +2636,38 @@ mod tests {
             query_ir,
             query_compile_usage: None,
         }
+    }
+
+    #[test]
+    fn fast_path_verifier_uses_selected_runtime_grounding() {
+        let prepared = prepared_for_single_shot(sample_ir(0.8, None));
+
+        let chunks = selected_runtime_answer_chunks(&prepared);
+        let grounding =
+            selected_runtime_grounding_evidence(&prepared, AssistantGroundingEvidence::default());
+        let verification = verify_answer_against_canonical_evidence(
+            "Which fragment is present?",
+            "The selected fragment is context-fragment-a.",
+            &prepared.structured.intent_profile,
+            &super::super::CanonicalAnswerEvidence {
+                bundle: None,
+                chunk_rows: Vec::new(),
+                structured_blocks: Vec::new(),
+                technical_facts: Vec::new(),
+            },
+            &chunks,
+            &prepared.answer_context,
+            &grounding,
+        );
+
+        assert!(chunks.is_empty());
+        assert!(
+            grounding
+                .verification_corpus
+                .iter()
+                .any(|fragment| fragment.contains("context-fragment-a"))
+        );
+        assert_eq!(verification.state, QueryVerificationState::Verified);
     }
 
     #[test]

@@ -1022,10 +1022,7 @@ export class Query {
 
     /**
      * Returns the raw LLM request/response chain that was sent to the
-     * provider for this assistant execution, if it is still in the
-     * in-memory debug cache. The cache is volatile (bounded FIFO) so old
-     * executions return 404 — that is by design, not an error the UI
-     * should treat as fatal.
+     * provider for this assistant execution.
      */
     public static getQueryExecutionLlmContext<ThrowOnError extends boolean = false>(options: Options<GetQueryExecutionLlmContextData, ThrowOnError>) {
         return (options.client ?? client).get<GetQueryExecutionLlmContextResponses, GetQueryExecutionLlmContextErrors, ThrowOnError>({

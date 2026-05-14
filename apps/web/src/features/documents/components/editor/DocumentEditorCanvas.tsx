@@ -16,6 +16,7 @@ type DocumentEditorCanvasProps = {
   loading: boolean;
   onRawTextChange: (markdown: string) => void;
   rawTextEditor: boolean;
+  readOnly?: boolean;
   saving: boolean;
   sourceFormat?: string;
   statusLabel: string;
@@ -41,6 +42,7 @@ export function DocumentEditorCanvas({
   loading,
   onRawTextChange,
   rawTextEditor,
+  readOnly = false,
   saving,
   sourceFormat,
   statusLabel,
@@ -180,6 +182,7 @@ export function DocumentEditorCanvas({
               className="document-editor-raw-textarea"
               disabled={saving}
               onChange={(event) => onRawTextChange(event.target.value)}
+              readOnly={readOnly}
               spellCheck={false}
               value={currentMarkdown}
             />

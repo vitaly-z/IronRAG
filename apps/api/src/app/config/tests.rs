@@ -95,6 +95,7 @@ fn sample_settings() -> Settings {
         query_balanced_context_enabled: true,
         runtime_graph_extract_recovery_enabled: true,
         runtime_graph_extract_recovery_max_attempts: 4,
+        runtime_graph_extract_idle_timeout_seconds: 300,
         runtime_graph_extract_stage_timeout_seconds: 600,
         runtime_graph_extract_resume_downgrade_level_one_after_replays: 3,
         runtime_graph_extract_resume_downgrade_level_two_after_replays: 5,
@@ -155,7 +156,7 @@ fn from_env_has_sane_local_defaults() {
     assert_eq!(settings.service_name, "ironrag-backend");
     assert_eq!(settings.environment, "local");
     assert_eq!(settings.database_max_connections, 64);
-    assert_eq!(settings.ingestion_graph_extract_parallelism_per_doc, 2);
+    assert_eq!(settings.ingestion_graph_extract_parallelism_per_doc, 4);
     assert_eq!(settings.redis_url, "redis://127.0.0.1:6379");
     assert_eq!(settings.arangodb_url, "http://127.0.0.1:8529");
     assert_eq!(settings.arangodb_database, "ironrag");
@@ -165,6 +166,7 @@ fn from_env_has_sane_local_defaults() {
     assert_eq!(settings.ingestion_max_parallel_jobs_per_library, 4);
     assert_eq!(settings.ingestion_memory_soft_limit_mib, 0);
     assert_eq!(settings.runtime_agent_max_turns, 4);
+    assert_eq!(settings.runtime_graph_extract_idle_timeout_seconds, 300);
     assert_eq!(settings.release_check_repository, "mlimarenko/IronRAG");
     assert_eq!(settings.release_check_interval_hours, 12);
     assert_eq!(settings.graph_gc_hours, 24);

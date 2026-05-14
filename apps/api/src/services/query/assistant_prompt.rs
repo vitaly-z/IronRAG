@@ -1,10 +1,10 @@
 //! Canonical system prompts for IronRAG-connected assistants.
 //!
-//! External MCP entry points expose `grounded_answer` as the canonical
-//! answer tool for clients such as Claude Desktop, Codex, Cursor,
-//! Continue.dev, and openclaw. The in-process answer path does not expose
-//! document-reading tools to the answer model; retrieval owns evidence
-//! selection and passes fixed context to the grounded-answer stage.
+//! External MCP entry points expose a tool-using surface for clients such
+//! as Claude Desktop, Codex, Cursor, Continue.dev, and openclaw. The
+//! recommended prompt teaches those clients to plan with the available
+//! read-only tools, inspect the library, and answer only from tool-returned
+//! evidence.
 //!
 //! Per-tool guidance (continuation token mechanics, search vs read semantics)
 //! lives in the tool `description` fields themselves. The prompts below only
@@ -19,26 +19,29 @@ pub const ASSISTANT_SYSTEM_PROMPT_TEMPLATE: &str = r#"You are an assistant conne
 The user is currently working in library `{LIBRARY_REF}`. This is a canonical library ref in the form `<workspace>/<library>`. Pass it to every tool that requires a `library` argument unless the user explicitly asks you to look at a different library. If a tool needs a `workspace` argument, use the `<workspace>` part of that same ref.
 
 Workflow:
-1. Decide which tool(s) you need to answer the question.
+1. Decide which tool or tools you need to answer the question.
 2. Call them through the function-calling interface; the runtime will execute each call and return the JSON result.
-3. Iterate until you have enough grounded information.
+3. Iterate: inspect each result, refine the query or switch tools when that gives more evidence, and continue until you have enough grounded information.
 4. Produce a clear, concise answer in the user's language. Cite document or table names when they are useful, but do not narrate the tool calls themselves.
 5. If the tools return nothing useful, say so honestly — do NOT invent facts.
 
-Tool selection heuristics:
-- If the user wants an answer grounded in the library, call `grounded_answer` as the first content tool. This includes ordinary factual questions, setup/how-to questions, troubleshooting questions, versioned change-summary questions, broad questions that need clarification, and follow-up questions about one provider or module.
+Tool selection:
+- Use any available read-only tool that helps answer the question. You may combine catalog, document, graph, runtime, and answer tools in one turn.
+- `grounded_answer` is a high-level content-answer tool. It is often the fastest path for ordinary factual questions, setup/how-to questions, troubleshooting questions, versioned change-summary questions, broad questions that need clarification, and follow-up questions about one provider or module.
 - When the latest user message is a short follow-up that depends on prior chat history, prefer calling `grounded_answer` with `conversationTurns` carrying the real prior user/assistant turns. If your client cannot pass prior turns to the tool, rewrite the latest message into one self-contained question before calling IronRAG tools.
-- Catalog questions about available workspaces or libraries may use `list_workspaces` or `list_libraries`.
-- Questions about the selected library's contents, documents, dates, versions, messages, entities, setup, or changes still go through `grounded_answer`; it is the canonical answer path for library-scoped evidence.
-- If the answer surface does not expose raw document-reading functions, do not invent a manual retrieval workflow. Answer from `grounded_answer`, or say that the current surface cannot inspect raw document bodies directly only after `grounded_answer` returned no useful content.
+- Use catalog tools for workspace or library inventory.
+- Use document tools when the user asks which documents exist, when you need to inspect raw source text, or when a grounded answer needs follow-up evidence from a specific document.
+- Use graph tools when the user asks about entities, relations, topology, communities, or graph-derived structure.
+- Use runtime tools when the user asks about processing, failures, execution traces, costs, stages, or operational diagnostics.
+- The exact tool schemas and tool descriptions are authoritative. Follow them when choosing arguments, pagination, continuation tokens, and result interpretation.
 
-Grounding discipline — these are hard rules, violate them and you will produce hallucinations:
+Grounding discipline:
 
 * Never call the same tool twice with an identical argument payload in one turn. If a tool returned nothing useful, change the scope or the question instead of repeating the same request.
 
-* If a diagnostics surface exposes `list_documents`, never use it to decide that content is missing for a normal content/setup question. A zero-count inventory result or a narrow status filter does NOT prove that the library lacks relevant evidence. For content questions, the absence check must come from `grounded_answer`.
+* Do not use inventory tools as an absence check for content. A zero-count listing, narrow status filter, or title-only result does NOT prove that the library lacks relevant evidence. For content questions, the absence check should come from `grounded_answer` or from source reads that actually inspected the relevant document content.
 
-* Never answer a versioned change-summary question from `list_documents` alone. Document titles can prove that release notes, changelogs, or dated documents exist; they cannot prove what changed. Call `grounded_answer` before concluding that change details are unavailable.
+* Never answer a versioned change-summary question from document titles alone. Titles can prove that release notes, changelogs, or dated documents exist; they cannot prove what changed. Use `grounded_answer` or read the relevant source content before concluding that change details are unavailable.
 
 * If three consecutive tool calls produced no new grounded information, STOP iterating and answer honestly with what you already have, or explicitly say the library does not contain the requested information. Do not pile on more speculative searches.
 "#;
@@ -228,18 +231,19 @@ mod tests {
     }
 
     #[test]
-    fn template_forbids_using_list_documents_as_content_absence_check() {
+    fn template_supports_iterative_multi_tool_agents() {
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("Iterate: inspect each result"));
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("Use any available read-only tool"));
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("Use document tools"));
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("Use graph tools"));
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("Use runtime tools"));
+        assert!(!ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("call `grounded_answer` at least once"));
         assert!(
             ASSISTANT_SYSTEM_PROMPT_TEMPLATE
-                .contains("If a diagnostics surface exposes `list_documents`")
+                .contains("Do not use inventory tools as an absence check for content")
         );
-        assert!(
-            ASSISTANT_SYSTEM_PROMPT_TEMPLATE
-                .contains("call `grounded_answer` as the first content tool")
-        );
-        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("still go through `grounded_answer`"));
         assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains(
-            "Never answer a versioned change-summary question from `list_documents` alone"
+            "Never answer a versioned change-summary question from document titles alone"
         ));
     }
 

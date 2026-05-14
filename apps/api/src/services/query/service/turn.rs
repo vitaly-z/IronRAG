@@ -18,7 +18,8 @@ use crate::{
     app::state::AppState,
     domains::catalog::CatalogLifecycleState,
     domains::query::{
-        QueryConversationState, QueryExecutionDetail, QueryVerificationState, resolve_top_k,
+        QueryConversationState, QueryExecutionDetail, QueryVerificationState,
+        QueryVerificationWarning, resolve_top_k,
     },
     domains::{
         agent_runtime::{
@@ -837,6 +838,7 @@ impl QueryService {
                             binding_id: terminal_execution.binding_id,
                             provider_kind: success.provider.provider_kind.as_str().to_string(),
                             model_name: success.provider.model_name.clone(),
+                            call_kind: "query_answer".to_string(),
                             usage_json: success.usage_json.clone(),
                         },
                     )
@@ -858,6 +860,7 @@ impl QueryService {
                                 binding_id: None,
                                 provider_kind: embed_usage.provider_kind.clone(),
                                 model_name: embed_usage.model_name.clone(),
+                                call_kind: "query_retrieve".to_string(),
                                 usage_json: embed_usage.usage_json.clone(),
                             },
                         )
@@ -906,6 +909,7 @@ impl QueryService {
                             binding_id: terminal_execution.binding_id,
                             provider_kind: success.provider.provider_kind.as_str().to_string(),
                             model_name: success.provider.model_name.clone(),
+                            call_kind: "query_answer".to_string(),
                             usage_json: success.usage_json.clone(),
                         },
                     )
@@ -927,6 +931,7 @@ impl QueryService {
                                 binding_id: None,
                                 provider_kind: embed_usage.provider_kind.clone(),
                                 model_name: embed_usage.model_name.clone(),
+                                call_kind: "query_retrieve".to_string(),
                                 usage_json: embed_usage.usage_json.clone(),
                             },
                         )
@@ -1106,29 +1111,55 @@ impl QueryService {
                     source_execution_id = %source_execution_id,
                     "query result cache source execution is unavailable"
                 );
-                if let Err(delete_error) = query_result_cache_repository::delete_query_result_cache(
-                    &state.persistence.postgres,
-                    &cache_context.cache_key,
+                evict_query_result_cache_entry(
+                    state,
+                    cache_context,
+                    source_execution_id,
+                    "source execution unavailable",
                 )
-                .await
-                {
-                    warn!(
-                        error = %delete_error,
-                        cache_key = %cache_context.cache_key,
-                        "failed to delete stale query result cache row"
-                    );
-                }
+                .await;
                 return Ok(None);
             }
         };
         if detail.verification_state != QueryVerificationState::Verified {
+            evict_query_result_cache_entry(
+                state,
+                cache_context,
+                source_execution_id,
+                "source execution is not verified",
+            )
+            .await;
+            return Ok(None);
+        }
+        if !query_detail_has_grounding_references(&detail) {
+            evict_query_result_cache_entry(
+                state,
+                cache_context,
+                source_execution_id,
+                "source execution has no grounding references",
+            )
+            .await;
             return Ok(None);
         }
         let Some(source_response_turn) = detail.response_turn.as_ref() else {
+            evict_query_result_cache_entry(
+                state,
+                cache_context,
+                source_execution_id,
+                "source execution has no response turn",
+            )
+            .await;
             return Ok(None);
         };
         let answer_text = source_response_turn.content_text.trim();
         if answer_text.is_empty() {
+            evict_query_result_cache_entry(
+                state,
+                cache_context,
+                source_execution_id,
+                "source execution answer is empty",
+            )
+            .await;
             return Ok(None);
         }
 
@@ -1289,6 +1320,52 @@ impl QueryService {
             )
             .await;
         }
+        let chunk_references = prepared_reference_context
+            .bundle_refs
+            .as_ref()
+            .map_or_else(Vec::new, map_chunk_references);
+        let mut prepared_segment_references = build_prepared_segment_references(
+            prepared_reference_context.bundle_refs.as_ref(),
+            &prepared_reference_context.structured_block_rows,
+            &prepared_reference_context.block_rank_refs,
+            &query_text,
+            &prepared_reference_context.segment_revision_info,
+        );
+        prepared_segment_references.extend(build_assistant_document_references(
+            execution.id,
+            &prepared_reference_context.assistant_document_references,
+        ));
+        let technical_fact_references = build_technical_fact_references(
+            prepared_reference_context.bundle_refs.as_ref(),
+            &prepared_reference_context.technical_fact_rows,
+            &prepared_reference_context.fact_rank_refs,
+        );
+        let mut verification_state = prepared_reference_context
+            .bundle_refs
+            .as_ref()
+            .map_or(QueryVerificationState::NotRun, |bundle| {
+                parse_query_verification_state(&bundle.bundle.verification_state)
+            });
+        let mut verification_warnings =
+            prepared_reference_context.bundle_refs.as_ref().map_or_else(Vec::new, |bundle| {
+                parse_query_verification_warnings(&bundle.bundle.verification_warnings)
+            });
+        if verification_state == QueryVerificationState::Verified
+            && chunk_references.is_empty()
+            && prepared_segment_references.is_empty()
+            && technical_fact_references.is_empty()
+            && graph_node_references.is_empty()
+            && graph_edge_references.is_empty()
+        {
+            verification_state = QueryVerificationState::InsufficientEvidence;
+            verification_warnings.push(QueryVerificationWarning {
+                code: "no_grounding_references".to_string(),
+                message: "Verified answers must include at least one grounding reference."
+                    .to_string(),
+                related_segment_id: None,
+                related_fact_id: None,
+            });
+        }
 
         Ok(QueryExecutionDetail {
             execution: map_execution_row(execution.clone()),
@@ -1299,43 +1376,13 @@ impl QueryService {
             ),
             request_turn,
             response_turn,
-            chunk_references: prepared_reference_context
-                .bundle_refs
-                .as_ref()
-                .map_or_else(Vec::new, map_chunk_references),
-            prepared_segment_references: {
-                let mut references = build_prepared_segment_references(
-                    prepared_reference_context.bundle_refs.as_ref(),
-                    &prepared_reference_context.structured_block_rows,
-                    &prepared_reference_context.block_rank_refs,
-                    &query_text,
-                    &prepared_reference_context.segment_revision_info,
-                );
-                references.extend(build_assistant_document_references(
-                    execution.id,
-                    &prepared_reference_context.assistant_document_references,
-                ));
-                references
-            },
-            technical_fact_references: build_technical_fact_references(
-                prepared_reference_context.bundle_refs.as_ref(),
-                &prepared_reference_context.technical_fact_rows,
-                &prepared_reference_context.fact_rank_refs,
-            ),
+            chunk_references,
+            prepared_segment_references,
+            technical_fact_references,
             graph_node_references,
             graph_edge_references,
-            verification_state: prepared_reference_context
-                .bundle_refs
-                .as_ref()
-                .map_or(QueryVerificationState::NotRun, |bundle| {
-                    parse_query_verification_state(&bundle.bundle.verification_state)
-                }),
-            verification_warnings: prepared_reference_context
-                .bundle_refs
-                .as_ref()
-                .map_or_else(Vec::new, |bundle| {
-                    parse_query_verification_warnings(&bundle.bundle.verification_warnings)
-                }),
+            verification_state,
+            verification_warnings,
         })
     }
 
@@ -1480,6 +1527,9 @@ async fn store_query_result_cache_winner(
     if detail.verification_state != QueryVerificationState::Verified {
         return;
     }
+    if !query_detail_has_grounding_references(detail) {
+        return;
+    }
     if detail.execution.failure_code.is_some() || detail.execution.runtime_execution_id.is_none() {
         return;
     }
@@ -1537,6 +1587,48 @@ async fn store_query_result_cache_winner(
             "query result cache winner already existed"
         );
     }
+}
+
+async fn evict_query_result_cache_entry(
+    state: &AppState,
+    cache_context: &QueryResultCacheContext,
+    source_execution_id: Uuid,
+    reason: &'static str,
+) {
+    if let Err(error) =
+        result_cache::delete_cached_execution_id(&state.persistence.redis, &cache_context.cache_key)
+            .await
+    {
+        warn!(
+            error = %error,
+            cache_key = %cache_context.cache_key,
+            source_execution_id = %source_execution_id,
+            reason,
+            "failed to delete redis query result cache entry"
+        );
+    }
+    if let Err(error) = query_result_cache_repository::delete_query_result_cache(
+        &state.persistence.postgres,
+        &cache_context.cache_key,
+    )
+    .await
+    {
+        warn!(
+            error = %error,
+            cache_key = %cache_context.cache_key,
+            source_execution_id = %source_execution_id,
+            reason,
+            "failed to delete postgres query result cache row"
+        );
+    }
+}
+
+fn query_detail_has_grounding_references(detail: &QueryExecutionDetail) -> bool {
+    !detail.chunk_references.is_empty()
+        || !detail.prepared_segment_references.is_empty()
+        || !detail.technical_fact_references.is_empty()
+        || !detail.graph_node_references.is_empty()
+        || !detail.graph_edge_references.is_empty()
 }
 
 async fn seed_query_runtime_session(

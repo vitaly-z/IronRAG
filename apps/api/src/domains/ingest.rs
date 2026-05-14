@@ -38,6 +38,8 @@ pub struct IngestAttempt {
     pub finished_at: Option<DateTime<Utc>>,
     pub failure_class: Option<String>,
     pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub progress_percent: i32,
     pub retryable: bool,
 }
 

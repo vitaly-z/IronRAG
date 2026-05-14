@@ -248,10 +248,6 @@ pub struct AppState {
     pub pipeline_hardening: PipelineHardeningSettings,
     pub resolve_settle_blockers: ResolveSettleBlockersSettings,
     pub resolve_settle_blockers_services: ResolveSettleBlockersServices,
-    /// In-memory capture of raw LLM request/response payloads per
-    /// assistant execution, used by the chat debug panel. Bounded
-    /// FIFO, never persisted.
-    pub llm_context_debug: crate::services::query::llm_context_debug::LlmContextDebugStore,
     /// Per-library cache of admitted runtime graph projections keyed
     /// by `(library_id, projection_version)`. The projection is
     /// loaded lazily on first use and reused for every subsequent
@@ -466,8 +462,6 @@ impl AppState {
             pipeline_hardening,
             resolve_settle_blockers,
             resolve_settle_blockers_services,
-            llm_context_debug:
-                crate::services::query::llm_context_debug::LlmContextDebugStore::default(),
             runtime_graph_projection_cache:
                 crate::services::knowledge::runtime_read::RuntimeGraphProjectionCache::default(),
         })

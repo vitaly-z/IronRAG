@@ -42,8 +42,7 @@ const CODE_SOURCE_FORMATS = new Set([
   'yml',
   'toml',
 ]);
-const NON_EDITABLE_SOURCE_FORMATS = new Set([
-  'pdf',
+const RASTER_IMAGE_SOURCE_FORMATS = new Set([
   'png',
   'jpg',
   'jpeg',
@@ -56,10 +55,50 @@ const NON_EDITABLE_SOURCE_FORMATS = new Set([
   'heic',
   'heif',
 ]);
+const NON_EDITABLE_SOURCE_FORMATS = new Set([
+  'pdf',
+  ...RASTER_IMAGE_SOURCE_FORMATS,
+]);
+const MIME_SOURCE_FORMATS = new Map<string, string>([
+  ['application/pdf', 'pdf'],
+  ['application/json', 'json'],
+  ['application/x-ndjson', 'json'],
+  ['application/x-yaml', 'yaml'],
+  ['application/yaml', 'yaml'],
+  ['application/xml', 'xml'],
+  ['application/vnd.ms-excel', 'xls'],
+  ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xlsx'],
+  ['application/vnd.oasis.opendocument.spreadsheet', 'ods'],
+  ['application/msword', 'doc'],
+  ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'docx'],
+  ['text/markdown', 'md'],
+  ['text/plain', 'txt'],
+  ['text/csv', 'csv'],
+  ['text/tab-separated-values', 'tsv'],
+  ['text/x-rust', 'rs'],
+  ['text/x-python', 'py'],
+  ['text/javascript', 'js'],
+  ['text/typescript', 'ts'],
+  ['image/jpeg', 'jpg'],
+]);
 
 function normalizeSourceFormat(sourceFormat?: string): string | undefined {
-  const normalized = sourceFormat?.trim().toLowerCase();
-  return normalized && normalized.length > 0 ? normalized.replace(/^\./, '') : undefined;
+  const raw = sourceFormat?.trim().toLowerCase().replace(/^\./, '');
+  if (!raw) {
+    return undefined;
+  }
+
+  const mapped = MIME_SOURCE_FORMATS.get(raw);
+  if (mapped) {
+    return mapped;
+  }
+
+  const mimeMatch = raw.match(/^([a-z0-9.+-]+)\/([a-z0-9.+-]+)$/);
+  if (mimeMatch?.[1] === 'image') {
+    return mimeMatch[2] === 'jpeg' ? 'jpg' : mimeMatch[2];
+  }
+
+  return raw;
 }
 
 export function isTableLikeSourceFormat(sourceFormat?: string): boolean {
@@ -75,6 +114,11 @@ export function isCodeLikeSourceFormat(sourceFormat?: string): boolean {
 export function isPlainTextSourceFormat(sourceFormat?: string): boolean {
   const normalized = normalizeSourceFormat(sourceFormat);
   return normalized ? PLAIN_TEXT_SOURCE_FORMATS.has(normalized) : false;
+}
+
+export function isRasterImageSourceFormat(sourceFormat?: string): boolean {
+  const normalized = normalizeSourceFormat(sourceFormat);
+  return normalized ? RASTER_IMAGE_SOURCE_FORMATS.has(normalized) : false;
 }
 
 export function isEditorEditableSourceFormat(sourceFormat?: string): boolean {
@@ -181,7 +225,7 @@ function countCodeSignals(markdown: string): number {
       score += 2;
       continue;
     }
-    if (/^[{}()[\];,]+$/.test(trimmed) || /[{}();]$/.test(trimmed)) {
+    if (/^[{}()[\];,]+$/.test(trimmed) || /[{};]$/.test(trimmed)) {
       score += 1;
       continue;
     }

@@ -1301,23 +1301,46 @@ pub const RECALCULATE_RUNTIME_GRAPH_NODE_SUPPORT_COUNTS_BY_IDS_SQL: &str = "with
          where node.id = desired_counts.id
            and node.support_count is distinct from desired_counts.support_count";
 
+const SUPPORT_COUNT_RECALCULATION_BATCH_SIZE: usize = 1_000;
+
+async fn recalculate_runtime_graph_support_counts_by_ids(
+    pool: &PgPool,
+    sql: &str,
+    library_id: Uuid,
+    projection_version: i64,
+    target_ids: &[Uuid],
+) -> Result<u64, sqlx::Error> {
+    if target_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut rows_affected = 0_u64;
+    for batch in target_ids.chunks(SUPPORT_COUNT_RECALCULATION_BATCH_SIZE) {
+        let result = sqlx::query(sql)
+            .bind(library_id)
+            .bind(projection_version)
+            .bind(batch)
+            .execute(pool)
+            .await?;
+        rows_affected = rows_affected.saturating_add(result.rows_affected());
+    }
+    Ok(rows_affected)
+}
+
 pub async fn recalculate_runtime_graph_node_support_counts_by_ids(
     pool: &PgPool,
     library_id: Uuid,
     projection_version: i64,
     node_ids: &[Uuid],
 ) -> Result<u64, sqlx::Error> {
-    if node_ids.is_empty() {
-        return Ok(0);
-    }
-
-    let result = sqlx::query(RECALCULATE_RUNTIME_GRAPH_NODE_SUPPORT_COUNTS_BY_IDS_SQL)
-        .bind(library_id)
-        .bind(projection_version)
-        .bind(node_ids)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
+    recalculate_runtime_graph_support_counts_by_ids(
+        pool,
+        RECALCULATE_RUNTIME_GRAPH_NODE_SUPPORT_COUNTS_BY_IDS_SQL,
+        library_id,
+        projection_version,
+        node_ids,
+    )
+    .await
 }
 
 /// Recalculates support counts for a targeted set of graph edges.
@@ -1363,17 +1386,14 @@ pub async fn recalculate_runtime_graph_edge_support_counts_by_ids(
     projection_version: i64,
     edge_ids: &[Uuid],
 ) -> Result<u64, sqlx::Error> {
-    if edge_ids.is_empty() {
-        return Ok(0);
-    }
-
-    let result = sqlx::query(RECALCULATE_RUNTIME_GRAPH_EDGE_SUPPORT_COUNTS_BY_IDS_SQL)
-        .bind(library_id)
-        .bind(projection_version)
-        .bind(edge_ids)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
+    recalculate_runtime_graph_support_counts_by_ids(
+        pool,
+        RECALCULATE_RUNTIME_GRAPH_EDGE_SUPPORT_COUNTS_BY_IDS_SQL,
+        library_id,
+        projection_version,
+        edge_ids,
+    )
+    .await
 }
 
 /// Lists runtime graph evidence for one target.
@@ -1527,10 +1547,8 @@ pub async fn search_runtime_graph_evidence_by_text(
                  from runtime_graph_evidence as evidence
                  where evidence.library_id = $1
                    and btrim(evidence.evidence_text) <> ''
-                   and to_tsvector(
-                        'simple'::regconfig,
-                        evidence.evidence_text || ' ' || coalesce(evidence.source_file_name, '')
-                   ) @@ requested_text_query.ts_query
+                   and to_tsvector('simple'::regconfig, evidence.evidence_text)
+                       @@ requested_text_query.ts_query
                  order by
                     evidence.confidence_score desc nulls last,
                     evidence.created_at desc,
@@ -1576,8 +1594,7 @@ pub async fn search_runtime_graph_evidence_by_text(
                  from runtime_graph_evidence as evidence
                  where evidence.library_id = $1
                    and btrim(evidence.evidence_text) <> ''
-                   and lower(evidence.evidence_text || ' ' || coalesce(evidence.source_file_name, ''))
-                       like requested_literal_query.literal_pattern escape '~'
+                   and lower(evidence.evidence_text) like requested_literal_query.literal_pattern escape '~'
                  order by
                     evidence.confidence_score desc nulls last,
                     evidence.created_at desc,

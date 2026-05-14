@@ -1,4 +1,14 @@
 #!/opt/ironrag-docling/bin/python
+"""IronRAG Docling extraction adapter.
+
+Usage:
+    ironrag-docling-extract <input-file>              # full document
+    ironrag-docling-extract --page-count <input-file>  # return page count
+    ironrag-docling-extract --page N <input-file>     # extract single page (1-based)
+    ironrag-docling-extract --pages START-END <input-file>  # extract page range
+    ironrag-docling-extract --page-batches SIZE START-END <input-file>  # stream page ranges
+"""
+
 import json
 import sys
 import time
@@ -46,10 +56,7 @@ _OCR_READER = None
 
 
 def _detect_dominant_script(sample_text):
-    """Return 'cyrillic', 'latin', or 'cjk' based on the dominant Unicode
-    block in `sample_text`. Used to pick the matching rapidocr Rec model
-    so that Russian PDFs don't get fed through the Chinese-only model
-    that transliterates Cyrillic into Latin look-alikes."""
+    """Return a coarse Unicode-script hint for RapidOCR model selection."""
     if not sample_text:
         return "latin"
     cyr = lat = cjk = 0
@@ -69,12 +76,7 @@ def _detect_dominant_script(sample_text):
 
 
 def _ocr_reader(script_hint):
-    """Lazily initialize the OCR reader.
-
-    Tries (in order): rapidocr (Docling 2.x default, torch backend, Rec
-    model selected by detected script — Cyrillic / Latin / CJK), easyocr,
-    tesseract subprocess. The first that initializes successfully wins.
-    """
+    """Lazily initialize the canonical OCR reader."""
     global _OCR_READER
     if _OCR_READER is None:
         try:
@@ -104,21 +106,6 @@ def _ocr_reader(script_hint):
                 pass
         except Exception:
             pass
-        try:
-            import easyocr  # type: ignore
-
-            _OCR_READER = ("easyocr", easyocr.Reader(["en", "ru"], gpu=False))
-            return _OCR_READER
-        except Exception:
-            pass
-        # Tesseract subprocess fallback. The binary ships in the image
-        # for Docling's existing OCR path; we just use it directly on
-        # the cropped picture image bytes.
-        import shutil
-
-        if shutil.which("tesseract"):
-            _OCR_READER = ("tesseract", "tesseract")
-            return _OCR_READER
         _OCR_READER = ("none", None)
     return _OCR_READER
 
@@ -130,7 +117,6 @@ def _ocr_image_bytes(reader_tuple, image_bytes):
             result = reader(image_bytes)
         except Exception:
             return ""
-        # rapidocr 3.x returns RapidOCROutput with .txts attribute.
         texts = getattr(result, "txts", None)
         if texts is None and isinstance(result, tuple):
             texts = result[0] if len(result) >= 1 else None
@@ -139,45 +125,12 @@ def _ocr_image_bytes(reader_tuple, image_bytes):
         if hasattr(texts, "__iter__"):
             return " ".join(str(t).strip() for t in texts if str(t).strip())
         return str(texts).strip()
-    if kind == "easyocr":
-        try:
-            ocr_lines = reader.readtext(image_bytes, detail=0, paragraph=True)
-            return " ".join(line.strip() for line in ocr_lines if line.strip())
-        except Exception:
-            return ""
-    if kind == "tesseract":
-        import subprocess
-        import tempfile
-
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fp:
-                fp.write(image_bytes)
-                tmp_path = fp.name
-            proc = subprocess.run(
-                ["tesseract", tmp_path, "stdout", "-l", "rus+eng", "--psm", "6"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            return " ".join(
-                line.strip() for line in proc.stdout.splitlines() if line.strip()
-            )
-        except Exception:
-            return ""
-        finally:
-            try:
-                import os
-
-                os.unlink(tmp_path)
-            except Exception:
-                pass
     return ""
 
 
 def _ocr_picture_items(document, script_hint="latin"):
     """Run OCR on every PictureItem in the document and return a list
-    of cleaned, non-empty text snippets in document order. `script_hint`
-    selects the rapidocr Rec model so Cyrillic PDFs stay in Cyrillic."""
+    of cleaned, non-empty text snippets in document order."""
     reader_tuple = _ocr_reader(script_hint)
     if reader_tuple[1] is None:
         return []
@@ -269,7 +222,6 @@ def _collect_picture_bytes(document):
             continue
         width, height = pil_image.size
         if width < 24 or height < 24:
-            # Decorative icon (info marker, copyright glyph). Skip.
             continue
         try:
             buf = io.BytesIO()
@@ -288,44 +240,52 @@ def _collect_picture_bytes(document):
     return pictures
 
 
-def main():
-    if len(sys.argv) != 2:
-        print("usage: ironrag-docling-extract <input-file>", file=sys.stderr)
-        return 64
+def _get_pdf_page_count(source_path):
+    """Return the page count of a PDF using pypdfium2 (already a docling dep)."""
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(source_path)
+        count = len(pdf)
+        pdf.close()
+        return count
+    except Exception:
+        return None
 
-    source = Path(sys.argv[1])
-    if not source.is_file():
-        print(f"input file not found: {source}", file=sys.stderr)
-        return 66
 
-    started_at = time.perf_counter()
+def _extract_pdf_page(source_path, page_num, output_path):
+    """Extract a single page (0-based) from a PDF and write to output_path."""
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(source_path)
+    if page_num >= len(pdf):
+        pdf.close()
+        raise ValueError(f"page {page_num} out of range ({len(pdf)} pages)")
+    new_pdf = pdfium.PdfDocument.new()
+    new_pdf.import_pages(pdf, [page_num])
+    new_pdf.save(output_path)
+    new_pdf.close()
+    pdf.close()
 
-    # Enable per-picture image generation so we can OCR embedded raster
-    # images that the text layer doesn't cover (screenshots, diagrams,
-    # tables-as-image inside PDFs). Without this, embedded images in
-    # PDFs become bare `<!-- image -->` placeholders in the markdown
-    # and their textual content never reaches the chunker / graph
-    # extractor.
+
+def _build_converter():
     pdf_opts = PdfPipelineOptions()
     pdf_opts.images_scale = 2.0
     pdf_opts.generate_picture_images = True
     pdf_opts.do_ocr = True
 
-    converter = DocumentConverter(
+    return DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts),
         }
     )
+
+
+def _convert_document(source, started_at, converter=None):
+    """Convert a document and return the JSON payload."""
+    if converter is None:
+        converter = _build_converter()
     result = converter.convert(source)
     document = result.document
 
-    # Two-track image handling. The local rapidocr / tesseract OCR path
-    # stays as a fallback for deployments without a vision binding (and
-    # for tiny logo-only pictures where a vision LLM would be overkill).
-    # In parallel we expose every embedded picture as a base64-encoded
-    # PNG so the Rust caller can route them through the active `vision`
-    # binding for higher-quality OCR (multimodal LLM beats PP-OCRv3
-    # mobile cyrillic on UI screenshots and mixed-script content).
     text = document.export_to_text()
     script_hint = _detect_dominant_script(text)
     picture_ocr_text = _ocr_picture_items(document, script_hint=script_hint)
@@ -337,7 +297,7 @@ def main():
     if picture_ocr_text:
         text = text + "\n\n" + "\n\n".join(picture_ocr_text)
 
-    payload = {
+    return {
         "markdown": markdown,
         "text": text,
         "pageCount": _page_count(result),
@@ -350,6 +310,178 @@ def main():
             "totalSeconds": round(time.perf_counter() - started_at, 6),
         },
     }
+
+
+def _convert_page_range(source, start_page, end_page, tmpdir, converter):
+    """Convert a 0-based inclusive PDF page range and return a batch payload."""
+    import os
+
+    started_at = time.perf_counter()
+    results = []
+    for page_num in range(start_page, end_page + 1):
+        page_path = os.path.join(tmpdir, f"page_{page_num + 1}.pdf")
+        _extract_pdf_page(source, page_num, page_path)
+        try:
+            payload = _convert_document(
+                Path(page_path), time.perf_counter(), converter=converter
+            )
+            payload["extractedPage"] = page_num + 1
+            results.append(payload)
+        finally:
+            try:
+                os.unlink(page_path)
+            except OSError:
+                pass
+
+    return {
+        "pages": results,
+        "pageRange": f"{start_page + 1}-{end_page + 1}",
+        "timings": {
+            "totalSeconds": round(time.perf_counter() - started_at, 6),
+        },
+    }
+
+
+def main():
+    args = sys.argv[1:]
+
+    # --page-count mode: return JSON with page count
+    if len(args) >= 2 and args[0] == "--page-count":
+        source = Path(args[1])
+        if not source.is_file():
+            print(f"input file not found: {source}", file=sys.stderr)
+            return 66
+        count = _get_pdf_page_count(source)
+        payload = {"pageCount": count}
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+        return 0
+
+    # --page N mode: extract single page (1-based page number)
+    if len(args) >= 3 and args[0] == "--page":
+        try:
+            page_num = int(args[1]) - 1  # convert to 0-based
+        except ValueError:
+            print(f"invalid page number: {args[1]}", file=sys.stderr)
+            return 64
+        source = Path(args[2])
+        if not source.is_file():
+            print(f"input file not found: {source}", file=sys.stderr)
+            return 66
+
+        import tempfile
+        import os
+
+        started_at = time.perf_counter()
+        tmpdir = tempfile.mkdtemp(prefix="docling-page-")
+        try:
+            converter = _build_converter()
+            page_path = os.path.join(tmpdir, f"page_{page_num + 1}.pdf")
+            _extract_pdf_page(source, page_num, page_path)
+            payload = _convert_document(Path(page_path), started_at, converter=converter)
+            payload["extractedPage"] = page_num + 1
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return 0
+
+    # --pages START-END mode: extract a range of pages in one process.
+    # The RapidOCR model is loaded once and reused across pages, which
+    # is substantially faster than spawning a new process per page.
+    if len(args) >= 3 and args[0] == "--pages":
+        try:
+            parts = args[1].split("-")
+            start_page = int(parts[0]) - 1  # 0-based
+            end_page = int(parts[1]) - 1
+        except (ValueError, IndexError):
+            print(f"invalid page range: {args[1]} (expected START-END)", file=sys.stderr)
+            return 64
+        source = Path(args[2])
+        if not source.is_file():
+            print(f"input file not found: {source}", file=sys.stderr)
+            return 66
+
+        import tempfile
+        import shutil
+
+        started_at = time.perf_counter()
+        tmpdir = tempfile.mkdtemp(prefix="docling-pages-")
+        try:
+            converter = _build_converter()
+            batch_payload = _convert_page_range(
+                source, start_page, end_page, tmpdir, converter
+            )
+            batch_payload["timings"]["totalSeconds"] = round(
+                time.perf_counter() - started_at, 6
+            )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        print(json.dumps(batch_payload, ensure_ascii=False), flush=True)
+        return 0
+
+    # --page-batches SIZE START-END mode: extract many page ranges in one
+    # process and emit one JSON object per completed range. The backend
+    # persists each line as a durable checkpoint before reading the next line,
+    # so a worker restart loses at most the range currently being converted.
+    if len(args) >= 4 and args[0] == "--page-batches":
+        try:
+            batch_size = int(args[1])
+            if batch_size <= 0:
+                raise ValueError("batch size must be positive")
+            parts = args[2].split("-")
+            start_page = int(parts[0]) - 1  # 0-based
+            end_page = int(parts[1]) - 1
+            if start_page < 0 or end_page < start_page:
+                raise ValueError("invalid page range")
+        except (ValueError, IndexError) as error:
+            print(
+                f"invalid page batch arguments: {' '.join(args[1:3])} ({error})",
+                file=sys.stderr,
+            )
+            return 64
+        source = Path(args[3])
+        if not source.is_file():
+            print(f"input file not found: {source}", file=sys.stderr)
+            return 66
+
+        import tempfile
+        import shutil
+
+        tmpdir = tempfile.mkdtemp(prefix="docling-page-batches-")
+        try:
+            converter = _build_converter()
+            current = start_page
+            while current <= end_page:
+                batch_end = min(current + batch_size - 1, end_page)
+                batch_payload = _convert_page_range(
+                    source, current, batch_end, tmpdir, converter
+                )
+                print(json.dumps(batch_payload, ensure_ascii=False), flush=True)
+                current = batch_end + 1
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return 0
+
+    # Default: full document extraction
+    if len(args) != 1:
+        print(
+            "usage: ironrag-docling-extract <input-file>\n"
+            "       ironrag-docling-extract --page-count <input-file>\n"
+            "       ironrag-docling-extract --page N <input-file>\n"
+            "       ironrag-docling-extract --pages START-END <input-file>\n"
+            "       ironrag-docling-extract --page-batches SIZE START-END <input-file>",
+            file=sys.stderr,
+        )
+        return 64
+
+    source = Path(args[0])
+    if not source.is_file():
+        print(f"input file not found: {source}", file=sys.stderr)
+        return 66
+
+    started_at = time.perf_counter()
+    payload = _convert_document(source, started_at)
     print(json.dumps(payload, ensure_ascii=False), flush=True)
     return 0
 

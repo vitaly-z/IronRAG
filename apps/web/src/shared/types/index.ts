@@ -62,6 +62,7 @@ export interface DocumentItem {
   progressPercent?: number;
   processingStartedAt?: string;
   processingFinishedAt?: string;
+  failureCode?: string;
   failureMessage?: string;
   statusReason?: string;
   canRetry?: boolean;
@@ -135,6 +136,21 @@ export interface AssistantSession {
 
 type AssistantStage = "planning" | "grounding" | "response";
 
+export type AssistantAgentActivityEvent = {
+  type: string;
+  deadline_ms?: number;
+  iteration?: number;
+  provider_kind?: string;
+  model_name?: string;
+  tool_call_count?: number;
+  has_final_answer?: boolean;
+  tool_name?: string;
+  is_error?: boolean;
+  child_execution_id?: string | null;
+  result_preview?: string;
+  elapsed_ms?: number;
+};
+
 export interface AssistantMessage {
   id: string;
   role: "user" | "assistant";
@@ -145,6 +161,7 @@ export interface AssistantMessage {
   stage?: AssistantStage;
   isStreaming?: boolean;
   evidence?: EvidenceBundle;
+  activityEvents?: AssistantAgentActivityEvent[];
 }
 
 interface FileAttachment {

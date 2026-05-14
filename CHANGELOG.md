@@ -1,303 +1,495 @@
 # Changelog
 
-## Unreleased
+## 0.4.7 — 2026-05-14
+
+### Installer: fail fast on startup migration drift
+
+- `install.sh` now starts stateful services and the startup authority
+  before creating API/worker/frontend dependents, then watches the
+  startup container directly. This prevents Compose from sitting forever
+  on `service_completed_successfully` dependents when startup restarts.
+- Backend images now include the canonical migration SQL files under
+  `/app/migrations`, so checksum-drift recovery can apply the exact
+  idempotent migration file from the running image before updating
+  `_sqlx_migrations.checksum`.
+
+### Ingest: restart-safe large documents and graph encoding
+
+- Stored PDF revisions now extract through durable Docling page-range
+units. Completed ranges are reused after worker restart, backend
+restart, lease recovery, or transient network loss instead of
+discarding already processed pages.
+- Long-running ingest attempts now heartbeat from an independent
+runtime and finalize only while the attempt still owns the active
+lease, preventing stale workers from marking recovered jobs complete.
+- Graph extraction now repairs unambiguous UTF-8 transport damage at
+the provider boundary and rejects unrepaired mojibake/control
+characters before persistence, so corrupted labels do not reach the
+graph UI.
+- Large graph finalization no longer depends on a blocking full-library
+summary refresh; summary refresh is treated as derived cache work.
+- Docker Compose now exposes the large-document tuning knobs used by
+the runtime: `IRONRAG_DOCLING_PAGE_BATCH_SIZE`,
+`IRONRAG_DOCLING_PAGE_STREAM_WINDOW_PAGES`,
+`IRONRAG_DOCLING_MAX_CONCURRENCY`,
+`IRONRAG_INGESTION_EMBEDDING_PARALLELISM`, and
+`IRONRAG_INGESTION_GRAPH_EXTRACT_PARALLELISM_PER_DOC`.
+
+### Documents: processing progress and failure visibility
+
+- Document list rows now expose primary ingest progress and failure
+details from the active ingest attempt, so the table can show processing
+percentage without an extra polling surface.
+- The documents UI fills the existing blue processing status badge as a
+compact progress bar and keeps failed-document errors visible in the
+document inspector, including the mobile drawer presentation.
+- The document inspector now shows processing-stage model names and
+costs in readable stacked rows, with billing-derived model attribution
+for stages whose lifecycle event did not carry the model directly.
+- Document lifecycle now keeps terminal stage timing, zero-cost provider
+calls, and stage detail metadata on the read model, so the inspector
+shows per-stage duration, model, cost, call count, and extraction/chunk
+counts instead of only the aggregate total.
+- Document inspector pipeline stages now render as a compact vertical
+stage list with inline focused details, active-stage emphasis, and no
+horizontal carousel scrolling.
+- Billing now resolves provider calls against model catalog entries by
+capability, so embedding stages use embedding prices and tiny non-zero
+stage costs are not rounded to `$0.0000` in the inspector.
+- Ready documents no longer keep the finalizing stage highlighted, stage
+rows surface document-level content, embedding, and graph costs across
+retries, and inspector actions use compact icon buttons with hover labels.
+- Inspector action tooltips now open inside the inspector bounds and wrap
+long disabled-action reasons instead of being clipped at the panel edge.
+- Ready-document inspectors now show the ready badge without a redundant
+100% progress bar, while in-progress documents still show percent and bar.
+- Ready PDF, image, and other non-editable document formats now open
+from the inspector in a read-only viewer instead of showing a disabled
+edit action.
+- The document inspector no longer shows the redundant preparation
+summary block; action buttons now sit below the processing pipeline with
+slightly larger icon targets.
+- Document viewer/editor content now treats MIME-typed PDFs as prose,
+collapses excessive blank lines, and hides embedded-image OCR scaffolding
+from non-image documents so garbled OCR captions do not pollute the
+main reading surface.
+- Document inspector totals now use the document lifecycle cost, matching
+stage rows that include retry/failure spend instead of mixing them with
+only the last successful attempt total.
+
+### Assistant: canonical grounded-answer execution
+
+- The UI assistant now executes turns through the same canonical
+`QueryService::execute_turn` path as MCP `grounded_answer`, so both
+surfaces share query compilation, hybrid retrieval, graph context,
+answer generation, verification, citations, caching, and audit records.
+- The separate in-process UI MCP-agent path was removed. The session-turn
+endpoint now returns the canonical assistant execution detail directly,
+and the SSE form emits safe runtime activity events (`started`,
+`tool_call_started`, periodic `tool_call_progress`,
+`tool_call_finished`, `persisting`) before the terminal `completed` /
+`failed` event.
+- Query-result cache hits are accepted only when the cached execution is
+verified and still has canonical grounding references; stale or
+reference-free cache rows are evicted instead of replayed.
+- Grounded-answer retrieval now degrades across independent vector and
+lexical chunk-search lanes instead of failing the whole assistant/MCP
+turn when only one search lane or one lexical subquery has a transient
+backend error.
+- Query-IR focus chunk searches now degrade like the other additive
+retrieval sources: failed focus subqueries are logged, successful focus
+hits are retained, and an all-focus failure no longer aborts a turn that
+already has primary retrieved chunks.
+- Graph evidence text search now preserves the indexed search path for
+full-text and literal lookups before applying the library filter,
+preventing large evidence tables from falling back to long per-library
+scans during grounded answers.
+- The admin MCP setup examples and public docs now include Hermes and
+explicitly list common MCP-compatible agents such as OpenClaw, Codex,
+Cursor, VS Code-based agents, and Claude clients.
+- Assistant turns now recover from mid-stream browser/proxy transport
+drops by loading the completed durable session result after the request
+boundary, while explicit backend `failed` events still surface as real
+errors.
+- Assistant LLM debug context is now persisted per query execution, so
+the debug view can show the exact provider prompt, tool activity,
+messages, response, and usage even after reloads or cached answer
+replays.
+- `/v1/ready` now validates Postgres migration state against the
+embedded migrations in the running binary and returns degraded/503 on
+checksum drift, missing migrations, dirty migration rows, or unexpected
+applied versions instead of reporting a false Ready state.
+
+### Provider credentials: allow custom baseUrl overrides
+
+> Reported by [@dkomchenko](https://github.com/dkomchenko).
+
+- Fixed a regression where hosted providers rejected explicit `baseUrl`
+overrides with `...does not allow baseUrl overrides`.
+- Creating/updating provider credentials now accepts explicit `baseUrl`
+overrides for all providers; when no override is supplied, runtime still
+falls back to each provider's catalog default URL.
+
+### Docker build: incremental compilation and profile tuning
+
+- `target/` cache mount in the builder stage persists compiled
+Rust artifacts across `docker build` runs.  Combined with
+`CARGO_PROFILE_RELEASE_INCREMENTAL=true`, Cargo rebuilds only the
+crates whose source files actually changed — 5–10× faster than a
+cold build on the second iteration.
+- **Release-profile overrides** (`incremental=true`, `codegen-units=256`,
+`opt-level=2`) are set via environment variables so the public-release
+Dockerfile inherits the defaults without a custom Cargo profile.
+- **Three-stage Dockerfile** isolates the heavyweight docling/Python
+warmup from the Rust builder, so changing application code no longer
+re-downloads HuggingFace models.
+
+### Docling timeout: raised default and env-override
+
+> Reported by [@VasKorotkov](https://github.com/VasKorotkov).
+
+- Raised `DEFAULT_TIMEOUT_SECS` from 300 s → 900 s so Docling has
+enough headroom for large PDFs with OCR.
+- The timeout is already overridable via `IRONRAG_DOCLING_TIMEOUT_SECS`.
+
+### Vector index: dimension reconciliation and health probe
+
+- `ensure_vector_index_reconcile` compares the active embedding
+model dimension with the existing ArangoDB index and drops+recreates
+when they diverge.  Driven by the resolved `dimensions` field in
+`ai_model_catalog.metadata_json`.
+- **Health probe** (`probe_vector_index`) tests `APPROX_NEAR_COSINE` at
+startup and logs an error when the index is corrupted — operators see
+a clear signal instead of silent zero-hit retrievals.
+- `known_embedding_dimensions` stamps OpenAI embedding model sizes
+(3072 / 1536) into the catalog during provider discovery.
+- **API binding change detection:** creating or updating an
+`embed_chunk` binding now returns `embeddingDimensionChanged: true`
+(with previous/new dimensions) when the new model's vector size
+differs, so the UI can warn the operator.
+- **UI toast** on the admin AI panel shows «Размерность векторов
+изменена…» when the binding response carries the flag.
+
+### Re-upload after soft delete
+
+> Reported by [@VasKorotkov](https://github.com/VasKorotkov).
+
+- Replaced the unconditional `UNIQUE(library_id, external_key)`
+constraint with a **partial index** (`WHERE document_state = 'active'`)
+so a soft-deleted document no longer blocks re-uploading the same
+file (migration `0008`).
+
+### Swagger UI: iframe isolation
+
+> Reported by [@VasKorotkov](https://github.com/VasKorotkov).
+
+- Swagger UI is now served as a **standalone HTML page**
+(`public/swagger.html`) loading `swagger-ui-dist` locally and
+embedded via `<iframe>`.  This completely isolates the vendor
+stylesheet from Tailwind preflight, which was collapsing operation
+tags into empty lists.
+
+### Admin AI panel: scroll and optional-binding warnings
+
+> Reported by [@VasKorotkov](https://github.com/VasKorotkov).
+
+- The bindings/presets/credentials content area now has `overflow-auto`
+so small viewports can scroll the AI configuration tab.
+- A **warning banner** appears when optional bindings (`extract_text`,
+`vision`) are not configured: keep raster-image OCR on the Docling
+engine unless the library is explicitly routed to `vision`; a missing
+vision binding fails loudly.
 
 ## 0.4.6 — 2026-05-11
 
 ### Fix: LoginPage TypeError on fresh stack with the new Agent purpose
 
-- **`bootstrapPurposeMetadata` was missing an `agent` entry**, so when
-  the bootstrap bundle preview iterated its presets the `Record<...>`
-  lookup returned `undefined` and `LoginPage.tsx:553` threw
-  `TypeError: Cannot read properties of undefined (reading 'labelKey')`,
-  collapsing the auth view into the error boundary on a fresh stack.
-  v0.4.5 added Agent to `AiBindingPurpose` (and the bootstrap synthesis
-  pipeline) but left this purpose-metadata table behind. v0.4.6 adds
-  the missing entry, declares Agent on `BootstrapBindingPurpose` in the
-  generated TS types so the `satisfies` check covers it, and ships
-  `login.purposeAgent` / `login.purposeAgentDesc` in `ru.json` and
-  `en.json`.
+- `**bootstrapPurposeMetadata` was missing an `agent` entry**, so when
+the bootstrap bundle preview iterated its presets the `Record<...>`
+lookup returned `undefined` and `LoginPage.tsx:553` threw
+`TypeError: Cannot read properties of undefined (reading 'labelKey')`,
+collapsing the auth view into the error boundary on a fresh stack.
+v0.4.5 added Agent to `AiBindingPurpose` (and the bootstrap synthesis
+pipeline) but left this purpose-metadata table behind. v0.4.6 adds
+the missing entry, declares Agent on `BootstrapBindingPurpose` in the
+generated TS types so the `satisfies` check covers it, and ships
+`login.purposeAgent` / `login.purposeAgentDesc` in `ru.json` and
+`en.json`.
 
 ## 0.4.5 — 2026-05-11
 
 ### UI assistant: complete the MCP-agent wiring + chat-model role recompute
 
-- **`AiBindingPurpose::Agent` is now a first-class required runtime
-  binding.** v0.4.4 shipped migration 0006 that added the `agent` enum
-  value but left half of the binding wiring incomplete: the admin UI
-  did not list the purpose, `CANONICAL_REQUIRED_RUNTIME_BINDING_PURPOSES`
-  did not include it, and `BootstrapBindingPurpose` had a deliberate
-  `unreachable!()` for it. As a result every UI-assistant turn 409'd
-  with `library X has no active 'agent' binding configured`. v0.4.5
-  promotes Agent to the canonical required tier on both ends:
-  `PURPOSE_ORDER` / `REQUIRED_RUNTIME_PURPOSE_ORDER` / i18n labels in
-  `apps/web`, plus `BootstrapBindingPurpose::Agent` + bootstrap preset
-  synthesis cloned from the active `query_answer` profile (Agent
-  shadows QueryAnswer-class chat models with tool-loop semantics).
+- `**AiBindingPurpose::Agent` is now a first-class required runtime
+binding.** v0.4.4 shipped migration 0006 that added the `agent` enum
+value but left half of the binding wiring incomplete: the admin UI
+did not list the purpose, the compile-time required-binding-purpose list
+did not include it, and `BootstrapBindingPurpose` had a deliberate
+`unreachable!()` for it. As a result every UI-assistant turn 409'd
+with `library X has no active 'agent' binding configured`. v0.4.5
+promotes Agent to the primary required tier on both ends:
+`PURPOSE_ORDER` / `REQUIRED_RUNTIME_PURPOSE_ORDER` / i18n labels in
+`apps/web`, plus `BootstrapBindingPurpose::Agent` + bootstrap preset
+synthesis cloned from the active `query_answer` profile (Agent
+shadows QueryAnswer-class chat models with tool-loop semantics).
 - **Migration 0007 recomputes chat-model `defaultRoles`** so every
-  `chat`/`text` model in `ai_model_catalog` advertises the canonical
-  text-chat purpose set (`extract_text` + `extract_graph` +
-  `query_compile` + `query_answer` + `agent`); multimodal chat models
-  also include `vision`. Migration 0005 had frozen newer chat models
-  with a narrower legacy purpose set, which is why the admin UI
-  refused to surface them under `extract_text` even when the provider
-  clearly supported it.
+`chat`/`text` model in `ai_model_catalog` advertises the standard
+text-chat purpose set (`extract_text` + `extract_graph` +
+`query_compile` + `query_answer` + `agent`); multimodal chat models
+also include `vision`. Migration 0005 had frozen newer chat models
+with a narrower legacy purpose set, which is why the admin UI
+refused to surface them under `extract_text` even when the provider
+clearly supported it.
 - **Idempotent Agent backfill.** Same migration walks every active
-  `query_answer` binding (instance / workspace / library) and inserts
-  a paired `agent` binding pointing at the same credential and a new
-  `<Provider> Agent · <model>` preset, on conflict do nothing. Existing
-  stacks become Agent-ready on the next startup without any operator
-  action.
+`query_answer` binding (instance / workspace / library) and inserts
+a paired `agent` binding pointing at the same credential and a new
+`<Provider> Agent · <model>` preset, on conflict do nothing. Existing
+stacks become Agent-ready on the next startup without any operator
+action.
 - **Reasoner-class `reasoning_content` echo.** Some chat APIs
-  (notably the hosted reasoner backend that fronts the `*-flash` /
-  `*-pro` family) reject the second tool-loop turn with HTTP 400
-  `The 'reasoning_content' in the thinking mode must be passed back
-  to the API` if the assistant message in the prior history strips
-  the field. `ChatMessage` and `ToolUseResponse` now carry an optional
-  `reasoning_content`, the OpenAI-compatible gateway parses + echoes
-  it, and the in-process MCP-agent loop builds the assistant turn via
-  `assistant_with_reasoning_and_tool_calls(...)` so reasoner multi-turn
-  runs cleanly. Non-reasoner providers ignore the optional field on
-  the wire.
+(notably the hosted reasoner backend that fronts the `*-flash` /
+`*-pro` family) reject the second tool-loop turn with HTTP 400
+`The 'reasoning_content' in the thinking mode must be passed back to the API` if the assistant message in the prior history strips
+the field. `ChatMessage` and `ToolUseResponse` now carry an optional
+`reasoning_content`, the OpenAI-compatible gateway parses + echoes
+it, and the in-process MCP-agent loop builds the assistant turn via
+`assistant_with_reasoning_and_tool_calls(...)` so reasoner multi-turn
+runs cleanly. Non-reasoner providers ignore the optional field on
+the wire.
 - **Provider-aware `tool_choice` policy.** Reasoner-class models
-  reject `tool_choice="required"` with HTTP 400 (`* does not support
-  this tool_choice`). The unified gateway now sends
-  `tool_choice="auto"` on those providers and `tool_choice="required"`
-  only on chat-class models on the first agent iteration when the
-  loop has not yet produced a tool call.
+reject `tool_choice="required"` with HTTP 400 (`* does not support this tool_choice`). The unified gateway now sends
+`tool_choice="auto"` on those providers and `tool_choice="required"`
+only on chat-class models on the first agent iteration when the
+loop has not yet produced a tool call.
 - **Library ref auto-injection for the in-process agent.** The shared
-  `grounded_answer` MCP descriptor lists `library` as required because
-  external MCP clients pick which library their token addresses. The
-  UI agent always operates inside one fixed library; we now strip
-  `library` from the schema we hand to the LLM and auto-inject the
-  canonical `<workspace_slug>/<library_slug>` ref before invoking the
-  tool. The model is freed from inventing identifiers it cannot know,
-  and the call resolves deterministically.
+`grounded_answer` MCP descriptor lists `library` as required because
+external MCP clients pick which library their token addresses. The
+UI agent always operates inside one fixed library; we now strip
+`library` from the schema we hand to the LLM and auto-inject the
+unified `<workspace_slug>/<library_slug>` ref before invoking the
+tool. The model is freed from inventing identifiers it cannot know,
+and the call resolves deterministically.
 - **Provider-error body is no longer swallowed.** `sanitize_provider_error_detail`
-  used to return the placeholder `upstream provider request failed;
-  response body was not included` even when the body had no
-  credential markers — making 4xx provider responses undebuggable. It
-  now preserves the body when no marker matches and only redacts when
-  it actually finds an `sk-` / `Bearer` / `Authorization` / `api_key`
-  fragment, so operators can read structured provider errors directly
-  from logs.
+used to return the placeholder `upstream provider request failed; response body was not included` even when the body had no
+credential markers — making 4xx provider responses undebuggable. It
+now preserves the body when no marker matches and only redacts when
+it actually finds an `sk-` / `Bearer` / `Authorization` / `api_key`
+fragment, so operators can read structured provider errors directly
+from logs.
 
 ## 0.4.4 — 2026-05-10
 
 ### Install: detect & explain sqlx migration checksum drift
 
-- `install.sh` now polls the backend health endpoint after `docker
-  compose up -d` and watches `ironrag-startup-1` for the canonical
-  sqlx error `migration N was previously applied but has been
-  modified`. If the recorded DB checksum diverges from the file
-  bundled in the new release image, the script prints the offending
-  migration version, the exact `sha384sum` and `UPDATE
-  _sqlx_migrations` commands needed to recover, stops the stack, and
-  exits non-zero — the previous behaviour left the operator staring
-  at an indefinite `Container ironrag-startup-1 Waiting`.
+- `install.sh` now polls the backend health endpoint after `docker compose up -d` and watches `ironrag-startup-1` for the familiar
+sqlx error `migration N was previously applied but has been modified`. If the recorded DB checksum diverges from the file
+bundled in the new release image, the script prints the offending
+migration version, the exact `sha384sum` and `UPDATE _sqlx_migrations` commands needed to recover, stops the stack, and
+exits non-zero — the previous behaviour left the operator staring
+at an indefinite `Container ironrag-startup-1 Waiting`.
 
 ## 0.4.3 — 2026-05-10
 
 ### Embedded picture OCR via the active vision binding
 
 - **PDF screenshots, diagrams, and image-only blocks now reach the
-  graph.** Until v0.4.2 the Docling adapter dropped embedded raster
-  pictures behind `<!-- image -->` placeholders and the local
-  rapidocr / tesseract fallback could only handle simple cases. v0.4.3
-  routes every embedded picture through the active `vision` binding —
-  the same multimodal LLM the operator already configured for
-  image-file uploads — so screenshots of UI flows, JSON payload
-  examples, and configuration tables are OCR'd at multimodal-LLM
-  recall, not at small-CPU-OCR-model recall.
+graph.** Until v0.4.2 the Docling adapter dropped embedded raster
+pictures behind `<!-- image -->` placeholders and the local
+rapidocr / tesseract fallback could only handle simple cases. v0.4.3
+routes every embedded picture through the active `vision` binding —
+the same multimodal LLM the operator already configured for
+image-file uploads — so screenshots of UI flows, JSON payload
+examples, and configuration tables are OCR'd at multimodal-LLM
+recall, not at small-CPU-OCR-model recall.
 - Docling's Python extractor now exposes each picture as a
-  base64-encoded PNG alongside its placeholder ordinal. The Rust
-  ingest pipeline iterates the list, calls
-  `extraction::image::extract_image_with_provider` per picture (same
-  helper as the standalone-image route), and appends the per-picture
-  text to the document's `content_text` so chunking, embedding, and
-  graph extraction see it. Cost per call is the same as one image
-  upload (~$0.001 with `gpt-5.4-mini` vision); for a typical PDF
-  with 5–10 embedded pictures the augmentation adds <$0.01 to the
-  document.
+base64-encoded PNG alongside its placeholder ordinal. The Rust
+ingest pipeline iterates the list, calls
+`extraction::image::extract_image_with_provider` per picture (same
+helper as the standalone-image route), and appends the per-picture
+text to the document's `content_text` so chunking, embedding, and
+graph extraction see it. Cost per call is the same as one image
+upload (~$0.001 with `gpt-5.4-mini` vision); for a typical PDF
+with 5–10 embedded pictures the augmentation adds <$0.01 to the
+document.
 - The local rapidocr / tesseract fallback is preserved for offline
-  deployments and runs first; the vision-binding pass replaces those
-  snippets when the binding is configured. Cyrillic / CJK / Latin
-  Rec model selection from v0.4.2 stays in place.
+deployments and runs first; the vision-binding pass replaces those
+snippets when the binding is configured. Cyrillic / CJK / Latin
+Rec model selection from v0.4.2 stays in place.
 - Failures on individual pictures (provider error, content moderation
-  rejection) are logged into the extraction warnings array and do not
-  fail the document — the rest of the pictures and the text layer
-  proceed.
+rejection) are logged into the extraction warnings array and do not
+fail the document — the rest of the pictures and the text layer
+proceed.
 
 ## 0.4.2 — 2026-05-09
 
 > Provider catalog now ships seven profiles (OpenAI, DeepSeek,
 > Qwen / DashScope-intl, GPTunnel, OpenRouter, RouterAI, Ollama)
 > with USD pricing and env-keyed credential auto-bootstrap. The
-> bootstrap bundle covers all canonical purposes including `vision`,
+> bootstrap bundle covers all standard binding purposes including `vision`,
 > so multimodal chat models are bindable to `vision` directly from
 > the admin UI. Ingest stages propagate cooperative cancellation.
 > OpenTelemetry replaces the prior Sentry path on backend and
 > frontend. Storybook, Playwright snapshot regression, axe a11y,
 > and React Query devtools land as baselines. Compliance scans
 > (no-prod-dataset-names, no-handler-sql, no-panic-in-handlers,
-> no-dbg-macro, no-hardcoded-languages) gate the canonical-only
-> doctrine in CI.
+> no-dbg-macro, no-hardcoded-languages) enforce the shared baseline
+> policy gates in CI.
 
 ### Multi-provider catalog
 
 - Provider catalog ships seven profiles (OpenAI, DeepSeek,
-  Qwen / DashScope-intl, GPTunnel, OpenRouter, RouterAI, Ollama)
-  declared in `ai_provider_catalog` with capability flags, runtime
-  paths, model-discovery configuration, and bootstrap-preset list.
+Qwen / DashScope-intl, GPTunnel, OpenRouter, RouterAI, Ollama)
+declared in `ai_provider_catalog` with capability flags, runtime
+paths, model-discovery configuration, and bootstrap-preset list.
 - Multimodal chat models (`gpt-4o`, `claude-4-*`, `gemini-3.x`,
-  `qwen3-vl`, `pixtral`, `llama4-vision`, `mistral-medium`/`-large`,
-  and similar) carry the `vision` purpose in `defaultRoles` and
-  `multimodal` modality, so they can be bound to the `vision`
-  pipeline purpose from the admin UI.
+`qwen3-vl`, `pixtral`, `llama4-vision`, `mistral-medium`/`-large`,
+and similar) carry the `vision` purpose in `defaultRoles` and
+`multimodal` modality, so they can be bound to the `vision`
+pipeline purpose from the admin UI.
 - Setting `IRONRAG_<PROVIDER>_API_KEY` in `.env` is sufficient to
-  register a credential — startup creates one instance-scope
-  `Bootstrap <DisplayName>` credential per provider, idempotently
-  (`ai_catalog::ensure_env_provider_credentials`).
+register a credential — startup creates one instance-scope
+`Bootstrap <DisplayName>` credential per provider, idempotently
+(`ai_catalog::ensure_env_provider_credentials`).
 - Catalog stores prices per `(model_catalog_id, billing_unit)` in
-  USD. Per-call billing rows are written for every LLM request and
-  rolled up per document and per query in the UI.
+USD. Per-call billing rows are written for every LLM request and
+rolled up per document and per query in the UI.
 - Catalog-level capability validation: writing a binding requires
-  the chosen model to declare the binding's purpose in
-  `defaultRoles`; `embed_chunk` and `query_retrieve` are upserted
-  as a paired counterpart on every write.
+the chosen model to declare the binding's purpose in
+`defaultRoles`; `embed_chunk` and `query_retrieve` are upserted
+as a paired counterpart on every write.
 - New end-to-end harness `apps/api/scripts/multi-provider-e2e.py`
-  exercises one provider at a time on a self-contained workspace +
-  library: upload → ingest → `extract_graph` → grounded answer,
-  asserting the answer references the expected entities.
+exercises one provider at a time on a self-contained workspace +
+library: upload → ingest → `extract_graph` → grounded answer,
+asserting the answer references the expected entities.
 
 ### Provider router and bootstrap readiness
 
 #### Added
 
 - OpenAI-compatible provider-router profiles can now describe runtime
-  paths, credential policy, base URL policy, model discovery, bootstrap
-  presets, and provider capabilities from one canonical catalog model.
+paths, credential policy, base URL policy, model discovery, bootstrap
+presets, and provider capabilities from one unified catalog model.
 - First-run setup exposes AI bootstrap bundles through the generated
-  contract surface, including the full runtime purpose vocabulary:
-  `extract_text`, `extract_graph`, `embed_chunk`, `query_compile`,
-  `query_retrieve`, `query_answer`, and `vision`.
+contract surface, including the full runtime purpose vocabulary:
+`extract_text`, `extract_graph`, `embed_chunk`, `query_compile`,
+`query_retrieve`, `query_answer`, and `vision`.
 
 #### Changed
 
 - Library shell readiness now separates ingest prerequisites from runtime
-  query readiness. Missing runtime bindings are surfaced as distinct
-  purposes, and `query_retrieve` is handled as an embedding-style runtime
-  purpose instead of being collapsed into answer generation.
+query readiness. Missing runtime bindings are surfaced as distinct
+purposes, and `query_retrieve` is handled as an embedding-style runtime
+purpose instead of being collapsed into answer generation.
 - Provider runtime profiles now expose `structuredOutput` through the
-  shared contract, OpenAPI schema, and generated TypeScript client, so
-  JSON-schema, JSON-object, and unsupported structured-output modes use
-  one canonical provider profile field.
+shared contract, OpenAPI schema, and generated TypeScript client, so
+JSON-schema, JSON-object, and unsupported structured-output modes use
+one shared provider profile field.
 - The admin AI and bootstrap frontend paths now consume generated API
-  types at the boundary, with provider catalog validation for capability
-  and credential metadata instead of duplicate raw response DTOs.
+types at the boundary, with provider catalog validation for capability
+and credential metadata instead of duplicate raw response DTOs.
 - Web ingest run parameters, document detail adapters, graph topology
-  adapters, and admin catalog surfaces now use the generated contract
-  types instead of hand-shaped raw response DTOs.
+adapters, and admin catalog surfaces now use the generated contract
+types instead of hand-shaped raw response DTOs.
 - Document list status/readiness, document readiness summaries, graph
-  topology loading, source-access mapping, and snapshot import reports
-  now use canonical generated contract types across backend and web
-  boundaries.
-- Async operation status now uses a typed canonical enum in the backend
-  contract and generated frontend API instead of raw string DTOs.
+topology loading, source-access mapping, and snapshot import reports
+now use generated contract types across backend and web
+boundaries.
+- Async operation status now uses a typed shared enum in the backend
+contract and generated frontend API instead of raw string DTOs.
 
 #### Fixed
 
 - Missing `query_compile`, `query_retrieve`, or `query_answer` bindings
-  now make `queryReady` false without making ingest readiness report a
-  query-only failure.
+now make `queryReady` false without making ingest readiness report a
+query-only failure.
 - Runtime query embeddings now use the active `query_retrieve` binding
-  and fail loud when it does not target the same vector source as
-  `embed_chunk`, preventing silent empty-vector retrieval after a binding
-  change. The query-embedding cache is scoped by provider catalog, model,
-  credential, and base URL.
+and fail loud when it does not target the same vector source as
+`embed_chunk`, preventing silent empty-vector retrieval after a binding
+change. The query-embedding cache is scoped by provider catalog, model,
+credential, and base URL.
 - Bootstrap presets and admin binding writes now enforce the same
-  vector-model invariant for `embed_chunk` and `query_retrieve` before
-  the runtime can enter a broken retrieval state.
+vector-model invariant for `embed_chunk` and `query_retrieve` before
+the runtime can enter a broken retrieval state.
 - Grounded-answer retrieval fixed release-blocking regressions around
-  over-eager clarification, same-stem multi-format document targeting,
-  graph namespace endpoint disambiguation, and multi-document comparison
-  truncation.
-- QueryIR routing now consumes one canonical target vocabulary, including
-  source-slice row requests, instead of accepting alias ladders or raw
-  question wording as a parallel routing path.
-- Graph extraction now validates the canonical entity/relation schema
-  exactly and stores only canonical relation types, removing parser
-  aliases and provider-specific structured-output fallbacks.
+over-eager clarification, same-stem multi-format document targeting,
+graph namespace endpoint disambiguation, and multi-document comparison
+truncation.
+- QueryIR routing now consumes one unified target vocabulary, including
+source-slice row requests, instead of accepting alias ladders or raw
+question wording as a parallel routing path.
+- Graph extraction now validates the entity/relation schema
+exactly and stores only schema-defined relation types, removing parser
+aliases and provider-specific structured-output fallbacks.
 - First-run setup now blocks completion until a ready provider bundle is
-  loaded and selected; credential-discovered provider models no longer
-  make valid configured bindings look missing before credential-scoped
-  discovery has returned.
+loaded and selected; credential-discovered provider models no longer
+make valid configured bindings look missing before credential-scoped
+discovery has returned.
 - Bootstrap and admin UI errors no longer render raw backend/provider
-  messages in the main operator path.
+messages in the main operator path.
 - Provider model discovery now uses declared discovery capability paths
-  instead of model-name heuristics, so opaque router model identifiers
-  are preserved and classified by the provider profile contract.
+instead of model-name heuristics, so opaque router model identifiers
+are preserved and classified by the provider profile contract.
 - Vector binding lifecycle updates now keep `embed_chunk` and
-  `query_retrieve` counterparts in sync for active, inactive, update,
-  and delete paths instead of leaving stale runtime assignments behind.
+`query_retrieve` counterparts in sync for active, inactive, update,
+and delete paths instead of leaving stale runtime assignments behind.
 - UI and MCP grounded-answer probes now send the same retrieval depth by
-  default, keeping parity measurements tied to the same runtime shape.
+default, keeping parity measurements tied to the same runtime shape.
 - Agent-surface and release-readiness probes now call MCP graph and
-  document tools with canonical catalog library references instead of
-  stale UUID alias fields.
-- Agent-surface probes now execute the canonical assistant JSON turn
-  endpoint instead of waiting for obsolete UI SSE completion frames.
-- MCP `grounded_answer` structured output now embeds the canonical
-  assistant execution detail instead of maintaining a parallel evidence
-  projection, restoring evidence-reference parity with the UI assistant turn
-  payload.
+document tools with primary catalog library references instead of
+stale UUID alias fields.
+- Agent-surface probes now execute the primary assistant JSON turn
+endpoint instead of waiting for obsolete UI SSE completion frames.
+- MCP `grounded_answer` structured output now embeds the same
+assistant execution detail instead of maintaining a parallel evidence
+projection, restoring evidence-reference parity with the UI assistant turn
+payload.
 - Agent-surface release gates now avoid over-specific graph-search
-  top-label and broad negative-token assertions when the grounded answer,
-  verifier, runtime id, and reference parity checks already cover the
-  user-visible contract.
+top-label and broad negative-token assertions when the grounded answer,
+verifier, runtime id, and reference parity checks already cover the
+user-visible contract.
 - Agent-surface reports no longer include the stale SSE-era tool-start
-  budget after the assistant probe moved to the canonical JSON turn
-  endpoint.
+budget after the assistant probe moved to the primary JSON turn
+endpoint.
 - Grounded-answer generation now explicitly preserves source-evidence
-  polarity for existence and capability questions; the live technical
-  benchmark now checks answer-opening polarity and no longer rejects
-  correct negated mentions of an unavailable endpoint as forbidden content.
+polarity for existence and capability questions; the live technical
+benchmark now checks answer-opening polarity and no longer rejects
+correct negated mentions of an unavailable endpoint as forbidden content.
 - Standalone assistant questions no longer inherit entity anchors from the
-  previous assistant answer, so topic changes inside one conversation keep
-  retrieval focused on the current question while follow-up questions still
-  use conversation context.
+previous assistant answer, so topic changes inside one conversation keep
+retrieval focused on the current question while follow-up questions still
+use conversation context.
 - Grounded-answer prompts now preserve source bindings for multi-role
-  questions instead of substituting adjacent workflow components when a
-  direct source document answers the requested role.
+questions instead of substituting adjacent workflow components when a
+direct source document answers the requested role.
 - Docling extraction now treats image-placeholder-only markdown as empty
-  and uses the available text layer as the canonical extracted content,
-  preserving PDF/DOCX text when markdown conversion emits only placeholders.
+and uses the available text layer as the primary extracted content,
+preserving PDF/DOCX text when markdown conversion emits only placeholders.
 - Document search now runs expanded lexical chunk probes and evidence
-  hydration with bounded parallelism and batch-loads document/revision
-  metadata, reducing release-gate latency without changing the canonical
-  ranking model.
+hydration with bounded parallelism and batch-loads document/revision
+metadata, reducing release-gate latency without changing the
+ranking model.
 - Document search now honors `evidenceSampleLimit=0`, runs independent
-  lexical/entity/relation/provider stages concurrently, caps vector probes
-  to the requested response surface, and uses term-bounded revision
-  backfill instead of full-revision scans.
+lexical/entity/relation/provider stages concurrently, caps vector probes
+to the requested response surface, and uses term-bounded revision
+backfill instead of full-revision scans.
 - Live grounded benchmark GET requests now refresh the HTTP session and
-  retry transient connection drops, so idempotent search probes do not
-  abort a release run after a closed keepalive socket.
+retry transient connection drops, so idempotent search probes do not
+abort a release run after a closed keepalive socket.
 - Snapshot import now authorizes the target library before accepting a
-  restore and only imports manifest-declared canonical sections, closing
-  dynamic table/collection import gaps.
+restore and only imports manifest-declared export sections, closing
+dynamic table/collection import gaps.
 - Snapshot export no longer includes AI provider credentials or runtime
-  binding state; provider access remains deployment configuration rather
-  than portable library data.
+binding state; provider access remains deployment configuration rather
+than portable library data.
 - Snapshot restore now validates row ownership, declared blob scope, and
-  graph edge endpoints before import; replace restores also quarantine
-  old library blobs so stale objects cannot be served after a restore.
+graph edge endpoints before import; replace restores also quarantine
+old library blobs so stale objects cannot be served after a restore.
 
 ### Frontend modernization
 
 #### Added
 
-- Canonical server-state now uses TanStack Query 5, code-first OpenAPI from `utoipa`, and a generated TypeScript SDK from `@hey-api/openapi-ts`.
+- Shared server-state now uses TanStack Query 5, code-first OpenAPI from `utoipa`, and a generated TypeScript SDK from `@hey-api/openapi-ts`.
 - Storybook 8, MSW-backed API mocks for tests, Sentry-compatible observability, lazy route loading, a gzip bundle budget, and the `make frontend-check` CI gate now cover the web app.
 
 #### Changed
@@ -308,71 +500,71 @@
 
 #### Fixed
 
-- Ten components were migrated off ad-hoc `useEffect` + `fetch` loops onto the canonical server-state path.
+- Ten components were migrated off ad-hoc `useEffect` + `fetch` loops onto the shared server-state path.
 - Sentry-compatible initialization no longer lands in the eager bundle; it loads behind `requestIdleCallback` via dynamic import.
 
 ### Assistant transient-network handling
 
 - The assistant turn dispatcher no longer surfaces a long
-  blame-the-browser placeholder ("Browser blocked the request to the
-  server. Typical causes: extension, tracking protection, corporate
-  proxy…") on every transient fetch failure. Pre-fetch network
-  rejects (`NetworkError`, `Failed to fetch`, `Load failed` — the
-  request never reached the server) are now retried once
-  transparently in the same handler. Anything that fails after that
-  surfaces with the raw error message via the existing retry banner,
-  so operators see the actual cause instead of a misleading
-  extension-blame guess. Removed the unused
-  `assistant.errorDiagnosis.*` i18n strings.
+blame-the-browser placeholder ("Browser blocked the request to the
+server. Typical causes: extension, tracking protection, corporate
+proxy…") on every transient fetch failure. Pre-fetch network
+rejects (`NetworkError`, `Failed to fetch`, `Load failed` — the
+request never reached the server) are now retried once
+transparently in the same handler. Anything that fails after that
+surfaces with the raw error message via the existing retry banner,
+so operators see the actual cause instead of a misleading
+extension-blame guess. Removed the unused
+`assistant.errorDiagnosis.*` i18n strings.
 
 ## 0.4.1 — 2026-05-03
 
 ### Ollama provider catalog: full library coverage
 
 - **68 Ollama models registered out of the box** across the major
-  families: Qwen3 (0.6B–32B + Coder), Qwen2.5 (0.5B–72B + Coder), QwQ
-  reasoning, Llama 3.1 / 3.2 / 3.3, Mistral / Mistral-Nemo, Mixtral
-  8x7B / 8x22B, Gemma 2 / Gemma 3, Phi 3 / 3.5 / 4 / 4-mini, DeepSeek-R1
-  (1.5B–70B reasoning), DeepSeek-Coder-V2, IBM Granite 3.3, plus
-  vision (Qwen2.5VL / Qwen3-VL, Llama 3.2-Vision, LLaVA, MiniCPM-V,
-  Moondream) and embedding (Qwen3-embedding, nomic-embed-text,
-  mxbai-embed-large, bge-m3, snowflake-arctic-embed2, all-minilm,
-  granite-embedding) families. Models not yet `ollama pull`-ed appear
-  in the UI dropdown anyway; selecting one and saving the binding
-  triggers `ollama pull` on first use.
+families: Qwen3 (0.6B–32B + Coder), Qwen2.5 (0.5B–72B + Coder), QwQ
+reasoning, Llama 3.1 / 3.2 / 3.3, Mistral / Mistral-Nemo, Mixtral
+8x7B / 8x22B, Gemma 2 / Gemma 3, Phi 3 / 3.5 / 4 / 4-mini, DeepSeek-R1
+(1.5B–70B reasoning), DeepSeek-Coder-V2, IBM Granite 3.3, plus
+vision (Qwen2.5VL / Qwen3-VL, Llama 3.2-Vision, LLaVA, MiniCPM-V,
+Moondream) and embedding (Qwen3-embedding, nomic-embed-text,
+mxbai-embed-large, bge-m3, snowflake-arctic-embed2, all-minilm,
+granite-embedding) families. Models not yet `ollama pull`-ed appear
+in the UI dropdown anyway; selecting one and saving the binding
+triggers `ollama pull` on first use.
 - **Default roles per model size and capability.** ≥4B chat models gain
-  the full set `extract_graph,query_answer,query_compile,utility,rerank`
-  so a single local model can serve every text purpose; <4B chat models
-  get `extract_graph,query_answer,utility` because they cannot reliably
-  emit the structured-JSON schemas used by `query_compile` and
-  `rerank`; reasoning models (DeepSeek-R1, QwQ) get
-  `query_answer,query_compile,utility`; vision models get
-  `extract_graph,query_answer,vision`; embedding models keep
-  `embed_chunk` only.
+the full set `extract_graph,query_answer,query_compile,utility,rerank`
+so a single local model can serve every text purpose; <4B chat models
+get `extract_graph,query_answer,utility` because they cannot reliably
+emit the structured-JSON schemas used by `query_compile` and
+`rerank`; reasoning models (DeepSeek-R1, QwQ) get
+`query_answer,query_compile,utility`; vision models get
+`extract_graph,query_answer,vision`; embedding models keep
+`embed_chunk` only.
 - **Bootstrap presets.** Each registered model gets an instance-scoped
-  preset named `Ollama <model>`, so the UI binding picker shows a
-  ready-to-select option per model without operator setup. 75 Ollama
-  presets total after seeding (was 7 in 0.4.0).
+preset named `Ollama <model>`, so the UI binding picker shows a
+ready-to-select option per model without operator setup. 75 Ollama
+presets total after seeding (was 7 in 0.4.0).
 
 ### Catalog parser hardening
 
 - The `defaultRoles` parser used by `resolve_active_runtime_binding`
-  no longer treats unknown role labels (e.g. forward-compatible
-  `rerank` / `utility` from new Ollama seeds) as fatal catalog
-  corruption. A single unmapped role used to silently return
-  `ApiError::Internal`, which propagated as a bare "internal server
-  error" through every binding lookup that listed the model catalog
-  — breaking embed_chunk and extract_graph for fresh ingest jobs and
-  surfacing in the admin AI tab as "failed to load AI configuration".
-  Unknown labels are now skipped.
+no longer treats unknown role labels (e.g. forward-compatible
+`rerank` / `utility` from new Ollama seeds) as fatal catalog
+corruption. A single unmapped role used to silently return
+`ApiError::Internal`, which propagated as a bare "internal server
+error" through every binding lookup that listed the model catalog
+— breaking embed_chunk and extract_graph for fresh ingest jobs and
+surfacing in the admin AI tab as "failed to load AI configuration".
+Unknown labels are now skipped.
 
 ### Documents header cost summary
 
 - Library and workspace totals always render together when the cost
-  banner is shown, so a library with no billed executions yet (e.g.
-  attachments still queued) no longer looks like the library cost
-  field "disappeared" — both rows render with the canonical
-  `$0.000` placeholder while workspace totals remain visible.
+banner is shown, so a library with no billed executions yet (e.g.
+attachments still queued) no longer looks like the library cost
+field "disappeared" — both rows render with the standard
+`$0.000` placeholder while workspace totals remain visible.
 
 ## 0.4.0 — 2026-05-03
 
@@ -416,7 +608,7 @@ corpus-specific query expansions or topic boosts.
 the typed technical facets requested by `QueryIR` and grounded in
 evidence.
 - Document targeting normalizes filename separators and natural phrasing
-to the same canonical document identity through deterministic
+to the same primary document identity through deterministic
 longest-match scoring.
 
 ### Grounded-answer prompt and policy
@@ -483,8 +675,8 @@ document batches with `chunk.document_id == ?` and
 `vector.revision_id IN @stale`, fitting comfortably under the Arango
 per-query memory cap on libraries that previously OOMed.
 - Library-scoped record-stream fallback in
-`first_record_stream_candidate_profile` finds canonical-revision
-record-stream profiles even when no top-K chunk is record-stream.
+`first_record_stream_candidate_profile` finds record-stream profiles
+for the active library revision even when no top-K chunk is record-stream.
 - `list_source_profile_chunks_by_revisions` AQL now filters by
 `library_id` for defence-in-depth tenant isolation.
 
@@ -492,7 +684,7 @@ record-stream profiles even when no top-K chunk is record-stream.
 
 - Concurrent answer cache fills are single-owner; identical grounded-
 answer turns wait for the active fill instead of starting duplicate
-canonical executions. Coordination failures fail loudly.
+fill executions. Coordination failures fail loudly.
 - Embedding coverage is verified after reuse: partial-vector revisions
 become explicit ingest failures instead of later retrieval misses.
 - Reprocess works for text-recoverable revisions without source blobs;
@@ -512,7 +704,7 @@ evidence-gated comparison answers landed.
 ### Assistant transport
 
 - UI assistant uses one direct JSON `POST /v1/query/sessions/{id}/turns`
-request — no SSE branch in the canonical lane. MCP streaming remains
+request — no SSE branch in the primary JSON path. MCP streaming remains
 isolated under `/v1/mcp`. Session history hydrates from
 `{ session, messages }` so existing conversations restore correctly.
 
@@ -581,7 +773,7 @@ concept nouns when both are present.
 - **Title-aware BM25 boost + ngram fuzzy title match.** Typos in
 product or proper-noun titles no longer shred recall; the ngram
 analyzer on `title` / `file_name` plus a separate title-token
-BM25 boost keeps the canonical document in top-K.
+BM25 boost keeps the intended document in top-K.
 - **Real chunk embedding in ingest** with library-wide vector filter.
 Vector search no longer silently matches stale embeddings from
 other libraries.
@@ -592,11 +784,11 @@ freshness budget.
 answer tool loop dispatches independent calls in parallel; graph
 topology cache is prewarmed atomically at boot.
 - **Revision-coherence gate hardened.** `map_chunk_hit` is strict on
-canonical revision equality, backed by the null-head recovery above.
+strict revision equality, backed by the null-head recovery above.
 
 ### Ingest performance
 
-- **Bulk-upsert in merge.** One-shot `list_runtime_graph_nodes_by_canonical_keys`
+- **Bulk-upsert in merge.** One-shot bulk preload of runtime graph nodes by stable merge keys
 preload plus `bulk_upsert_runtime_graph_nodes` replace ~35 sequential
 round-trips per chunk; +112 % throughput and −71 % slow statements
 on an internal stress stack.
@@ -647,7 +839,7 @@ previously 0 / 5 × 500 with ArangoDB OOM.
 
 ### QueryCompiler: NL → typed QueryIR replaces hardcoded keyword classifiers
 
-The fix replaces the scattered keyword-based routing with a single canonical layer: a compiled `QueryIR` (act, scope, target_types, literal_constraints, conversation_refs, confidence) produced by a new `QueryCompilerService` from the natural-language question. Every downstream stage now reads routing signals from the IR instead of re-classifying the raw question string.
+The fix replaces the scattered keyword-based routing with a single unified layer: a compiled `QueryIR` (act, scope, target_types, literal_constraints, conversation_refs, confidence) produced by a new `QueryCompilerService` from the natural-language question. Every downstream stage now reads routing signals from the IR instead of re-classifying the raw question string.
 
 - `**QueryIR` schema.** Finite enums for `act` (retrieve_value, describe, configure_how, compare, enumerate, meta, follow_up), `scope`, `language`, `literal_kind`, `entity_role`, `conversation_ref_kind`. Open-ended ontology tags for `target_types` and `comparison.dimension` so new concepts enter through data, not code. Strict OpenAI-compatible JSON Schema (`domains/query_ir.rs::query_ir_json_schema`) generated by hand so the compiler output validates under structured-output strict mode.
 - `**QueryCompilerService`.** Stateless service in `services/query/compiler.rs` that calls whatever model the operator binds to the new `AiBindingPurpose::QueryCompile` — no model is hardcoded in code. Falls back to a safe `Describe` IR with `confidence: 0.0` when the binding is missing, the provider is down, or the model returns invalid JSON, so the pipeline keeps working in degraded mode.
@@ -667,30 +859,30 @@ Three hardcoded lists remain pending a column-semantic ontology in Arango: `tabl
 
 ### Admin & documents tables
 
-- Fixed paginated sorting on the documents list: sortable columns now order the full result set on the backend instead of reordering only the current UI page. Added canonical server sort keys for document cost, pipeline time, and finished time, and fixed cursor pagination for non-default document sorts.
-- Fixed the admin pricing table to use one canonical server-driven list path for search, provider filtering, sorting, and pagination. `GET /v1/ai/prices` now returns `{ items, total, limit, offset }`, and the UI sorts prices across the full paginated dataset instead of locally inside the loaded slice.
-- The documents header now shows the library-wide total cost from the canonical billing summary instead of summing only the currently loaded page, so the number stays correct across pagination, search, and local table state.
+- Fixed paginated sorting on the documents list: sortable columns now order the full result set on the backend instead of reordering only the current UI page. Added primary server sort keys for document cost, pipeline time, and finished time, and fixed cursor pagination for non-default document sorts.
+- Fixed the admin pricing table to use one shared server-driven list path for search, provider filtering, sorting, and pagination. `GET /v1/ai/prices` now returns `{ items, total, limit, offset }`, and the UI sorts prices across the full paginated dataset instead of locally inside the loaded slice.
+- The documents header now shows the library-wide total cost from the primary billing summary instead of summing only the currently loaded page, so the number stays correct across pagination, search, and local table state.
 - The admin token screen now resolves workspace and library scope names server-side and shows effective permissions directly in the list and detail panel. Long raw `workspace:<uuid>` / `library:<uuid>` strings were removed from the primary UX path.
 
 ### MCP–UI Parity: `grounded_answer` tool
 
-The IronRAG UI assistant is the reference implementation of grounded Q&A. Every MCP agent plugged into the same library now receives the same answer quality, evidence references, and guard-rails — MCP is no longer a degraded lane, it is the same pipeline exposed as a canonical tool.
+The IronRAG UI assistant is the reference implementation of grounded Q&A. Every MCP agent plugged into the same library now receives the same answer quality, evidence references, and guard-rails — MCP is no longer a degraded lane, it is the same pipeline exposed as a first-class tool.
 
-- New MCP tool `**grounded_answer`** (`apps/api/src/interfaces/http/mcp/tools/grounded.rs`). Input: `library`, `query`, optional `conversationTurns`, optional `topK`, `includeDebug`. Handler is a thin translator — it creates an ephemeral conversation and delegates to `state.canonical_services.query.execute_turn`, i.e. the same entry point the UI handler `POST /v1/query/sessions/{id}/turns` uses. No parallel retrieval, ranking, or answer-generation logic is introduced.
-- Structured output surfaces `executionDetail`, the same canonical assistant DTO the UI consumes, including chunk, prepared-segment, technical-fact, graph-entity, graph-relation, verifier, runtime, request, and response fields. Agents receive exactly the data the UI debug panel shows for the equivalent turn, plus top-level `runtimeExecutionId`, `executionId`, and `conversationId` shortcuts for trace lookup.
+- New MCP tool `**grounded_answer`** (`apps/api/src/interfaces/http/mcp/tools/grounded.rs`). Input: `library`, `query`, optional `conversationTurns`, optional `topK`, `includeDebug`. Handler is a thin translator — it creates an ephemeral conversation and delegates to the query service `execute_turn` entry point on application state, i.e. the same entry point the UI handler `POST /v1/query/sessions/{id}/turns` uses. No parallel retrieval, ranking, or answer-generation logic is introduced.
+- Structured output surfaces `executionDetail`, the same assistant DTO the UI consumes, including chunk, prepared-segment, technical-fact, graph-entity, graph-relation, verifier, runtime, request, and response fields. Agents receive exactly the data the UI debug panel shows for the equivalent turn, plus top-level `runtimeExecutionId`, `executionId`, and `conversationId` shortcuts for trace lookup.
 - Tool is gated by the `query_run` grant — identical to the UI path. An MCP token that can ask questions in UI can ask them over MCP; a scope denied in UI is denied in MCP. Parity is observable at the grant level, not just at the code level.
-- `MCP_CANONICAL_TOOL_NAMES` extended in `apps/api/src/interfaces/http/mcp.rs`; `visible_tool_names` advertises `grounded_answer` when the token has `query_run` somewhere.
+- MCP tool registry in `apps/api/src/interfaces/http/mcp.rs` extended; `visible_tool_names` advertises `grounded_answer` when the token has `query_run` somewhere.
 - Docs updated (`docs/ru/MCP.md`, `docs/en/MCP.md`) — `grounded_answer` is now the top-of-list tool, with explicit guidance "prefer this over `search_documents` + `read_document` for knowledge questions". Admin UI (`apps/web/src/components/admin/McpTab.tsx`) shows an MCP–UI parity disclosure card and updates the recommended system-prompt description so every external client (Claude Code, Claude Desktop, Cursor, Codex, OpenClaw, VS Code) is told to call `grounded_answer` first.
 
 ### MCP Streamable HTTP transport (spec 2025-06-18)
 
-- Canonical `/v1/mcp` endpoint now implements the current MCP Streamable HTTP transport and nothing else — no legacy HTTP+SSE split, no parallel POST-only alias, no ad-hoc JSON-RPC surface. One URL handles the full client lifecycle:
+- The `/v1/mcp` endpoint now implements the current MCP Streamable HTTP transport and nothing else — no legacy HTTP+SSE split, no parallel POST-only alias, no ad-hoc JSON-RPC surface. One URL handles the full client lifecycle:
   - `POST /v1/mcp` carries JSON-RPC requests, notifications, and batches. Content is negotiated from the `Accept` header: `application/json` → single JSON body (default, curl-friendly); `text/event-stream` (optionally alongside JSON) → one-shot SSE frame `event: message\ndata: …\n\n` so SDK clients that advertise both formats get the transport they expect. Notification-only requests (no `id`) are acknowledged with a bare `202 Accepted`.
   - `GET /v1/mcp` returns a well-formed but silent SSE stream (`200 OK`, `Content-Type: text/event-stream`, one `: ready` comment, connection idle). Spec 2025-06-18 permits either a 405 or a zero-event SSE stream; we choose the latter because some bundled MCP clients (notably OpenClaw's `bundle-mcp`, which spawns a fresh subprocess per chat session) treat any non-200 handshake as fatal and drop the whole MCP server for that agent context. A valid empty stream satisfies them without introducing real event traffic.
   - `DELETE /v1/mcp` returns `200 OK`. The server is stateless between requests — session termination is a no-op — but cleanup flows in SDK clients succeed instead of erroring.
 - The `initialize` response now includes a freshly minted `Mcp-Session-Id` header (UUIDv7). Clients that pin the session via this header on subsequent calls are accepted without additional validation; the server does not correlate calls across the id because no state depends on it, but the header satisfies every compliant client (Claude Code remote, Cursor, OpenAI Responses API tools, the official `@modelcontextprotocol/sdk`, OpenClaw bundle-mcp).
 - Protocol version is `2025-06-18`. An optional `Mcp-Protocol-Version` request header is tolerated but not required — the server advertises its version via the `initialize` response payload.
-- `GET /v1/mcp` and `DELETE /v1/mcp` no longer run the Bearer-auth extractor; both answer their canonical status immediately. Bundled MCP clients (notably OpenClaw's `bundle-mcp`, spawned fresh per chat session) speculatively open the SSE stream before carrying the session Bearer, and the earlier 401 response made them drop the whole MCP server registration — group-chat agents were left without tools even though direct-message agents worked. Spec 2025-06-18 allows answering without auth on these methods.
+- `GET /v1/mcp` and `DELETE /v1/mcp` no longer run the Bearer-auth extractor; both answer with their unauthenticated handshake responses immediately. Bundled MCP clients (notably OpenClaw's `bundle-mcp`, spawned fresh per chat session) speculatively open the SSE stream before carrying the session Bearer, and the earlier 401 response made them drop the whole MCP server registration — group-chat agents were left without tools even though direct-message agents worked. Spec 2025-06-18 allows answering without auth on these methods.
 - Smoke-tested end-to-end from the compose stack and from production with OpenClaw on a group chat: `application/json` returns `content-type: application/json` + valid JSON-RPC; `application/json, text/event-stream` returns `content-type: text/event-stream` with one `event: message` frame; `GET` returns 200 + silent SSE handshake (`: ready`); `DELETE` returns 200. Group-chat MCP tool calls now work identically to direct-message ones.
 
 ## 0.3.0 — 2026-04-16
@@ -699,7 +891,7 @@ Large-library performance release. On a 4900-document reference library the docu
 
 ### AI catalog & admin UX
 
-- AI model compatibility is now classified canonically across OpenAI, Qwen, DeepSeek, and Ollama from one binding-purpose model. Hosted DeepSeek remains text-only; multimodal and embedding roles are exposed only where the provider or discovered model family actually supports them.
+- AI model compatibility is now classified uniformly across OpenAI, Qwen, DeepSeek, and Ollama from one binding-purpose model. Hosted DeepSeek remains text-only; multimodal and embedding roles are exposed only where the provider or discovered model family actually supports them.
 - `GET /v1/ai/models` no longer performs live provider `/models` discovery on every admin-page load. Generic reads now resolve against the persisted catalog plus visible credentials, while provider discovery sync runs on credential save and on narrow credential-specific refreshes only. In local profiling the AI admin read path dropped from multi-second stalls to low-millisecond responses.
 - The Admin `AI` tab was redesigned for high-cardinality catalogs: scope cards, provider inventory, binding cards, searchable credentials and presets, and lazy Ollama model checks in the editor. Fixed the library-override crash caused by the missing `selectedCredentialModelSet` binding state.
 
@@ -712,7 +904,7 @@ Large-library performance release. On a 4900-document reference library the docu
 ### Documents list
 
 - `GET /v1/content/documents` is now keyset-paginated: `cursor`, `limit` (50/200), `search` (ILIKE), `sortBy`, `sortOrder`, opt-in `includeTotal`. Response is a slim `ContentDocumentListItem` with server-derived `status` and `readiness`; heavy fields moved to the per-document detail endpoint used by the inspector.
-- Backend list path is a single Postgres CTE with LATERAL joins replacing the previous 6-call batch prefetch. The `(library_id, created_at DESC, id DESC)` keyset index and a GIN trigram index for `search` over `lower(external_key)` are part of the canonical `0001_init.sql` baseline.
+- Backend list path is a single Postgres CTE with LATERAL joins replacing the previous 6-call batch prefetch. The `(library_id, created_at DESC, id DESC)` keyset index and a GIN trigram index for `search` over `lower(external_key)` are part of the baseline `0001_init.sql` migration.
 - `get_library_summary` now uses a single aggregate SQL (`aggregate_library_document_readiness`) instead of iterating the document list. Fixed a Cartesian `LEFT JOIN ingest_job` that was inflating counts ~4000× during integration.
 - Frontend `DocumentsPage` rewritten around server pagination + `IntersectionObserver` infinite scroll. Debounced server search and sort. Client-side status/readiness filters and local `slice()` paging removed — no mixed client/server filtering.
 
@@ -729,13 +921,13 @@ Large-library performance release. On a 4900-document reference library the docu
 
 ### Worker — heartbeat starvation fix
 
-- Root cause of the repeated `lease_expired / stale_heartbeat` failures: `projection::project_canonical_graph`, `projection::project_targeted_canonical_graph`, and the per-chunk `serde_json::from_value::<GraphExtractionCandidateSet>` inside `rebuild.rs`'s `buffer_unordered(8)` were fully synchronous CPU-bound paths on tokio worker threads with no yield points. They pegged every tokio worker at 100 %, starving the heartbeat task so leases expired while the worker was still alive.
+- Root cause of the repeated `lease_expired / stale_heartbeat` failures: synchronous full-library and targeted graph projection paths in the `projection` module, and the per-chunk `serde_json::from_value::<GraphExtractionCandidateSet>` inside `rebuild.rs`'s `buffer_unordered(8)` were fully synchronous CPU-bound paths on tokio worker threads with no yield points. They pegged every tokio worker at 100 %, starving the heartbeat task so leases expired while the worker was still alive.
 - Fix: those CPU hot spots now run inside `tokio::task::spawn_blocking`. The heartbeat task moved onto a dedicated `heartbeat_postgres: PgPool` (`min_connections=1`, `max_connections=2`) so the main pool can be fully checked out without blocking heartbeats. New stage-level timeout `IRONRAG_RUNTIME_GRAPH_EXTRACT_STAGE_TIMEOUT_SECONDS` (default 600) wraps `materialize_revision_graph_candidates` + `reconcile_revision_graph` via `tokio::time::timeout`, surfacing `stage_timeout` failures through the existing "degraded to readable" branch instead of silently holding a lease.
 
 ### Batch rerun — async job with polling
 
 - `POST /v1/content/documents/batch-reprocess` now returns `202 Accepted` with `{ batchOperationId, total, libraryId, workspaceId }`. A spawned task admits the child mutations via `buffer_unordered(N)` (default 4, `IRONRAG_BATCH_REPROCESS_PARALLELISM`) bounded by `IRONRAG_BATCH_REPROCESS_TIMEOUT_SECS` (default 3600). Library consistency is enforced up front — every `documentId` must belong to the same library.
-- `ops_async_operation` carries a nullable `parent_async_operation_id` FK directly in the canonical `0001_init.sql` baseline. This is the canonical single-table batch-ops mechanism — any future batch endpoint reuses the same parent/child shape.
+- `ops_async_operation` carries a nullable `parent_async_operation_id` FK directly in the baseline `0001_init.sql` migration. This is the single-table batch-ops mechanism — any future batch endpoint reuses the same parent/child shape.
 - `GET /v1/ops/operations/{id}` returns the parent row plus `progress { total, completed, failed, inFlight }` via a single `LEFT JOIN` + FILTER aggregate. For any parent with children, `status` and `completedAt` are derived on read from progress counts (`processing` while any child pending, `failed` on any child failure, else `ready`) — no race between the spawned admit phase and child lifecycle.
 - Old `BATCH_MAX_DOCUMENTS = 1000` cap replaced by a DoS sanity cap of 100 000 ids.
 - Frontend shows a progress banner that polls `opsApi.getAsyncOperation(id)` with 1.5 s → 5 s adaptive backoff, refreshes the document list on terminal states, and auto-dismisses 4 s after completion.
@@ -746,7 +938,7 @@ Large-library performance release. On a 4900-document reference library the docu
 - **Streaming Arango cursor.** New `ArangoClient::query_json_batches` yields cursor batches via an async callback instead of merging the entire result into memory. The old path OOM-killed the backend on `knowledge_structured_block` (545 k rows / ~1 GB JSON). Export now streams through a bounded `mpsc` channel (depth 2) between the cursor producer task and the tar writer.
 - **Edge `library_id` propagation.** Every Arango edge insert now carries `library_id` (10 wrapper methods, 12 call sites, 8 files). Persistent indexes on `library_id` for all 15 edge collections. Snapshot export edge query uses `FILTER edge.library_id == @lid` instead of the old per-edge `DOCUMENT()` lookup — edge export stage dropped from **11.3 s → <2 ms** on the large-library reference fixture.
 - **Batched import.** `PgBatcher` flushes every 1 000 rows via `jsonb_populate_recordset`; `ArangoBatcher` flushes via `FOR doc IN @docs INSERT`. Large-library full restore (107 k pg + 466 k arango rows) dropped from **>5 min (nginx 504)** to **~78 s**.
-- **Bulk Arango timeout.** `query_json_bulk` and `query_json_batches` carry a 10-minute per-request timeout override. The canonical 15 s client timeout was truncating edge cleanup and large-batch inserts.
+- **Bulk Arango timeout.** `query_json_bulk` and `query_json_batches` carry a 10-minute per-request timeout override. The default 15 s Arango client timeout was truncating edge cleanup and large-batch inserts.
 - **Replace mode.** `POST /snapshot?overwrite=replace` clears the library footprint (reverse-FK Postgres delete, Arango edge/doc purge, blob stash) before restoring. Import trusts the archive manifest for include kinds — no duplicate selector on the request.
 - **Simplified include scope.** `IncludeKind` collapsed from `content / runtime_graph / knowledge / blobs` to `**library_data` + `blobs`**. A library is one atomic domain unit; the old split leaked storage tiers into the UI. Back-compat shim maps old tokens to `library_data`. UI dialog: one always-on "Library data" card + one "Include source files" checkbox.
 - Export throughput on the large-library reference fixture (24 k nodes, 82 k edges, 445 k structured blocks): **6.1 s / 42 MiB** (was 17.4 s before edge indexes, truncated before tar.zst).
@@ -775,7 +967,7 @@ Large-library performance release. On a 4900-document reference library the docu
 - **URL and version parsing via real crates.** `url::Url::parse` (RFC 3986) replaces `starts_with("http://")`. `semver::Version::parse` replaces manual digit splitting.
 - **Block-family dispatch.** The extraction loop dispatches extractors by block kind instead of running all 14 on every line. CodeBlock → identifiers + env vars + config keys; EndpointBlock → full HTTP surface; Table → endpoints + config + params; Prose → URLs + versions + error codes.
 - **Parser-derived confidence.** Confidence now derived from the parser that produced the fact (AST node → 0.98, structural parse → 0.97, keyword heuristic → 0.94) instead of hardcoded values per block kind.
-- **Typed QuestionIntent.** `QuestionIntent` enum with 10 intents (Endpoint, Parameter, HttpMethod, Version, ErrorCode, EnvVar, ConfigKey, Protocol, BasePrefix, Port) and a canonical bilingual keyword table. Replaces scattered `contains()` chains across 4 files.
+- **Typed QuestionIntent.** `QuestionIntent` enum with 10 intents (Endpoint, Parameter, HttpMethod, Version, ErrorCode, EnvVar, ConfigKey, Protocol, BasePrefix, Port) and a structured bilingual keyword table. Replaces scattered `contains()` chains across 4 files.
 - **Fact-grounded deterministic answers.** Endpoint and parameter answers now require matching technical facts in the evidence store, not substring parsing of chunk text.
 - **Branded identifier heuristics removed.** Heading phrase matching and catalog link guessing deleted from the pipeline — entity extraction is the LLM's job, not the fact store's.
 
@@ -796,7 +988,7 @@ Large-library performance release. On a 4900-document reference library the docu
 ### AI catalog bootstrap
 
 - **Pre-seeded model presets for all providers.** `seed_all_provider_presets` runs at bootstrap and creates presets for OpenAI, DeepSeek, Qwen, and Ollama (4 purposes × 4 providers = 16 presets) regardless of whether API keys are configured. Operators can immediately assign bindings after adding a credential — no manual preset creation required.
-- **Preset lookup fix.** `select_runtime_preset` no longer falls back to a single-model match when the canonical name doesn't match. The old behavior returned the wrong preset when two purposes (e.g. ExtractGraph + QueryAnswer) shared the same model (qwen3:0.6b), preventing the second preset from being created.
+- **Preset lookup fix.** `select_runtime_preset` no longer falls back to a single-model match when the expected preset name doesn't match. The old behavior returned the wrong preset when two purposes (e.g. ExtractGraph + QueryAnswer) shared the same model (qwen3:0.6b), preventing the second preset from being created.
 
 ### Code quality
 
@@ -821,7 +1013,7 @@ Large-library performance release. On a 4900-document reference library the docu
 ### Diff-aware reuse correctness & graph fail-fast
 
 - **Diff-reuse no longer poisons the new revision's lifecycle**. `materialize_revision_graph_candidates` synthesizes a `runtime_graph_extraction` record for every chunk whose text checksum matches the parent revision, but used to clone `raw_output_json` verbatim — including the parent revision's `lifecycle.revision_id`. The downstream `reconcile_revision_graph` filter then dropped every reused record because `extraction_lifecycle.revision_id != Some(current_revision_id)`, leaving the merge with **0 records → 0 nodes → 0 edges** even though all 100 chunks looked "ready" in the table. Fix: rewrite `raw_output_json.lifecycle.revision_id` to the current revision before persisting the synthetic record. Triggered for any retry/edit on a CSV-style document where every row is structurally identical.
-- **Fail-fast graph pipeline**. `run_inline_post_chunk_pipeline` used to swallow a "0 contributions" reconcile by recording `extract_graph` as `completed` with `graphReady=false` and degrading to `graph_state='processing'`, leaving the document permanently stuck in a misleading half-state with no error visible. The pipeline now returns `ApiError` whenever `materialize` errors, `reconcile` errors, or `graph_ready` is false; the ingest job is marked `failed` and the revision's `graph_state='failed'`. Single canonical path — no `degradedToReadable` shim.
+- **Fail-fast graph pipeline**. `run_inline_post_chunk_pipeline` used to swallow a "0 contributions" reconcile by recording `extract_graph` as `completed` with `graphReady=false` and degrading to `graph_state='processing'`, leaving the document permanently stuck in a misleading half-state with no error visible. The pipeline now returns `ApiError` whenever `materialize` errors, `reconcile` errors, or `graph_ready` is false; the ingest job is marked `failed` and the revision's `graph_state='failed'`. Single unified path — no `degradedToReadable` shim.
 - **Honest stage timings**. The "embed_chunk" stage used to fire a fake "deferred" `started`/`completed` pair before `materialize` even ran, then re-emit `completed` after reconcile finished, which made `merge_stages` report the full wall clock (~19.6 s) for both `Extract Graph` AND `Embed Chunk`. The pipeline now uses two independent timers: `extract_elapsed_ms` covers only the LLM materialization phase, `embed_elapsed_ms` covers only the reconcile phase, and the `embed_chunk` stage event is emitted **only** when `embedding_usage` is actually present (no no-op fallback row).
 - **Single source of truth for `Extract Graph` model name**. `materialize_revision_graph_candidates` now reads `provider_kind` and `model_name` directly from the active extract-graph binding (`graph_runtime_context.provider_profile.indexing`), so the pipeline event always carries the binding model — even when 100 % of chunks are reused and the per-chunk LLM call never ran. Removed the `provider_kind` / `model_name` fields from `ChunkExtractAggregate` since they were dead code under the new scheme.
 
@@ -837,7 +1029,7 @@ Large-library performance release. On a 4900-document reference library the docu
 
 - **Parallel per-chunk graph merge**. `reconcile_revision_graph` used to walk `latest_records_by_chunk` sequentially, paying ~130 sequential DB round-trips per chunk × N chunks per doc — pinning all 4 tokio runtime worker threads at 100 % CPU and starving the heartbeat / dispatcher / cancel-poll tasks. Wrapped the chunk loop in `stream::iter().buffer_unordered(8)` with `Arc`-shared pool / quality_guard / document / merge_scope captures, and consume `latest_records_by_chunk.into_values()` so `record.normalized_output_json` is `mem::take`'d straight into the deserializer (no per-chunk deep clone of `serde_json::Value`). Empirically reproduced on prod data: worker CPU dropped from **502 % → 7 %** (62× less starvation), tokio threads moved from `state=R` (running) to `state=S` (sleeping on futex), pipeline throughput unblocked.
 - **Bulk `runtime_graph_evidence` insert**. New `bulk_create_runtime_graph_evidence_for_chunk` repository function batches every per-chunk evidence row (typically 50+ for 10 entities + 10 relations) into a single `INSERT ... SELECT FROM unnest(...)` round-trip. `merge_chunk_graph_candidates` collects `GraphEvidenceTarget`s into a `Vec` during the per-entity / per-relation walk and flushes once at the end. Replaces ~50 sequential single-row INSERTs per chunk with one bulk insert.
-- **TLS `close_notify` retry coverage**. The transport retry classifier was missing the rustls "peer dropped TLS session mid-response" pattern. Production worker would see `error decoding response body: ... peer closed connection without sending TLS close_notify` from the LLM provider, fail to recognize it as retryable, and surface `extract_graph` as failed after ~51 s at the outer recovery layer. Added `peer closed connection` and `close_notify` to `is_retryable_transport_error_text` so these cases now go through the canonical `[1, 3, 10, 30, 90]` s schedule.
+- **TLS `close_notify` retry coverage**. The transport retry classifier was missing the rustls "peer dropped TLS session mid-response" pattern. Production worker would see `error decoding response body: ... peer closed connection without sending TLS close_notify` from the LLM provider, fail to recognize it as retryable, and surface `extract_graph` as failed after ~51 s at the outer recovery layer. Added `peer closed connection` and `close_notify` to `is_retryable_transport_error_text` so these cases now go through the standard `[1, 3, 10, 30, 90]` s schedule.
 
 ### Dashboard / documents page consolidation
 
@@ -870,7 +1062,7 @@ Large-library performance release. On a 4900-document reference library the docu
 
 ### Worker memory footprint
 
-- Vision LLM image bytes moved instead of cloned (`describe_extracted_images` takes `Vec<ExtractedImage>` by value, drops each image after its call). `extraction_plan` is moved into `CanonicalExtractedContent` instead of deep-cloned. Per-chunk graph-extract uses `Arc<…>` for shared state and `try_fold` instead of `buffer_unordered + try_collect` so nothing accumulates across a document's chunk stream.
+- Vision LLM image bytes moved instead of cloned (`describe_extracted_images` takes `Vec<ExtractedImage>` by value, drops each image after its call). `extraction_plan` is moved into the primary extracted-content aggregate instead of deep-cloned. Per-chunk graph-extract uses `Arc<…>` for shared state and `try_fold` instead of `buffer_unordered + try_collect` so nothing accumulates across a document's chunk stream.
 - PDF extractor parses the `lopdf::Document` once (was twice), `drop`s it before vision phase, and caps images at 30 / 150 MB per doc. HTML extractor truncates the decoded source to 4 MB at a tag boundary before `scraper::Html::parse_document` so pathological Confluence exports can't blow the `html5ever` arena. Both paths warn but never reject a document.
 - Noisy third-party `tracing` crates (`scraper`, `html5ever`, `selectors`, `hyper`, `h2`, `reqwest`, `rustls`, `sqlx`, `mio`, `tower`, `tonic`, `tungstenite`) are clamped to `warn` in `telemetry::init` regardless of `IRONRAG_LOG_FILTER`, so `debug` no longer amplifies HTML parse events into gigabytes of log allocation.
 - `build_chunk_reuse_plan` stores `Arc<RuntimeGraphExtractionRecordRow>` in all three HashMaps so the diff-reuse path refcount-bumps instead of deep-cloning `raw_output_json` + `normalized_output_json` three times per doc.
@@ -888,7 +1080,7 @@ Large-library performance release. On a 4900-document reference library the docu
 
 ### Document status taxonomy (UI)
 
-- Canonical `DocumentStatus` with strict priority: `canceled` → `failed` → `ready` → `blocked` / `retrying` / `stalled` → `processing` → `queued`. Timer only ticks for in-flight states. `documentStatusSortRank` + `Finished` column give operators proper severity sort and completion time.
+- `DocumentStatus` with strict priority: `canceled` → `failed` → `ready` → `blocked` / `retrying` / `stalled` → `processing` → `queued`. Timer only ticks for in-flight states. `documentStatusSortRank` + `Finished` column give operators proper severity sort and completion time.
 - Filter pills rebuilt around four buckets: **All | In Progress | Needs Attention | Ready | Failed**. Retry toasts surface real outcomes with accurate skipped / failed counts; documents that no longer exist come back as `skipped` instead of `failed`. `queue_state='completed'` + `readiness='processing'` zombies are reclassified as `failed` with an explicit reason.
 - Inspector cleanup: dropped the legacy "Re-ingest from URL" button, summary truncated to 280 chars with a "Show full" toggle, `source_uri` shown for `web_page` docs instead of the `viewpage.action` basename.
 
@@ -901,7 +1093,7 @@ Large-library performance release. On a 4900-document reference library the docu
 - Fixed web snapshot persistence for long percent-encoded page and attachment URLs.
 - Fixed graph edge rendering during zoom and selection so focused neighbors stay visible above unrelated nodes.
 - Fixed web-ingested documents to render as `Web page` instead of leaking raw source/file extensions into the type column.
-- Added canonical token minting for an explicit target workspace plus multi-library grants in one token, fixed library-scoped discovery so tokens only enumerate selected libraries, and closed the workspace-scoped `iam_admin` auth bypass.
+- Added standard token minting for an explicit target workspace plus multi-library grants in one token, fixed library-scoped discovery so tokens only enumerate selected libraries, and closed the workspace-scoped `iam_admin` auth bypass.
 - Hid unfinished connector-admin permissions from user-facing token issuance surfaces while keeping connector support on the backend roadmap.
 
 ## 0.2.0 — 2026-04-12
@@ -910,22 +1102,22 @@ Large-library performance release. On a 4900-document reference library the docu
 
 - Rebranded the shipped product from `RustRAG` to `IronRAG` across env vars, packages, images, charts, OpenAPI, and release-facing docs.
 - Added a full-screen document editor for text, `docx`, and `xlsx` uploads with table-aware markdown editing and automatic reprocessing after save.
-- Unified `xlsx`, `docx`, `pdf`, and `csv` table handling on one canonical extraction path with grounded row and column-summary semantics.
-- Added a full document lifecycle inspector with per-stage duration, model/provider identity, token usage, and cost from the canonical billing path.
-- Rebuilt the in-app assistant on one canonical MCP-tool agent loop and added a DeepSeek bootstrap preset for first-run provider setup.
+- Unified `xlsx`, `docx`, `pdf`, and `csv` table handling on one shared extraction path with grounded row and column-summary semantics.
+- Added a full document lifecycle inspector with per-stage duration, model/provider identity, token usage, and cost from the primary billing path.
+- Rebuilt the in-app assistant on one unified MCP-tool agent loop and added a DeepSeek bootstrap preset for first-run provider setup.
 - Added diff-aware ingest reuse so unchanged chunks can skip repeated graph extraction on document replacement and edit flows.
 
 ### Breaking Changes
 
-- **Schema reset**: the database baseline was consolidated to one canonical `0001_init.sql`; legacy execution and accounting paths were removed.
-- **Assistant/MCP cutover**: the standalone `ask` shortcut and parallel special-case assistant flow were removed; assistant Q&A now runs only through the canonical MCP tool loop.
+- **Schema reset**: the database baseline was consolidated to one `0001_init.sql` migration; legacy execution and accounting paths were removed.
+- **Assistant/MCP cutover**: the standalone `ask` shortcut and parallel special-case assistant flow were removed; assistant Q&A now runs only through the unified MCP tool loop.
 - **IRONRAG rename**: release-facing configuration now uses `IRONRAG`** naming instead of `RUSTRAG`**.
 
 ### Platform
 
-- Billing and pipeline cost rollups now come from one canonical source of truth, including vision and embedding calls.
+- Billing and pipeline cost rollups now come from one primary source of truth, including vision and embedding calls.
 - System-level IAM grants now authorize correctly across workspaces, libraries, and documents.
-- Document delete and revision-head writes were hardened so canonical Postgres state can commit cleanly even when read-model cleanup degrades to warnings.
+- Document delete and revision-head writes were hardened so primary Postgres state can commit cleanly even when read-model cleanup degrades to warnings.
 - Grounding guardrails now refuse conflicting or insufficiently supported answers instead of shipping hallucinated output.
 - Added `ironrag-cli` for users, tokens, workspaces, libraries, and scoped permission management.
 - Deployment surfaces were aligned around the split `web` / `api` / `worker` / `startup` topology for Docker and Helm.
@@ -933,7 +1125,7 @@ Large-library performance release. On a 4900-document reference library the docu
 ### Refactor
 
 - Split major backend hotspots into focused graph-store, MCP, AI catalog, ingest, graph-service, and query submodules while deleting legacy release artifacts and dead code.
-- Trimmed the MCP protocol to the canonical tool surface only: no fake resources capability, no legacy aliases, and permission-filtered `tools/list`.
+- Trimmed the MCP protocol to the declared tool surface only: no fake resources capability, no legacy aliases, and permission-filtered `tools/list`.
 - Removed silent error swallowing and cleaned up the release line to a zero-warning backend build.
 
 ### Validation
@@ -947,19 +1139,19 @@ Large-library performance release. On a 4900-document reference library the docu
 
 - **Parallel embedding batches** (`ingest/runtime.rs`): node and edge embedding now sends batches in parallel via `futures::stream::buffer_unordered`. New env var `IRONRAG_INGESTION_EMBEDDING_PARALLELISM=4` (default) controls how many embed batches run concurrently per job. For a 200-chunk document this is ~4x faster end-to-end.
 - **Per-library job isolation** (`ingest_repository::claim_next_queued_ingest_job`): SQL claim now optionally caps the number of `leased` jobs per library. New env var `IRONRAG_INGESTION_MAX_JOBS_PER_LIBRARY=0` (0 = unlimited) prevents one busy library from starving others when many docs are queued at once.
-- **Parallel web crawl fetches** (`ingest/web::discover_recursive_scope`): the BFS frontier is now drained in waves of N candidates and HTTP fetches run in parallel via `buffer_unordered`, while DB writes stay sequential per result for canonical/seen-set determinism. New env var `IRONRAG_WEB_INGEST_CRAWL_CONCURRENCY=4`.
+- **Parallel web crawl fetches** (`ingest/web::discover_recursive_scope`): the BFS frontier is now drained in waves of N candidates and HTTP fetches run in parallel via `buffer_unordered`, while DB writes stay sequential per result for stable seen-set determinism. New env var `IRONRAG_WEB_INGEST_CRAWL_CONCURRENCY=4`.
 - All three knobs are independent and tunable per deployment via env vars. Defaults are conservative (4) and tested against the local stack.
 
 ### Refactor — Bootstrap Flow Cleanup
 
-- **Removed legacy `/iam/bootstrap/claim` endpoint** entirely: route, handler, `BootstrapClaimRequest/Response`, `BootstrapClaimCommand/Outcome`, service method, OpenAPI paths and schemas, integration test, and the `bootstrap_token` / `bootstrap_claim_enabled` config fields with their `IRONRAG_BOOTSTRAP_TOKEN` env var. Single canonical bootstrap surface is now `/iam/bootstrap/setup` only.
+- **Removed legacy `/iam/bootstrap/claim` endpoint** entirely: route, handler, `BootstrapClaimRequest/Response`, `BootstrapClaimCommand/Outcome`, service method, OpenAPI paths and schemas, integration test, and the `bootstrap_token` / `bootstrap_claim_enabled` config fields with their `IRONRAG_BOOTSTRAP_TOKEN` env var. Single bootstrap surface is now `/iam/bootstrap/setup` only.
 - **Display name optional** in bootstrap setup: backend already accepted `Option<String>` and falls back to login; frontend no longer validates it as required and passes `undefined` when empty.
 - **Required field markers** in `LoginPage`: red `*` next to required labels (Admin login, Password) plus `(optional)` hint next to Display name; matching `login.optional` i18n key in en/ru locales.
 - **Cursor pointer everywhere**: added `cursor: pointer` to all `button:not(:disabled)`, `[role="button"]`, `a[href]`, `label[for]`, `summary`, `select` via `@layer base` global rule in `index.css`, plus baked into the `Button` cva so the shadcn variant gets it explicitly. Disabled controls get `cursor: not-allowed`.
 
 ### Refactor — Code Quality + Hierarchy
 
-- `**shared/` restructure**: 7 files moved into `shared/extraction/` (chunking, file_extract, structured_document, text_render, technical_facts) and `shared/web/` (ingest, url_identity). Root keeps only canonical primitives.
+- `**shared/` restructure**: 7 files moved into `shared/extraction/` (chunking, file_extract, structured_document, text_render, technical_facts) and `shared/web/` (ingest, url_identity). Root keeps only core shared primitives.
 - `**services/` restructure**: 43 flat files reorganized into 8 domain folders — `graph/`, `query/`, `content/`, `ingest/`, `mcp/`, `ops/`, `iam/`, `knowledge/`. ~80 import sites updated.
 - `**query/execution.rs` split started**: 7909-line megafile reduced to 6346 in `mod.rs` plus 5 extracted submodules — `embed`, `hyde_crag`, `technical_literals`, `verification`, `port_answer` (-20%, 1631 lines moved out).
 - *Dead `legacy`_ bootstrap flags removed**: `legacy_ui_bootstrap_enabled`, `legacy_bootstrap_token_endpoint_enabled`, `allow_legacy_startup_side_effects` deleted from config and 5 integration tests. `legacy_ui_bootstrap_admin` renamed to `ui_bootstrap_admin`.
@@ -970,7 +1162,7 @@ Large-library performance release. On a 4900-document reference library the docu
 
 ### Deploy
 
-- Added the canonical Helm chart for `web`, `api`, `worker`, and one `startup` job.
+- Added the primary Helm chart for `web`, `api`, `worker`, and one `startup` job.
 - Added `docker-compose-s4.yml` for the bundled stack with [s4core](https://github.com/s4core/s4core) and S3 storage.
 - Kept `docker-compose.yml` as the classic bundled stack with filesystem storage.
 
@@ -978,7 +1170,7 @@ Large-library performance release. On a 4900-document reference library the docu
 
 - Split runtime into `api`, `worker`, and `startup`.
 - Moved migrations and bootstrap out of serving pods into the startup authority.
-- Added the canonical storage contract: `filesystem` or S3-compatible object storage.
+- Added the standard storage contract: `filesystem` or S3-compatible object storage.
 - Added real source links for documents and grounded answers.
 - Fixed replace/delete cleanup so query-chunk references from superseded or deleted revisions are removed instead of leaving stale graph/query state behind.
 - Fixed deleted document detail responses to stop exposing stale readiness, prepared counts, and source download links after terminal deletion.
@@ -1030,7 +1222,7 @@ Large-library performance release. On a 4900-document reference library the docu
 - **Filter bar redesign**: status filter buttons now include icons (⏱ processing, ✓ ready, ⚠ sparse, ✕ failed) and count badges. Total cost moved inline into the filter bar.
 - **Web ingest status fix**: `COMPLETED_PARTIAL` now treated as terminal state, no longer triggers "in progress" banner.
 - **Graph sub-type filtering**: `hiddenSubTypes` state allows hiding individual sub-types from the graph. Sub-type badges are clickable in the legend.
-- **Node inspector**: shows sub-type below the canonical type with translated label.
+- **Node inspector**: shows sub-type below the primary type label with translated label.
 - **i18n**: added 8 new keys (showLegend, hideLegend, showAll, invert, resetFilter, subType, tabs.documents, tabs.webIngest) in both en.json and ru.json.
 
 ### Dependencies
@@ -1052,7 +1244,7 @@ Large-library performance release. On a 4900-document reference library the docu
 ### Highlights
 
 - **Universal entity taxonomy**: 10 domain-agnostic entity types (`person`, `organization`, `location`, `event`, `artifact`, `natural`, `process`, `concept`, `attribute`, `entity`) designed to work across any domain — programming, medicine, law, finance, biology, engineering, and beyond. Domain-specific granularity via `sub_type` metadata.
-- **Pipeline intelligence upgrade**: graph extraction v6 with few-shot examples, relation catalog expanded from 49 to 88 canonical types, semantic chunking (2800 chars, 10% overlap, heading-aware), boilerplate detection, quality scoring, entity resolution, document summaries, and post-extraction type refinement.
+- **Pipeline intelligence upgrade**: graph extraction v6 with few-shot examples, relation catalog expanded from 49 to 88 standard relation types, semantic chunking (2800 chars, 10% overlap, heading-aware), boilerplate detection, quality scoring, entity resolution, document summaries, and post-extraction type refinement.
 - **Hybrid search**: BM25 + vector cosine similarity merged via Reciprocal Rank Fusion (RRF) with field-weighted scoring (heading boost 1.5x, quality score multiplier).
 - **21 MCP tools**: added `ask` (grounded Q&A), `search_entities`, `get_graph_topology`, `list_relations`, `list_documents`, `delete_document`. Token-efficient responses with `includeReferences=false` by default.
 - **Canvas2D graph renderer**: replaced SVG with Canvas2D for rendering 10K+ nodes and 50K+ edges. Zero React re-renders during pan/zoom. Viewport culling, level-of-detail labels, adaptive edge budget.
@@ -1061,7 +1253,7 @@ Large-library performance release. On a 4900-document reference library the docu
 ### Pipeline
 
 - Graph extraction prompt v6 with comprehensive entity type guidance, coreference resolution rules, and 2 few-shot examples.
-- Relation catalog expanded from 49 to 88 canonical types: `calls`, `implements`, `extends`, `authenticates`, `contains`, `returns`, `validates`, `transforms`, `deployed_on`, `inherits_from`, `imports`, and 27 more.
+- Relation catalog expanded from 49 to 88 standard relation types: `calls`, `implements`, `extends`, `authenticates`, `contains`, `returns`, `validates`, `transforms`, `deployed_on`, `inherits_from`, `imports`, and 27 more.
 - Post-extraction type refinement: regex-based pass auto-reclassifies env vars, URL paths, HTTP methods, file paths, and status codes from generic `entity` to specific types.
 - Post-extraction mentions reduction: summary-based heuristic upgrades `mentions` to `uses`, `depends_on`, `contains`, `defines`, `provides`, `authenticates`, and other specific types when the summary text implies a concrete relationship.
 - Semantic chunking: increased default from 1,600 to 2,800 chars, added 10% overlap between adjacent chunks, heading-aware splitting (headings always start new chunks).
@@ -1141,7 +1333,7 @@ Large-library performance release. On a 4900-document reference library the docu
 ### Highlights
 
 - **Full frontend rewrite**: replaced Leptos/Thaw Rust UI with React + shadcn/ui + Tailwind stack. Production-grade UI with i18n (en/ru), interactive knowledge graph, document management, AI assistant with evidence panel, and admin panel.
-- **Backend canonicalization**: eliminated all legacy `project_id` vocabulary, collapsed dual-head revision semantics, removed 63 clippy dead-code warnings, achieved green `make backend-lint` for the first time.
+- **Backend vocabulary consolidation**: eliminated all legacy `project_id` vocabulary, collapsed dual-head revision semantics, removed 63 clippy dead-code warnings, achieved green `make backend-lint` for the first time.
 - **Billing pipeline**: added cost tracking for graph extraction and query execution. Per-document and per-library cost summaries displayed in UI.
 - **Entity references in queries**: answers now include matched knowledge graph entities with labels and types.
 - **Source attribution**: segment references include document title and source URI, enabling users to trace answers back to specific documents and web pages.
@@ -1211,20 +1403,20 @@ Large-library performance release. On a 4900-document reference library the docu
 
 - Switched the default `[docker-compose.yml](./docker-compose.yml)` to published Docker Hub images so release installs no longer depend on local image builds.
 - Historical note: the legacy deployment surface `docker-compose-gitlab.yml` was removed (deleted); active compose files are now `[docker-compose.yml](./docker-compose.yml)` and `[docker-compose-local.yml](./docker-compose-local.yml)`.
-- Updated root env documentation and release docs around the canonical `docker-compose.yml` and `docker-compose-local.yml` split.
-- Tracked the canonical workspace `[Cargo.lock](./Cargo.lock)` in release artifacts so clean GitHub checkouts can build the API Docker image without missing-file failures.
-- Added the canonical `apps/api/src/agent_runtime/` subsystem with typed task contracts, staged execution, explicit policy decisions, and owner-linked runtime persistence.
-- Replaced full-library graph rebuilds during ingestion with targeted canonical graph reconciliation.
-- Reworked knowledge generation and operations read models around canonical revision readiness.
+- Updated root env documentation and release docs around the primary `docker-compose.yml` and `docker-compose-local.yml` split.
+- Tracked the repo-root `[Cargo.lock](./Cargo.lock)` in release artifacts so clean GitHub checkouts can build the API Docker image without missing-file failures.
+- Added the `apps/api/src/agent_runtime/` subsystem with typed task contracts, staged execution, explicit policy decisions, and owner-linked runtime persistence.
+- Replaced full-library graph rebuilds during ingestion with targeted graph reconciliation.
+- Reworked knowledge generation and operations read models around primary revision readiness.
 
 ### Product
 
 - Assistant execution surfaces now render runtime lifecycle, stage summaries, policy interventions, and explicit policy-rejected or policy-terminated outcomes instead of generic failures.
-- Documents, Dashboard, Graph, and auth surfaces were rebalanced around the canonical workbench layout.
+- Documents, Dashboard, Graph, and auth surfaces were rebalanced around the primary workbench layout.
 
 ### Reliability And Performance
 
-- Fixed long-running document ingestion stalls by eliminating graph-persistence races in canonical merge/write paths.
+- Fixed long-running document ingestion stalls by eliminating graph-persistence races in primary merge/write paths.
 - Restored truthful operator state reporting so idle libraries now surface `healthy` plus `graph_ready`.
 
 ## 0.0.3 - 2026-04-03
@@ -1232,8 +1424,8 @@ Large-library performance release. On a 4900-document reference library the docu
 ### Highlights
 
 - Added the full structured preparation pipeline: semantic sections, structure-aware chunks, typed technical facts, grounded graph evidence, and answer verification.
-- Added canonical URL ingestion for `single_page` and `recursive_crawl`.
-- Completed the first-run bootstrap flow with canonical provider/model bindings.
+- Added standard URL ingestion for `single_page` and `recursive_crawl`.
+- Completed the first-run bootstrap flow with primary provider/model bindings.
 
 ## 0.0.2 - 2026-03-31
 
@@ -1242,7 +1434,7 @@ Large-library performance release. On a 4900-document reference library the docu
 - Added the dedicated Assistant surface with preserved chat history, attachments, grounded context, and responsive layouts.
 - Added the Admin `MCP` section with setup snippets for Codex, Cursor, Claude Code, VS Code, and generic HTTP clients.
 - Added the grounded-query benchmark harness.
-- Added the canonical web-ingest run model.
+- Added the standard web-ingest run model.
 
 ## 0.0.1
 

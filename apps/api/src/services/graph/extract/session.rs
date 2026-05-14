@@ -18,8 +18,13 @@ use crate::{
 };
 
 use super::graph_extraction_cache_hash;
-use super::parse::{normalize_graph_extraction_output, sanitize_graph_extraction_candidate_set};
-use super::prompt::{build_graph_extraction_prompt_plan, graph_extraction_response_format};
+use super::parse::{
+    normalize_graph_extraction_output, repair_graph_extraction_candidate_set,
+    sanitize_graph_extraction_candidate_set,
+};
+use super::prompt::{
+    GRAPH_EXTRACTION_VERSION, build_graph_extraction_prompt_plan, graph_extraction_response_format,
+};
 use super::types::*;
 
 pub(crate) async fn resolve_graph_extraction_with_gateway(
@@ -37,7 +42,7 @@ pub(crate) async fn resolve_graph_extraction_with_gateway(
     if cancellation_token.is_cancelled() {
         return Err(cancelled_graph_extraction_failure(
             request,
-            "graph_extract_v8:cancelled",
+            format!("{GRAPH_EXTRACTION_VERSION}:cancelled"),
             request.chunk.content.len(),
         ));
     }
@@ -61,7 +66,7 @@ pub(crate) async fn resolve_graph_extraction_with_gateway(
         if cancellation_token.is_cancelled() {
             return Err(cancelled_graph_extraction_failure(
                 request,
-                "graph_extract_v8:cancelled",
+                format!("{GRAPH_EXTRACTION_VERSION}:cancelled"),
                 request.chunk.content.len(),
             ));
         }
@@ -483,7 +488,7 @@ pub(crate) async fn resolve_graph_extraction_with_gateway(
     }
 
     Err(GraphExtractionFailureOutcome {
-        request_shape_key: "graph_extract_v8:unknown".to_string(),
+        request_shape_key: format!("{GRAPH_EXTRACTION_VERSION}:unknown"),
         request_size_bytes: 0,
         recovery_summary: extraction_recovery.classify_outcome(
             trace.provider_attempt_count,
@@ -714,6 +719,14 @@ pub(crate) fn build_resolved_extraction_from_candidate(
     recovery_summary: ExtractionRecoverySummary,
     recovery_attempts: Vec<GraphExtractionRecoveryRecord>,
 ) -> ResolvedGraphExtraction {
+    let normalized = repair_graph_extraction_candidate_set(candidate.normalized);
+    if super::parse::graph_extraction_candidate_set_contains_encoding_damage(&normalized) {
+        tracing::error!(
+            prompt_hash = %candidate.raw.prompt_hash,
+            "graph extraction candidate retained encoding damage after repair"
+        );
+    }
+
     ResolvedGraphExtraction {
         provider_kind: provider_kind.to_string(),
         model_name: model_name.to_string(),
@@ -722,7 +735,7 @@ pub(crate) fn build_resolved_extraction_from_candidate(
         usage_json: aggregate_provider_usage_json(provider_kind, model_name, usage_samples),
         usage_calls,
         provider_failure,
-        normalized: candidate.normalized,
+        normalized,
         lifecycle: candidate.raw.lifecycle,
         recovery,
         recovery_summary,

@@ -1690,10 +1690,7 @@ export const getQueryExecutionLlmContextQueryKey = (options: Options<GetQueryExe
 
 /**
  * Returns the raw LLM request/response chain that was sent to the
- * provider for this assistant execution, if it is still in the
- * in-memory debug cache. The cache is volatile (bounded FIFO) so old
- * executions return 404 — that is by design, not an error the UI
- * should treat as fatal.
+ * provider for this assistant execution.
  */
 export const getQueryExecutionLlmContextOptions = (options: Options<GetQueryExecutionLlmContextData>) => queryOptions<GetQueryExecutionLlmContextResponse, DefaultError, GetQueryExecutionLlmContextResponse, ReturnType<typeof getQueryExecutionLlmContextQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {

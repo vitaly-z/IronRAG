@@ -199,4 +199,14 @@ describe('BindingsSection optimistic mutations', () => {
       expect.stringContaining('binding unavailable'),
     );
   });
+
+  it('renders optional bindings as a visible recommended list', async () => {
+    await renderHarness();
+
+    expect(container.querySelector('details')).toBeNull();
+    expect(container.textContent).toContain('Optional bindings');
+    expect(container.textContent).toContain('Recommended for processing PDF, image, DOCX, and PPTX files.');
+    expect(container.textContent).toContain('Text Extraction');
+    expect(container.textContent).toContain('Vision');
+  });
 });

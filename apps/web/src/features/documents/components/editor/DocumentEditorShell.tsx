@@ -29,6 +29,7 @@ type DocumentEditorShellProps = {
   onOpenChange: (open: boolean) => void;
   onSave: (markdown: string) => void | Promise<void>;
   open: boolean;
+  readOnly?: boolean;
   saving: boolean;
   sourceFormat?: string;
   t: TFunction;
@@ -52,6 +53,7 @@ export function DocumentEditorShell({
   onOpenChange,
   onSave,
   open,
+  readOnly = false,
   saving,
   sourceFormat,
   t,
@@ -70,7 +72,7 @@ export function DocumentEditorShell({
       extensions: editorExtensions,
       content: loading || rawTextEditor ? '' : markdown,
       contentType: 'markdown',
-      editable: !rawTextEditor && !loading && !saving,
+      editable: !readOnly && !rawTextEditor && !loading && !saving,
       editorProps: {
         attributes: {
           class: `document-editor-prosemirror document-editor-prosemirror--${surfaceMode} min-h-[68vh] px-5 py-5 outline-none sm:px-7 sm:py-6 lg:px-8 lg:py-7`,
@@ -90,15 +92,15 @@ export function DocumentEditorShell({
         setCurrentMarkdown(nextEditor.getMarkdown());
       },
     },
-    [loading, markdown, rawTextEditor, surfaceMode],
+    [loading, markdown, rawTextEditor, readOnly, surfaceMode],
   );
 
   useEffect(() => {
     if (!editor) {
       return;
     }
-    editor.setEditable(!rawTextEditor && !loading && !saving);
-  }, [editor, loading, rawTextEditor, saving]);
+    editor.setEditable(!readOnly && !rawTextEditor && !loading && !saving);
+  }, [editor, loading, rawTextEditor, readOnly, saving]);
 
   useEffect(() => {
     let cancelled = false;
@@ -149,10 +151,12 @@ export function DocumentEditorShell({
     return () => window.clearTimeout(focusTimer);
   }, [editor, loading, open, rawTextEditor]);
 
-  const isDirty = !loading && !saving && isEditorContentDirty(baseline, currentMarkdown);
-  const statusState = saving ? 'saving' : error ? 'error' : isDirty ? 'dirty' : 'clean';
+  const isDirty = !readOnly && !loading && !saving && isEditorContentDirty(baseline, currentMarkdown);
+  const statusState = readOnly ? 'readOnly' : saving ? 'saving' : error ? 'error' : isDirty ? 'dirty' : 'clean';
   const statusLabel = (() => {
     switch (statusState) {
+      case 'readOnly':
+        return t('documents.editor.readOnly');
       case 'saving':
         return t('documents.editor.saving');
       case 'error':
@@ -181,6 +185,9 @@ export function DocumentEditorShell({
   };
 
   const handleSave = () => {
+    if (readOnly) {
+      return;
+    }
     if (rawTextEditor) {
       void onSave(currentMarkdown);
       return;
@@ -193,21 +200,27 @@ export function DocumentEditorShell({
 
   const actions = (
     <div className="flex w-full justify-end">
-      <div className="flex flex-col-reverse gap-2 sm:flex-row">
-        <Button variant="outline" onClick={handleRequestClose} disabled={saving}>
-          {t('documents.cancel')}
+      {readOnly ? (
+        <Button variant="outline" onClick={handleRequestClose}>
+          {t('common.close')}
         </Button>
-        <Button onClick={handleSave} disabled={loading || saving || !editor || Boolean(error && !currentMarkdown)}>
-          {saving ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              {t('documents.editor.saving')}
-            </>
-          ) : (
-            t('documents.editor.save')
-          )}
-        </Button>
-      </div>
+      ) : (
+        <div className="flex flex-col-reverse gap-2 sm:flex-row">
+          <Button variant="outline" onClick={handleRequestClose} disabled={saving}>
+            {t('documents.cancel')}
+          </Button>
+          <Button onClick={handleSave} disabled={loading || saving || !editor || Boolean(error && !currentMarkdown)}>
+            {saving ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                {t('documents.editor.saving')}
+              </>
+            ) : (
+              t('documents.editor.save')
+            )}
+          </Button>
+        </div>
+      )}
     </div>
   );
 
@@ -215,7 +228,7 @@ export function DocumentEditorShell({
     <DocumentEditorOverlay
       actions={actions}
       description={`${documentName}${sourceFormat ? ` · ${sourceFormat.toUpperCase()}` : ''}`}
-      helperText={t('documents.editor.description')}
+      helperText={readOnly ? t('documents.editor.viewerDescription') : t('documents.editor.description')}
       onOpenChange={(nextOpen) => {
         if (nextOpen) {
           onOpenChange(true);
@@ -224,23 +237,40 @@ export function DocumentEditorShell({
         handleRequestClose();
       }}
       open={open}
-      title={t('documents.editor.title')}
+      title={readOnly ? t('documents.editor.viewerTitle') : t('documents.editor.title')}
     >
       <div className="flex min-h-0 flex-1 flex-col bg-[radial-gradient(circle_at_top,hsl(var(--primary)/0.06),transparent_28%),linear-gradient(180deg,hsl(var(--surface-sunken)/0.42),hsl(var(--background)))]">
-        <div className="border-b bg-background/90 px-4 py-4 backdrop-blur supports-[backdrop-filter]:bg-background/88 sm:px-6 sm:py-5">
-          <div className="mx-auto w-full max-w-[94rem]">
-            <DocumentEditorToolbar
-              editor={editor}
-              isDirty={isDirty}
-              saving={saving}
-              sourceFormat={sourceFormat}
-              statusLabel={statusLabel}
-              statusTone={statusTone}
-              surfaceMode={surfaceMode}
-              t={t}
-            />
+        {readOnly ? (
+          <div className="border-b bg-background/90 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/88 sm:px-6">
+            <div className="mx-auto flex w-full max-w-[94rem] items-center justify-between gap-3">
+              <span className="rounded-full border border-border/80 bg-muted/70 px-2.5 py-1 text-xs font-semibold text-muted-foreground">
+                {statusLabel}
+              </span>
+              <span className="truncate text-xs font-medium text-muted-foreground">
+                {surfaceMode === 'prose'
+                  ? t('documents.editor.proseMode')
+                  : surfaceMode === 'table'
+                    ? t('documents.editor.tableMode')
+                    : t('documents.editor.codeMode')}
+              </span>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="border-b bg-background/90 px-4 py-4 backdrop-blur supports-[backdrop-filter]:bg-background/88 sm:px-6 sm:py-5">
+            <div className="mx-auto w-full max-w-[94rem]">
+              <DocumentEditorToolbar
+                editor={editor}
+                isDirty={isDirty}
+                saving={saving}
+                sourceFormat={sourceFormat}
+                statusLabel={statusLabel}
+                statusTone={statusTone}
+                surfaceMode={surfaceMode}
+                t={t}
+              />
+            </div>
+          </div>
+        )}
 
         <div aria-live="polite" className="sr-only">
           {error ?? ''}
@@ -254,6 +284,7 @@ export function DocumentEditorShell({
           loading={loading}
           onRawTextChange={setCurrentMarkdown}
           rawTextEditor={rawTextEditor}
+          readOnly={readOnly}
           saving={saving}
           sourceFormat={sourceFormat}
           statusLabel={statusLabel}

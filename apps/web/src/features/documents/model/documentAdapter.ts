@@ -1,6 +1,9 @@
 import type { TFunction } from 'i18next';
 
-import { humanizeDocumentStage } from '@/shared/lib/document-processing';
+import {
+  humanizeDocumentFailure,
+  humanizeDocumentStage,
+} from '@/shared/lib/document-processing';
 import { mapSourceAccess } from '@/shared/lib/source-access';
 import type { DocumentListItem } from '@/shared/api/documents';
 import type { DocumentItem, DocumentStatus } from '@/shared/types';
@@ -64,6 +67,14 @@ function deriveExtension(fileName: string, mimeType?: string | null): string {
   return 'file';
 }
 
+function normalizeProgressPercent(value: number | null | undefined): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return undefined;
+  }
+
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
 /**
  * Canonical list-row mapper. The backend list endpoint already emits
  * `DocumentListItem` with server-derived `status` / `readiness` / `stage`,
@@ -81,6 +92,20 @@ export function mapListItem(raw: DocumentListItem, t: TFunction): DocumentItem {
   // `$0.000` for `0` and `—` for `null`, matching the prior UI.
   const costValue = parseFloat(raw.cost);
   const cost = Number.isFinite(costValue) ? costValue : null;
+  const progressPercent = normalizeProgressPercent(raw.progressPercent);
+  const failureCode = raw.failureCode ?? undefined;
+  const failureMessage = raw.failureMessage?.trim() || undefined;
+  const statusReason =
+    raw.status === 'failed'
+      ? humanizeDocumentFailure(
+          {
+            failureCode,
+            stalledReason: failureMessage,
+            stage: raw.stage,
+          },
+          t,
+        )
+      : undefined;
 
   return {
     id: raw.id,
@@ -92,8 +117,12 @@ export function mapListItem(raw: DocumentListItem, t: TFunction): DocumentItem {
     status: raw.status,
     readiness: raw.readiness,
     stage: humanizeDocumentStage(raw.stage, t),
+    progressPercent,
     processingStartedAt: raw.processingStartedAt,
     processingFinishedAt: raw.processingFinishedAt,
+    failureCode,
+    failureMessage,
+    statusReason,
     canRetry: raw.retryable,
     sourceKind: raw.sourceKind,
     sourceUri: raw.sourceUri,

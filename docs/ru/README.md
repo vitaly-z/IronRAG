@@ -29,7 +29,7 @@ flowchart TD
   Upload["Загрузка (UI / API / MCP / web-crawl)"]:::entry
   Detect{"file kind + recognition policy"}:::decision
   Native["native parsers<br/>text / md / html / code / xls"]:::worker
-  Docling["Docling CPU<br/>PDF / DOCX / PPTX / OCR"]:::worker
+  Docling["Docling CPU<br/>PDF checkpoints / DOCX / PPTX / OCR"]:::worker
   Vision["vision binding<br/>альтернативный raster OCR"]:::worker
   MissingVision["fail loud — нет vision binding"]:::fail
   Chunk["chunk_content + structured blocks"]:::worker
@@ -62,7 +62,19 @@ Recognition policy задаётся per-library
 `{"rasterImageEngine":"docling"}` или `{"rasterImageEngine":"vision"}`).
 Новые библиотеки наследуют
 `IRONRAG_RECOGNITION_DEFAULT_RASTER_IMAGE_ENGINE=docling`. Отсутствие
-vision binding падает явно — silent fallback запрещён.
+vision binding падает явно, когда policy выбирает `vision`; silent provider
+fallback запрещён.
+
+Stored PDFs restart-safe: завершённые Docling page ranges сохраняются как
+ingest units и переиспользуются после worker restart, backend restart, lease
+recovery или краткого сетевого обрыва. Chunk embeddings и graph-extraction
+outputs также переиспользуются по устойчивым checksums при resume job.
+
+Assistant turns тоже durable: UI streaming передаёт activity для того же
+persisted query execution, а browser/proxy transport drop после старта работы
+восстанавливается чтением завершённого session result без повторной отправки
+prompt. LLM debug snapshots сохраняются per execution, поэтому provider context
+остаётся доступен после reload и cached replay.
 
 ## Grounded-запрос в одном кадре
 
@@ -101,7 +113,7 @@ runtime войдёт в состояние «retrieval сломан».
 
 | Хранилище | Роль |
 |---|---|
-| **PostgreSQL** | Catalog (workspaces, libraries, documents, revisions), AI catalog (providers, models, presets, prices), bindings, IAM, sessions, query executions, billing. Источник правды для всего, кроме самого графа знаний. |
+| **PostgreSQL** | Catalog (workspaces, libraries, documents, revisions), durable ingest units, AI catalog (providers, models, presets, prices), bindings, IAM, sessions, query executions, billing. Источник правды для всего, кроме самого графа знаний. |
 | **ArangoDB** | Knowledge graph (nodes, edges, evidence), document store, chunk vectors (3072-dim cosine), structured-block search, technical-fact индекс. |
 | **Redis** | Graph topology cache, IR cache, answer-context cache, координация prewarm. |
 | **Filesystem / S3** | Source-document блобы (конфигурируется; включённый `s4core` даёт встроенный S3-совместимый blob-store). |
@@ -109,7 +121,7 @@ runtime войдёт в состояние «retrieval сломан».
 ## Multi-provider router
 
 Binding выбирает пару `(provider_credential, model_preset)` для каждой
-канонической purpose-цели пайплайна (`extract_text`, `extract_graph`,
+purpose-цели пайплайна (`extract_text`, `extract_graph`,
 `embed_chunk`, `query_compile`, `query_retrieve`, `query_answer`,
 `vision`). Каталог содержит семь профилей провайдеров — OpenAI,
 DeepSeek, Qwen / DashScope-intl, GPTunnel, OpenRouter, RouterAI и
@@ -130,10 +142,10 @@ Scopes резолвятся library → workspace → instance, поэтому w
 ### MCP-клиенты
 
 MCP-сервер транспорт-агностичен. Документированные интеграции:
-Claude Desktop, Claude Code, Cursor, VS Code (Continue / Cline / Roo),
-Zed, Hermes / Lobe-style chat-агенты, локальный `grounded_answer`
-через IronRAG CLI. Scope токена ограничивает набор инструментов;
-см. [IAM.md](./IAM.md).
+Claude Desktop, Claude Code, Cursor, Codex, VS Code (Continue / Cline /
+Roo), Zed, OpenClaw, Hermes, Lobe-style chat-агенты, локальный
+`grounded_answer` через IronRAG CLI. Scope токена ограничивает набор
+инструментов; см. [IAM.md](./IAM.md).
 
 См. [../../README.md](../../README.md) для оператор-ориентированного
 резюме и [PIPELINE.md](./PIPELINE.md) — для контракта purpose'ов.

@@ -37,6 +37,7 @@ const VECTOR_OVER_FETCH_DEFAULT_FLOOR: usize = 64;
 /// post-filter that can hold an Arango worker thread for seconds. 8 192
 /// keeps a 256 GB Arango heap-budget headroom even on the temporal lane.
 const VECTOR_OVER_FETCH_MAX: usize = 8_192;
+const KNOWLEDGE_CHUNK_VECTOR_UPSERT_BATCH_ROWS: usize = 8;
 
 // TODO(IRONRAG-001): extract the duplicated `FILTER (@temporal_start_iso ==
 // null AND @temporal_end_iso == null) OR (X.occurred_at != null AND ...)`
@@ -272,20 +273,27 @@ impl ArangoSearchStore {
     }
 
     /// Bulk UPSERT of chunk vector rows. One AQL round-trip replaces N
-    /// sequential `upsert_chunk_vector` calls — on a typical embed
-    /// batch (16 vectors) this collapses 16 serial `UPSERT .. IN ..
-    /// RETURN NEW` round-trips into one, cutting the Arango I/O tail
-    /// on the chunk embed stage from O(chunks × RTT) to O(chunks /
-    /// batch_size × RTT). Payload per request is roughly
-    /// `len × dimensions × 4 bytes` plus metadata — 16 × 3072 × 4 =
-    /// ~192 KB, comfortably inside the default Arango request size.
+    /// sequential `upsert_chunk_vector` calls. The write path intentionally
+    /// does not `RETURN NEW`: callers only need the write to succeed, and
+    /// returning full embedding arrays makes large-document ingest spend most
+    /// of its time serializing vectors back over HTTP.
     pub async fn upsert_chunk_vectors_bulk(
         &self,
         rows: &[KnowledgeChunkVectorRow],
-    ) -> anyhow::Result<Vec<KnowledgeChunkVectorRow>> {
+    ) -> anyhow::Result<()> {
         if rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
+        for batch in rows.chunks(KNOWLEDGE_CHUNK_VECTOR_UPSERT_BATCH_ROWS) {
+            self.upsert_chunk_vectors_batch(batch).await?;
+        }
+        Ok(())
+    }
+
+    async fn upsert_chunk_vectors_batch(
+        &self,
+        rows: &[KnowledgeChunkVectorRow],
+    ) -> anyhow::Result<()> {
         // Note on field names: `KnowledgeChunkVectorRow` serialises its
         // key column as `_key` (serde rename) to match Arango's
         // canonical document-key field. That means inside the AQL body
@@ -295,7 +303,7 @@ impl ArangoSearchStore {
         // `row.key` and collapsed every bulk embed batch on prod.
         let cursor = self
             .client
-            .query_json(
+            .query_json_bulk(
                 "FOR row IN @rows
                  UPSERT { _key: row._key }
                  INSERT {
@@ -327,8 +335,7 @@ impl ArangoSearchStore {
                     occurred_at: row.occurred_at,
                     occurred_until: row.occurred_until
                  }
-                 IN @@collection
-                 RETURN NEW",
+                 IN @@collection",
                 serde_json::json!({
                     "@collection": KNOWLEDGE_CHUNK_VECTOR_COLLECTION,
                     "rows": rows,
@@ -336,7 +343,12 @@ impl ArangoSearchStore {
             )
             .await
             .context("failed to bulk-upsert knowledge chunk vectors")?;
-        decode_many_results(cursor)
+        let row_count =
+            cursor.get("result").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+        if row_count != 0 {
+            return Err(anyhow!("chunk vector bulk upsert returned unexpected rows"));
+        }
+        Ok(())
     }
 
     pub async fn delete_chunk_vector(

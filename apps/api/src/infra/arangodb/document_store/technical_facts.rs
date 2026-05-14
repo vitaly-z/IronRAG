@@ -1,7 +1,10 @@
 use anyhow::Context;
 use uuid::Uuid;
 
-use super::{ArangoDocumentStore, KnowledgeTechnicalFactRow, decode::decode_many_results};
+use super::{
+    ArangoDocumentStore, KnowledgeTechnicalFactRow,
+    decode::{decode_many_results, decode_single_result},
+};
 use crate::infra::arangodb::collections::KNOWLEDGE_TECHNICAL_FACT_COLLECTION;
 
 impl ArangoDocumentStore {
@@ -77,6 +80,27 @@ impl ArangoDocumentStore {
             .await
             .context("failed to list technical facts by revision")?;
         decode_many_results(cursor)
+    }
+
+    pub async fn count_technical_facts_by_revision(
+        &self,
+        revision_id: Uuid,
+    ) -> anyhow::Result<i64> {
+        let cursor = self
+            .client
+            .query_json(
+                "FOR fact IN @@collection
+                 FILTER fact.revision_id == @revision_id
+                 COLLECT WITH COUNT INTO count
+                 RETURN count",
+                serde_json::json!({
+                    "@collection": KNOWLEDGE_TECHNICAL_FACT_COLLECTION,
+                    "revision_id": revision_id,
+                }),
+            )
+            .await
+            .context("failed to count technical facts by revision")?;
+        decode_single_result(cursor)
     }
 
     pub async fn list_technical_facts_by_ids(

@@ -48,6 +48,8 @@ spec:
               value: worker
             - name: IRONRAG_SERVICE_NAME
               value: ironrag-worker
+            - name: OTEL_SERVICE_NAME
+              value: ironrag-worker
           readinessProbe:
             httpGet:
               path: /v1/ready

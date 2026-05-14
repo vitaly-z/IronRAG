@@ -60,3 +60,16 @@ python3 apps/api/benchmarks/grounded_query/compare_benchmarks.py old.json new.js
 - latency и evidence metadata для каждого кейса.
 
 Цель — не только pass/fail. Вывод должен показывать, упало ли качество на retrieval, answer assembly, evidence selection или verification.
+
+## Large-document ingest smoke
+
+Крупные private ingest corpora не хранятся в публичной репе. При изменениях в
+Docling, chunking, embedding, graph extraction или worker leases прогоняй
+private large-document smoke и публикуй только sanitized evidence:
+
+- все файлы дошли до `ready`;
+- resumed jobs переиспользовали завершённые PDF page-range units;
+- graph topology после finalization не пустой;
+- encoding scanners не нашли mojibake в persisted graph labels или page units;
+- document UI показал stage progress, model, duration, calls и cost;
+- публичный `make check` прошёл.

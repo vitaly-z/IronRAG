@@ -544,6 +544,7 @@ async fn canonical_ingest_attempts_preserve_queue_state_retry_and_stage_ordering
                     current_stage: Some("extracting".to_string()),
                     failure_class: Some("lease_lost".to_string()),
                     failure_code: Some("lease_lost".to_string()),
+                    failure_message: Some("lease lost during extraction".to_string()),
                     retryable: true,
                 },
             )
@@ -619,6 +620,7 @@ async fn canonical_ingest_attempts_preserve_queue_state_retry_and_stage_ordering
                     current_stage: Some("finalizing".to_string()),
                     failure_class: None,
                     failure_code: None,
+                    failure_message: None,
                     retryable: false,
                 },
             )

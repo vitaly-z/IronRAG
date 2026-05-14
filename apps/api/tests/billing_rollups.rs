@@ -329,6 +329,7 @@ async fn canonical_billing_rollups_cover_query_and_ingest_executions() -> Result
                     binding_id: None,
                     provider_kind: "openai".to_string(),
                     model_name: "gpt-5.4".to_string(),
+                    call_kind: "query_answer".to_string(),
                     usage_json: serde_json::json!({
                         "prompt_tokens": 4000,
                         "completion_tokens": 1000,

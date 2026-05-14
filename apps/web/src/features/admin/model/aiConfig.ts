@@ -57,6 +57,9 @@ export type AiReadinessSummary = {
   executableEffectiveBindings: number;
   localBindingCount: number;
   missingPurposes: AIPurpose[];
+  /** Optional bindings that are not configured — the system falls back
+   *  to local CPU processing (lower quality / higher latency). */
+  missingOptionalPurposes: AIPurpose[];
   availableCredentialCount: number;
   activeCredentialCount: number;
   localCredentialCount: number;
@@ -101,6 +104,9 @@ export const REQUIRED_RUNTIME_PURPOSE_ORDER: AIPurpose[] = [
   'query_answer',
   'agent',
 ];
+
+/** Optional bindings — system degrades to local CPU when missing. */
+export const OPTIONAL_PURPOSES: AIPurpose[] = ['extract_text', 'vision'];
 
 export function purposeLabel(value: AIPurpose, t: TFunction) {
   return t(`admin.aiPanel.purposeLabels.${value}`);
@@ -352,11 +358,34 @@ export function summarizeAiReadiness({
     }
   }
   const configuredProviderIds = new Set(availableCredentials.map(entry => entry.providerId));
+
+  // Optional bindings — check separately from required runtime purposes.
+  const missingOptionalPurposes = OPTIONAL_PURPOSES.filter(purpose => {
+    const resolution = resolveBindingForPurpose({
+      purpose,
+      selectedScope,
+      bindingsForScope,
+      instanceBindings,
+      workspaceBindings,
+    });
+    const binding = resolution.effectiveBinding;
+    if (!binding || binding.state !== 'configured') return true;
+    const preset = presetById.get(binding.presetId);
+    return !canUsePresetWithCredential({
+      purpose,
+      credential: credentialById.get(binding.credentialId),
+      preset,
+      model: preset ? modelById.get(preset.modelCatalogId) : undefined,
+      modelsByCredentialId: {},
+    });
+  });
+
   return {
     totalPurposes: REQUIRED_RUNTIME_PURPOSE_ORDER.length,
     executableEffectiveBindings: executablePurposeIds.size,
     localBindingCount: bindingsForScope.length,
     missingPurposes: REQUIRED_RUNTIME_PURPOSE_ORDER.filter(purpose => !executablePurposeIds.has(purpose)),
+    missingOptionalPurposes,
     availableCredentialCount: availableCredentials.length,
     activeCredentialCount: availableCredentials.filter(entry => entry.state === 'active').length,
     localCredentialCount: localCredentials.length,

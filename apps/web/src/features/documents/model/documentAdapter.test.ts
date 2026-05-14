@@ -114,6 +114,8 @@ describe('mapListItem', () => {
       stage: 'finalizing',
       retryable: false,
       sourceKind: 'upload',
+      cost: '0',
+      costCurrencyCode: 'USD',
       ...overrides,
     };
   }
@@ -191,8 +193,39 @@ describe('mapListItem', () => {
     expect(doc.canRetry).toBe(true);
   });
 
-  it('defaults cost to null — cost is joined in at the page level from the billing endpoint', () => {
-    const doc = mapListItem(buildRaw(), i18n.t.bind(i18n));
+  it('maps list progress and failure fields for the table and inspector', () => {
+    const doc = mapListItem(
+      buildRaw({
+        status: 'processing',
+        readiness: 'processing',
+        stage: 'extract_graph',
+        progressPercent: 76.4,
+      }),
+      i18n.t.bind(i18n),
+    );
+
+    expect(doc.progressPercent).toBe(76);
+    expect(doc.stage).toBe('Extracting graph');
+  });
+
+  it('keeps the backend failure message as the primary failed-document reason', () => {
+    const doc = mapListItem(
+      buildRaw({
+        status: 'failed',
+        readiness: 'failed',
+        failureCode: 'parser_failed',
+        failureMessage: 'Parser failed on page 2',
+      }),
+      i18n.t.bind(i18n),
+    );
+
+    expect(doc.failureCode).toBe('parser_failed');
+    expect(doc.failureMessage).toBe('Parser failed on page 2');
+    expect(doc.statusReason).toBe('Parser failed on page 2');
+  });
+
+  it('returns null for non-numeric list cost values', () => {
+    const doc = mapListItem(buildRaw({ cost: '' }), i18n.t.bind(i18n));
 
     expect(doc.cost).toBeNull();
   });

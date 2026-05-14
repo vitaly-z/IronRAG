@@ -7,6 +7,7 @@ import { FeatureErrorBoundary } from '@/shared/components/FeatureErrorBoundary';
 import { useApp } from '@/shared/contexts/app-context';
 import type { AIScopeKind } from '@/shared/types';
 import {
+  OPTIONAL_PURPOSES,
   purposeLabel,
   recommendAiConfigSection,
   summarizeAiReadiness,
@@ -318,7 +319,7 @@ export default function AiConfigurationPanel({ active }: AiConfigurationPanelPro
   }
 
   return (
-    <div className="flex flex-1 min-h-0 flex-col gap-4">
+    <div className="flex flex-1 min-h-0 flex-col gap-4 overflow-auto lg:overflow-visible">
       <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
         <h2 className="text-base font-bold tracking-tight">{t('admin.aiPanel.title')}</h2>
         <ScopePicker selectedScope={selectedScope} activeWorkspaceName={activeWorkspace?.name} activeLibraryName={activeLibrary?.name} onScopeChange={setSelectedScope} />
@@ -329,14 +330,31 @@ export default function AiConfigurationPanel({ active }: AiConfigurationPanelPro
         t={t}
         onOpenRecommendedSection={openRecommendedSection}
       />
-      <div className="grid flex-1 min-h-0 gap-4 lg:grid-cols-[18rem_minmax(0,1fr)] lg:items-stretch">
+      {readinessSummary.missingOptionalPurposes.length > 0 && (
+        <div className="rounded-md border border-status-warning/25 bg-status-warning/5 p-3 flex items-start gap-3">
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-status-warning" />
+          <div className="min-w-0">
+            <p className="text-sm font-bold text-status-warning">
+              {t('admin.aiPanel.optionalBindingsMissingTitle')}
+            </p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {t('admin.aiPanel.optionalBindingsMissingDetail', {
+                purposes: readinessSummary.missingOptionalPurposes
+                  .map(p => purposeLabel(p, t))
+                  .join(', '),
+              })}
+            </p>
+          </div>
+        </div>
+      )}
+      <div className="grid gap-4 lg:flex-1 lg:min-h-0 lg:grid-cols-[18rem_minmax(0,1fr)] lg:items-stretch">
         <AiSectionNavigation
           activeSection={activeSection}
           summary={readinessSummary}
           t={t}
           onSelectSection={setActiveSection}
         />
-        <div className="flex min-w-0 min-h-0 flex-col">
+        <div className="flex min-w-0 flex-col lg:min-h-0 lg:overflow-auto">
           <FeatureErrorBoundary feature={t('admin.aiPanel.featureName')}>{section}</FeatureErrorBoundary>
         </div>
       </div>

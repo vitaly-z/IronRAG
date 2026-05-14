@@ -15,6 +15,7 @@ const { useAppMock, queryApiMock, toastErrorMock } = vi.hoisted(() => ({
     getSession: vi.fn(),
     createSession: vi.fn(),
     createTurn: vi.fn(),
+    createTurnStream: vi.fn(),
     getExecution: vi.fn(),
     getExecutionLlmContext: vi.fn(),
   },
@@ -94,6 +95,21 @@ describe('AssistantPage integration', () => {
       title: '',
       updatedAt: '2026-04-10T11:00:00Z',
       turnCount: 0,
+    });
+    queryApiMock.createTurnStream.mockResolvedValue({
+      responseTurn: {
+        id: 'turn-default',
+        contentText: 'Default answer',
+        createdAt: '2026-04-10T11:00:05Z',
+        executionId: 'exec-default',
+      },
+      preparedSegmentReferences: [],
+      technicalFactReferences: [],
+      entityReferences: [],
+      relationReferences: [],
+      verificationState: 'verified',
+      verificationWarnings: [],
+      runtimeStageSummaries: [],
     });
   });
 
@@ -177,7 +193,7 @@ describe('AssistantPage integration', () => {
   });
 
   it('posts a turn and replaces the placeholder with the final answer + evidence', async () => {
-    queryApiMock.createTurn.mockResolvedValue({
+    queryApiMock.createTurnStream.mockResolvedValue({
       responseTurn: {
         id: 'turn-1',
         contentText: 'Hello world',
@@ -234,19 +250,16 @@ describe('AssistantPage integration', () => {
     await flushUi();
 
     expect(queryApiMock.createSession).toHaveBeenCalledWith('ws-1', 'library-1');
-    expect(queryApiMock.createTurn).toHaveBeenCalledWith(
+    expect(queryApiMock.createTurnStream).toHaveBeenCalledWith(
       'session-new',
       'Where is the docs page?',
+      expect.any(Function),
     );
     expect(container.textContent).toContain('Hello world');
   });
 
-  it('retries a transient network reject once, then surfaces the failure without recovering', async () => {
-    // Production behaviour: a `Failed to fetch` reject means the request
-    // never hit the backend, so AssistantPage retries the turn exactly once.
-    // Both attempts fail here, so the user sees the canonical send-error
-    // message and never the recovery payload.
-    queryApiMock.createTurn.mockRejectedValue(new Error('Failed to fetch'));
+  it('keeps a failed stream turn inline with the pending question and retry affordance', async () => {
+    queryApiMock.createTurnStream.mockRejectedValue(new Error('Failed to fetch'));
 
     await renderPage();
 
@@ -262,13 +275,14 @@ describe('AssistantPage integration', () => {
 
     await flushUi();
     await flushUi();
-    await flushUi();
 
-    expect(queryApiMock.createTurn).toHaveBeenCalledTimes(2);
-    expect(container.textContent).not.toContain('Recovered answer');
+    expect(queryApiMock.createTurnStream).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain('Where is the docs page?');
+    expect(container.textContent).toContain('The request did not complete');
+    expect(container.textContent).toContain("Request didn't go through");
   });
 
-  it('optimistically shows a first-turn session and rolls back with a toast when session creation fails', async () => {
+  it('keeps a first-turn session creation failure visible with an inline error', async () => {
     let rejectSession!: (reason: Error) => void;
     queryApiMock.createSession.mockReturnValue(
       new Promise((_resolve, reject) => {
@@ -297,7 +311,8 @@ describe('AssistantPage integration', () => {
     await flushUi();
     await flushUi();
 
-    expect(container.textContent).not.toContain('Will this rollback?');
+    expect(container.textContent).toContain('Will this rollback?');
+    expect(container.textContent).toContain('The request did not complete');
     expect(container.textContent).toContain("Request didn't go through");
     expect(toastErrorMock).toHaveBeenCalledWith(
       expect.stringContaining('session unavailable'),
@@ -415,7 +430,7 @@ describe('AssistantPage integration', () => {
     }));
 
     let resolveTurn!: (value: unknown) => void;
-    queryApiMock.createTurn.mockReturnValue(
+    queryApiMock.createTurnStream.mockReturnValue(
       new Promise((resolve) => {
         resolveTurn = resolve;
       }),
@@ -442,9 +457,10 @@ describe('AssistantPage integration', () => {
     });
 
     await waitFor(() => {
-      expect(queryApiMock.createTurn).toHaveBeenCalledWith(
+      expect(queryApiMock.createTurnStream).toHaveBeenCalledWith(
         'session-1',
         'What is pending?',
+        expect.any(Function),
       );
     });
 
@@ -521,7 +537,7 @@ describe('AssistantPage integration', () => {
       updatedAt: '2026-04-11T11:00:00Z',
       turnCount: 0,
     }));
-    queryApiMock.createTurn.mockResolvedValue({
+    queryApiMock.createTurnStream.mockResolvedValue({
       responseTurn: {
         id: 'turn-2',
         contentText: 'Library two answer',
@@ -583,13 +599,15 @@ describe('AssistantPage integration', () => {
     await flushUi();
 
     expect(queryApiMock.createSession).toHaveBeenCalledWith('ws-1', 'library-2');
-    expect(queryApiMock.createTurn).toHaveBeenCalledWith(
+    expect(queryApiMock.createTurnStream).toHaveBeenCalledWith(
       'session-new-library-2',
       'What changed?',
+      expect.any(Function),
     );
-    expect(queryApiMock.createTurn).not.toHaveBeenCalledWith(
+    expect(queryApiMock.createTurnStream).not.toHaveBeenCalledWith(
       'session-1',
       expect.any(String),
+      expect.any(Function),
     );
     await waitFor(() => {
       expect(container.textContent).toContain('Library two answer');

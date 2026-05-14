@@ -13,6 +13,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/shared/components/ui/dialog";
+import {
+  Drawer,
+  DrawerContent,
+  DrawerDescription,
+  DrawerTitle,
+} from "@/shared/components/ui/drawer";
+import { useIsMobile } from "@/shared/hooks/use-mobile";
 import type { DocumentItem, Locale } from "@/shared/types";
 
 import {
@@ -31,9 +38,7 @@ type InspectorSectionProps = {
   clearSelectedDoc: () => void;
   errorMessage: (error: unknown, fallback: string) => string;
   fetchSelectedDetail: (documentId: string) => Promise<void>;
-  inspectorFacts: number | null;
   inspectorLifecycle: DocumentLifecycleDetail | null;
-  inspectorSegments: number | null;
   loadFirstPage: () => Promise<void>;
   locale: Locale;
   selectedDoc: DocumentItem | null;
@@ -48,9 +53,7 @@ export function InspectorSection({
   clearSelectedDoc,
   errorMessage,
   fetchSelectedDetail,
-  inspectorFacts,
   inspectorLifecycle,
-  inspectorSegments,
   loadFirstPage,
   locale,
   selectedDoc,
@@ -59,32 +62,46 @@ export function InspectorSection({
   t,
   updateSearchParamState,
 }: InspectorSectionProps) {
+  const isMobile = useIsMobile();
   const [deleteDocOpen, setDeleteDocOpen] = useState(false);
   const [replaceFileOpen, setReplaceFileOpen] = useState(false);
   const [replaceFile, setReplaceFile] = useState<File | null>(null);
   const [replaceLoading, setReplaceLoading] = useState(false);
   const replaceFileInputRef = useRef<HTMLInputElement>(null);
 
-  const editAvailability = useCallback(
+  const editorAvailability = useCallback(
     (doc: DocumentItem | null) => {
-      if (!doc) return { enabled: false, reason: null as string | null };
-      if (!isEditorEditableSourceFormat(doc.fileType)) {
-        return { enabled: false, reason: t("documents.editUnavailableFormat") };
-      }
+      if (!doc) return { enabled: false, readOnly: false, reason: null as string | null };
       if (
         doc.readiness === "readable" ||
         doc.readiness === "graph_sparse" ||
         doc.readiness === "graph_ready"
       ) {
-        return { enabled: true, reason: null as string | null };
+        return {
+          enabled: true,
+          readOnly: !isEditorEditableSourceFormat(doc.fileType),
+          reason: null as string | null,
+        };
       }
       if (doc.readiness === "processing") {
-        return { enabled: false, reason: t("documents.editUnavailableProcessing") };
+        return {
+          enabled: false,
+          readOnly: false,
+          reason: t("documents.editUnavailableProcessing"),
+        };
       }
       if (doc.readiness === "failed") {
-        return { enabled: false, reason: t("documents.editUnavailableFailed") };
+        return {
+          enabled: false,
+          readOnly: false,
+          reason: t("documents.editUnavailableFailed"),
+        };
       }
-      return { enabled: false, reason: t("documents.editUnavailableGeneric") };
+      return {
+        enabled: false,
+        readOnly: false,
+        reason: t("documents.editUnavailableGeneric"),
+      };
     },
     [t],
   );
@@ -97,7 +114,7 @@ export function InspectorSection({
     [fetchSelectedDetail, loadFirstPage],
   );
   const documentEditor = useDocumentEditor({
-    editAvailability,
+    editorAvailability,
     errorMessage,
     onDocumentSaved: handleDocumentEditorSaveRefresh,
     onDocumentSelected: selectDoc,
@@ -161,25 +178,43 @@ export function InspectorSection({
   ]);
 
   if (!selectedDoc) return null;
-  const availability = editAvailability(selectedDoc);
+  const availability = editorAvailability(selectedDoc);
+  const inspectorPanel = (
+    <DocumentsInspectorPanel
+      editorActionDisabledReason={availability.reason}
+      editorActionEnabled={availability.enabled}
+      editorActionReadOnly={availability.readOnly}
+      lifecycle={inspectorLifecycle}
+      locale={locale}
+      selectedDoc={selectedDoc}
+      selectionMode={selectionMode}
+      setDeleteDocOpen={setDeleteDocOpen}
+      setReplaceFileOpen={setReplaceFileOpen}
+      t={t}
+      updateSearchParamState={updateSearchParamState}
+      onOpenEditor={() => void documentEditor.openEditor(selectedDoc)}
+      onRetry={handleRetry}
+      presentation={isMobile ? "drawer" : "sidebar"}
+    />
+  );
+
   return (
     <>
-      <DocumentsInspectorPanel
-        canEdit={availability.enabled}
-        editDisabledReason={availability.reason}
-        inspectorFacts={inspectorFacts}
-        inspectorSegments={inspectorSegments}
-        lifecycle={inspectorLifecycle}
-        locale={locale}
-        selectedDoc={selectedDoc}
-        selectionMode={selectionMode}
-        setDeleteDocOpen={setDeleteDocOpen}
-        setReplaceFileOpen={setReplaceFileOpen}
-        t={t}
-        updateSearchParamState={updateSearchParamState}
-        onEdit={() => void documentEditor.openEditor(selectedDoc)}
-        onRetry={handleRetry}
-      />
+      {isMobile ? (
+        <Drawer open={!!selectedDoc} onOpenChange={(open) => {
+          if (!open) clearSelectedDoc();
+        }}>
+          <DrawerContent className="h-[88dvh] max-h-[88dvh] rounded-t-xl p-0">
+            <DrawerTitle className="sr-only">{selectedDoc.fileName}</DrawerTitle>
+            <DrawerDescription className="sr-only">
+              {selectedDoc.failureMessage ?? selectedDoc.statusReason ?? selectedDoc.fileName}
+            </DrawerDescription>
+            {inspectorPanel}
+          </DrawerContent>
+        </Drawer>
+      ) : (
+        inspectorPanel
+      )}
       <Dialog open={deleteDocOpen} onOpenChange={setDeleteDocOpen}>
         <DialogContent>
           <DialogHeader>
@@ -283,6 +318,7 @@ export function InspectorSection({
           onOpenChange={documentEditor.handleEditorOpenChange}
           onSave={documentEditor.saveEditor}
           open={documentEditor.editorOpen}
+          readOnly={documentEditor.editorReadOnly}
           saving={documentEditor.editorSaving}
           sourceFormat={documentEditor.editorDocument.fileType}
           t={t}

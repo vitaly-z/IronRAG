@@ -5,6 +5,7 @@ import {
   isCodeLikeSourceFormat,
   isEditorEditableSourceFormat,
   isPlainTextSourceFormat,
+  isRasterImageSourceFormat,
   isTableLikeSourceFormat,
   resolveEditorSurfaceMode,
 } from './editorSurfaceMode';
@@ -35,7 +36,23 @@ describe('editorSurfaceMode', () => {
   it('disables editor for pdf and image formats', () => {
     expect(isEditorEditableSourceFormat('pdf')).toBe(false);
     expect(isEditorEditableSourceFormat('png')).toBe(false);
+    expect(isEditorEditableSourceFormat('application/pdf')).toBe(false);
+    expect(isEditorEditableSourceFormat('image/png')).toBe(false);
+    expect(isRasterImageSourceFormat('image/jpeg')).toBe(true);
     expect(isEditorEditableSourceFormat('xlsx')).toBe(true);
     expect(isEditorEditableSourceFormat('py')).toBe(true);
+  });
+
+  it('does not classify prose with parenthetical references as code', () => {
+    expect(
+      resolveEditorSurfaceMode({
+        markdown: [
+          'The report references the previous section (see Appendix A).',
+          'A second paragraph keeps normal punctuation (and closes here).',
+          'A final line also ends with a parenthetical reference (Table 1).',
+        ].join('\n'),
+        sourceFormat: 'application/pdf',
+      }),
+    ).toBe('prose');
   });
 });

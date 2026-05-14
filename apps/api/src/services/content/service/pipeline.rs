@@ -87,15 +87,24 @@ fn spawn_inline_attempt_heartbeat(
             if !heartbeat_running.load(Ordering::Relaxed) {
                 break;
             }
-            if let Err(error) =
-                ingest_repository::touch_attempt_heartbeat(&heartbeat_postgres, attempt_id, None)
-                    .await
+            match ingest_repository::touch_attempt_heartbeat(&heartbeat_postgres, attempt_id, None)
+                .await
             {
-                warn!(
-                    attempt_id = %attempt_id,
-                    ?error,
-                    "failed to touch inline ingest attempt heartbeat",
-                );
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        attempt_id = %attempt_id,
+                        "inline ingest attempt heartbeat observed lost lease",
+                    );
+                    break;
+                }
+                Err(error) => {
+                    warn!(
+                        attempt_id = %attempt_id,
+                        ?error,
+                        "failed to touch inline ingest attempt heartbeat",
+                    );
+                }
             }
         }
     });
@@ -1076,6 +1085,7 @@ impl ContentService {
                     current_stage: Some(INGEST_STAGE_FINALIZING.to_string()),
                     failure_class: None,
                     failure_code: None,
+                    failure_message: None,
                     retryable: false,
                 },
             )
@@ -1102,6 +1112,7 @@ impl ContentService {
                     current_stage: Some(INGEST_STAGE_FINALIZING.to_string()),
                     failure_class: Some("content_mutation".to_string()),
                     failure_code: Some("inline_pipeline_failed".to_string()),
+                    failure_message: Some(format!("inline mutation pipeline failed: {error}")),
                     retryable: false,
                 },
             )
@@ -1358,38 +1369,6 @@ impl ContentService {
 
                 match graph_outcome {
                     Ok(graph_outcome) => {
-                        // Graph node/edge embedding usage is captured as
-                        // its own `embed_graph` billing call_kind, not
-                        // `embed_chunk` (which covers text chunk embedding).
-                        if let Some(embedding_usage) = graph_outcome.embedding_usage {
-                            let embed_provider = embedding_usage.provider_kind.clone();
-                            let embed_model = embedding_usage.model_name.clone();
-
-                            if let Err(error) = state
-                                .canonical_services
-                                .billing
-                                .capture_ingest_attempt(
-                                    &state,
-                                    CaptureIngestAttemptBillingCommand {
-                                        workspace_id: context.workspace_id,
-                                        library_id: context.library_id,
-                                        attempt_id,
-                                        binding_id: None,
-                                        provider_kind: embed_provider.clone().unwrap_or_default(),
-                                        model_name: embed_model.clone().unwrap_or_default(),
-                                        call_kind: "embed_graph".to_string(),
-                                        usage_json: embedding_usage.into_usage_json(),
-                                    },
-                                )
-                                .await
-                            {
-                                warn!(
-                                    attempt_id = %attempt_id,
-                                    ?error,
-                                    "embed_graph billing capture failed; continuing ingest",
-                                );
-                            }
-                        }
                         state
                             .canonical_services
                             .ingest
@@ -1408,9 +1387,10 @@ impl ContentService {
 	                                        "recordStreamSourceUnitsSkipped": graph_materialization.record_stream_source_units_skipped,
 	                                        "extractedEntityCandidates": graph_materialization.extracted_entities,
 	                                        "extractedRelationCandidates": graph_materialization.extracted_relations,
-	                                        "reusedChunks": graph_materialization.reused_chunks,
-	                                        "reusedEntities": graph_materialization.reused_entities,
-	                                        "reusedRelations": graph_materialization.reused_relations,
+                                            "reusedChunks": graph_materialization.reused_chunks,
+                                            "reusedPromptHashMismatches": graph_materialization.reused_prompt_hash_mismatches,
+                                            "reusedEntities": graph_materialization.reused_entities,
+                                            "reusedRelations": graph_materialization.reused_relations,
 	                                        "projectedNodes": graph_outcome.projection.node_count,
 	                                        "projectedEdges": graph_outcome.projection.edge_count,
 	                                        "projectionVersion": graph_outcome.projection.projection_version,
@@ -1436,7 +1416,7 @@ impl ContentService {
                     Err(error) => {
                         graph_failure = Some(format!("graph reconcile failed: {error:#}"));
                         // extract_graph itself succeeded — failure is in the
-                        // reconcile/graph-embed phase. Close extract_graph
+                        // reconcile/projection phase. Close extract_graph
                         // normally so the UI shows where the pipeline
                         // actually broke.
                         state
@@ -1457,9 +1437,10 @@ impl ContentService {
 	                                        "recordStreamSourceUnitsSkipped": graph_materialization.record_stream_source_units_skipped,
 	                                        "extractedEntityCandidates": graph_materialization.extracted_entities,
 	                                        "extractedRelationCandidates": graph_materialization.extracted_relations,
-	                                        "reusedChunks": graph_materialization.reused_chunks,
-	                                        "reusedEntities": graph_materialization.reused_entities,
-	                                        "reusedRelations": graph_materialization.reused_relations,
+                                            "reusedChunks": graph_materialization.reused_chunks,
+                                            "reusedPromptHashMismatches": graph_materialization.reused_prompt_hash_mismatches,
+                                            "reusedEntities": graph_materialization.reused_entities,
+                                            "reusedRelations": graph_materialization.reused_relations,
 	                                        "providerKind": graph_materialization.provider_kind,
 	                                        "modelName": graph_materialization.model_name,
 	                                    }),

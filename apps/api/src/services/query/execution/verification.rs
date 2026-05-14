@@ -34,6 +34,18 @@ pub(crate) fn verify_answer_against_canonical_evidence(
             unsupported_literals: Vec::new(),
         };
     }
+    if !has_canonical_grounding_evidence(evidence, chunks, assistant_grounding) {
+        return RuntimeAnswerVerification {
+            state: QueryVerificationState::InsufficientEvidence,
+            warnings: vec![QueryVerificationWarning {
+                code: "no_canonical_evidence".to_string(),
+                message: "Answer verification requires selected canonical evidence.".to_string(),
+                related_segment_id: None,
+                related_fact_id: None,
+            }],
+            unsupported_literals: Vec::new(),
+        };
+    }
 
     let (inline_literals, fenced_line_literals) = extract_answer_literals(answer);
     let mut normalized_corpus = build_verification_corpus(evidence, chunks, assistant_grounding);
@@ -102,6 +114,19 @@ pub(crate) fn verify_answer_against_canonical_evidence(
     };
 
     RuntimeAnswerVerification { state, warnings, unsupported_literals }
+}
+
+fn has_canonical_grounding_evidence(
+    evidence: &CanonicalAnswerEvidence,
+    chunks: &[RuntimeMatchedChunk],
+    assistant_grounding: &AssistantGroundingEvidence,
+) -> bool {
+    !evidence.chunk_rows.is_empty()
+        || !evidence.structured_blocks.is_empty()
+        || !evidence.technical_facts.is_empty()
+        || !chunks.is_empty()
+        || !assistant_grounding.verification_corpus.is_empty()
+        || !assistant_grounding.document_references.is_empty()
 }
 
 fn extract_answer_literals(answer: &str) -> (Vec<String>, Vec<String>) {
