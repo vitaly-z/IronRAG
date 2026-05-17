@@ -124,6 +124,7 @@ export function mapListItem(raw: DocumentListItem, t: TFunction): DocumentItem {
     failureMessage,
     statusReason,
     canRetry: raw.retryable,
+    documentHint: raw.documentHint?.trim() || undefined,
     sourceKind: raw.sourceKind,
     sourceUri: raw.sourceUri,
     sourceAccess: mapSourceAccess(raw.sourceAccess),

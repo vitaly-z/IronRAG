@@ -202,6 +202,7 @@ impl McpSearchFixture {
                 title: Some(external_key),
                 language_code: None,
                 source_uri: Some(&format!("{external_key}.txt")),
+                document_hint: None,
                 storage_key: None,
                 created_by_principal_id: None,
             },

@@ -89,6 +89,7 @@ type DocumentReprocessResponse = ContentMutationDetailResponse;
 type DocumentMutationResponse = ContentMutationDetailResponse;
 
 interface DocumentUploadOptions {
+  documentHint?: string;
   externalKey?: string;
   fileName?: string;
   title?: string;
@@ -149,6 +150,7 @@ export const documentsApi = {
       library_id: libraryId,
       file: fileBlob,
     };
+    if (options?.documentHint) body.document_hint = options.documentHint;
     if (options?.externalKey) body.external_key = options.externalKey;
     if (options?.title) body.title = options.title;
     return Content.uploadContentDocument({ body }).then(

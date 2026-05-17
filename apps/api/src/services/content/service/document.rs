@@ -1580,6 +1580,7 @@ pub struct ContentDocumentListEntry {
     pub retryable: bool,
     pub source_kind: Option<String>,
     pub source_uri: Option<String>,
+    pub document_hint: Option<String>,
     pub source_access: Option<crate::domains::content::ContentSourceAccess>,
     /// Canonical connector identity for this document. Comes straight
     /// from `content_document.external_key` and is the key connectors
@@ -1794,6 +1795,7 @@ fn build_document_list_entry(
             .revision_source_uri
             .clone()
             .or_else(|| effective_revision.and_then(|revision| revision.source_uri.clone())),
+        document_hint: row.revision_document_hint.clone(),
         source_access: source_descriptor.and_then(|d| d.access),
         cost_total: row.cost_total,
         cost_currency_code: row.cost_currency_code.clone(),
@@ -1850,6 +1852,7 @@ mod tests {
             revision_mime_type: Some("text/markdown".to_string()),
             revision_byte_size: Some(128),
             revision_source_uri: None,
+            revision_document_hint: None,
             revision_content_source_kind: Some("upload".to_string()),
             revision_storage_key: None,
             mutation_id: mutation_state.map(|_| Uuid::now_v7()),

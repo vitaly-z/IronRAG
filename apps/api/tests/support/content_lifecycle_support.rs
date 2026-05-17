@@ -278,6 +278,7 @@ pub fn revision_command(
         title: Some(title.to_string()),
         language_code: Some("en".to_string()),
         source_uri: source_uri.map(ToString::to_string),
+        document_hint: None,
         storage_key: Some(format!("storage/{checksum}")),
         created_by_principal_id: None,
     }

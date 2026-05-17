@@ -440,7 +440,7 @@ mod tests {
                 section_path: vec!["contracts".to_string()],
                 document_id: Some(Uuid::from_u128(18)),
                 document_title: Some("Synthetic contract".to_string()),
-                source_uri: Some("urn:synthetic:contract".to_string()),
+                document_hint: Some("Synthetic contract".to_string()),
                 source_access: Some(AssistantContentSourceAccess {
                     kind: "stored_document".to_string(),
                     href: "urn:synthetic:contract".to_string(),

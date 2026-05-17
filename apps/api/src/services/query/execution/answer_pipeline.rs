@@ -1205,12 +1205,13 @@ pub(crate) async fn generate_answer_query(
 }
 
 /// Append a deterministic "Sources" section to a final answer when
-/// the retrieval bundle carries document source URIs. The single-
-/// shot prompt already tells the model to quote source URLs inline,
-/// but models frequently drop them when summarising long context —
-/// so the runtime guarantees the citations downstream regardless.
+/// the retrieval bundle carries resolved document hints that are safe
+/// HTTP(S) URLs. The single-shot prompt already tells the model to cite
+/// document hints inline, but models frequently drop them when
+/// summarising long context, so the runtime guarantees clickable web
+/// citations downstream regardless.
 ///
-/// Library-agnostic: we filter to entries whose `source_uri` looks
+/// Library-agnostic: we filter to entries whose `document_hint` looks
 /// like an actual URL (`http://` or `https://`) and keep at most
 /// `MAX_APPENDED_SOURCES` unique ones in retrieval order. Non-URL
 /// source pointers (e.g. `upload://…`, `file://…`) are NOT
@@ -1238,7 +1239,7 @@ fn append_source_section(
     let mut seen: HashSet<String> = HashSet::new();
     let mut urls: Vec<(String, String)> = Vec::new();
     for document in retrieved_documents {
-        let Some(source) = document.source_uri.as_deref() else {
+        let Some(source) = document.document_hint.as_deref() else {
             continue;
         };
         let trimmed = source.trim();
@@ -2352,8 +2353,8 @@ fn selected_runtime_grounding_evidence(
             &document.preview_excerpt,
         );
         push_grounding_fragment(&mut grounding.verification_corpus, &mut seen, &document.title);
-        if let Some(source_uri) = &document.source_uri {
-            push_grounding_fragment(&mut grounding.verification_corpus, &mut seen, source_uri);
+        if let Some(document_hint) = &document.document_hint {
+            push_grounding_fragment(&mut grounding.verification_corpus, &mut seen, document_hint);
         }
     }
     push_grounding_fragment(
@@ -2561,11 +2562,11 @@ mod tests {
         ]
     }
 
-    fn retrieved_doc(title: &str, source_uri: &str) -> super::RuntimeRetrievedDocumentBrief {
+    fn retrieved_doc(title: &str, document_hint: &str) -> super::RuntimeRetrievedDocumentBrief {
         super::RuntimeRetrievedDocumentBrief {
             title: title.to_string(),
             preview_excerpt: String::new(),
-            source_uri: Some(source_uri.to_string()),
+            document_hint: Some(document_hint.to_string()),
         }
     }
 
@@ -2622,7 +2623,7 @@ mod tests {
                 retrieved_documents: vec![super::RuntimeRetrievedDocumentBrief {
                     title: "document-a".to_string(),
                     preview_excerpt: "context-fragment-a".to_string(),
-                    source_uri: None,
+                    document_hint: None,
                 }],
                 retrieved_context_document_titles: vec!["document-a".to_string()],
                 chunk_references: Vec::new(),
@@ -3710,12 +3711,12 @@ mod tests {
             crate::services::query::execution::types::RuntimeRetrievedDocumentBrief {
                 title: "PaymentLink Provider Alpha Manual".to_string(),
                 preview_excerpt: String::new(),
-                source_uri: None,
+                document_hint: None,
             },
             crate::services::query::execution::types::RuntimeRetrievedDocumentBrief {
                 title: "PaymentLink Provider Beta Manual".to_string(),
                 preview_excerpt: String::new(),
-                source_uri: None,
+                document_hint: None,
             },
         ];
 
@@ -3815,7 +3816,7 @@ mod tests {
             vec![crate::services::query::execution::types::RuntimeRetrievedDocumentBrief {
                 title: "Container Return Procedure".to_string(),
                 preview_excerpt: String::new(),
-                source_uri: None,
+                document_hint: None,
             }];
         let context_titles = vec!["Container Return Procedure".to_string()];
 

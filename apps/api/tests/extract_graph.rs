@@ -169,6 +169,7 @@ impl ExtractGraphFixture {
                 title: Some("Extract Graph Fixture"),
                 language_code: Some("en"),
                 source_uri: None,
+                document_hint: None,
                 storage_key: None,
                 created_by_principal_id: None,
             },

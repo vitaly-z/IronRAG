@@ -421,6 +421,10 @@ export function DocumentsInspectorPanel({
   });
   const compactTypeLabel = compactText(typeLabel, 54);
   const compactDocumentId = compactText(selectedDoc.id, 30);
+  const documentHint = selectedDoc.documentHint?.trim() ?? '';
+  const documentHintDisplay = documentHint.length > 80 ? documentHint.slice(0, 80) : documentHint;
+  const documentHintIsUrl =
+    documentHint.startsWith('http://') || documentHint.startsWith('https://');
   const statusBadge = buildDocumentStatusBadgeConfig(t)[selectedDoc.status];
   const latestLifecycleAttempt = lifecycle?.attempts?.[0];
   const pipelineStageEvents =
@@ -658,6 +662,27 @@ export function DocumentsInspectorPanel({
                       label: t('documents.externalKey'),
                       value: selectedDoc.externalKey,
                       title: selectedDoc.externalKey,
+                    },
+                  ]
+                : []),
+              ...(documentHint
+                ? [
+                    {
+                      label: t('documents.documentHint'),
+                      value: documentHintIsUrl ? (
+                        <a
+                          className="text-primary underline-offset-2 hover:underline"
+                          href={documentHint}
+                          rel="noopener noreferrer"
+                          target="_blank"
+                          title={documentHint}
+                        >
+                          {documentHintDisplay}
+                        </a>
+                      ) : (
+                        documentHintDisplay
+                      ),
+                      title: documentHint,
                     },
                   ]
                 : []),

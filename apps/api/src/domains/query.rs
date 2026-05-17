@@ -292,6 +292,7 @@ pub struct PreparedSegmentReference {
     pub document_id: Option<Uuid>,
     pub document_title: Option<String>,
     pub source_uri: Option<String>,
+    pub document_hint: Option<String>,
     pub source_access: Option<ContentSourceAccess>,
 }
 

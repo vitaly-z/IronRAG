@@ -370,6 +370,7 @@ fn prepared_segment_references(
     (0..count)
         .map(|index| {
             let source_uri = format!("urn:synthetic:segment:{seed}:{index}");
+            let document_hint = format!("Synthetic document {seed}-{index}");
             AssistantPreparedSegmentReference {
                 execution_id,
                 segment_id: deterministic_id(seed, offset(200, index)),
@@ -380,8 +381,8 @@ fn prepared_segment_references(
                 heading_trail: vec!["Synthetic guide".to_string(), format!("Section {index}")],
                 section_path: vec!["synthetic".to_string(), format!("case-{seed}")],
                 document_id: Some(deterministic_id(seed, offset(240, index))),
-                document_title: Some(format!("Synthetic document {seed}-{index}")),
-                source_uri: Some(source_uri.clone()),
+                document_title: Some(document_hint.clone()),
+                document_hint: Some(document_hint),
                 source_access: Some(AssistantContentSourceAccess {
                     kind: "stored_document".to_string(),
                     href: source_uri,

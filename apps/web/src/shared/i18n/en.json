@@ -270,6 +270,8 @@
     "status": "Status",
     "documentId": "Document ID",
     "externalKey": "External key",
+    "documentHint": "Hint",
+    "documentHintHelp": "Source URL or any free-form hint for the assistant",
     "pipeline": "Processing Pipeline",
     "pipelineStage": "Stage",
     "pipelineTime": "Time",
@@ -672,7 +674,11 @@
   "admin": {
     "title": "Admin",
     "access": "Access",
-    "mcp": "MCP",
+    "mcp": {
+      "label": "MCP",
+      "includeDocumentHint": "Include source hints in MCP answers",
+      "includeDocumentHintHelp": "When enabled, MCP agents receive a source hint with every citation."
+    },
     "operations": "Operations",
     "ingestQueue": "Queue",
     "ai": "AI",

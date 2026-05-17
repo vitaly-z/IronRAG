@@ -887,6 +887,7 @@ fn sample_document_summary(
             title: Some("Ops Summary".to_string()),
             language_code: Some("ru".to_string()),
             source_uri: None,
+            document_hint: None,
             storage_key: None,
             created_by_principal_id: None,
             created_at: Utc::now(),

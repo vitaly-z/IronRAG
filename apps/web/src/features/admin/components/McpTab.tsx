@@ -1,14 +1,19 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import type { TFunction } from 'i18next';
 import { Copy, Terminal, Code2, Brain } from 'lucide-react';
+import { toast } from 'sonner';
 import { Button } from '@/shared/components/ui/button';
+import { Checkbox } from '@/shared/components/ui/checkbox';
 import { DataState } from '@/shared/components/DataState';
-import { queries } from '@/shared/api';
+import { adminApi, queries } from '@/shared/api';
+import { errorMessage } from '@/shared/lib/errorMessage';
+import type { Library } from '@/shared/types';
 
 type McpTabProps = {
   t: TFunction;
-  activeLibraryId: string | undefined;
   active: boolean;
+  activeLibrary: Library | null;
+  refreshSession: () => Promise<void>;
 };
 
 type McpClientConfig = {
@@ -73,12 +78,27 @@ function getMcpConfigs(origin: string): McpClientConfig[] {
   ];
 }
 
-export function McpTab({ t, activeLibraryId, active }: McpTabProps) {
+export function McpTab({ t, active, activeLibrary, refreshSession }: McpTabProps) {
+  const activeLibraryId = activeLibrary?.id;
   const promptQuery = useQuery({
     ...queries.getAssistantSystemPromptOptions(
       activeLibraryId ? { query: { libraryId: activeLibraryId } } : {},
     ),
     enabled: active,
+  });
+  const mcpSettingsMutation = useMutation({
+    mutationFn: (includeDocumentHintInMcpAnswers: boolean) => {
+      if (!activeLibraryId) {
+        throw new Error('No active library');
+      }
+      return adminApi.updateLibraryMcpSettings(activeLibraryId, {
+        includeDocumentHintInMcpAnswers,
+      });
+    },
+    onSuccess: () => refreshSession(),
+    onError: (error: unknown) => {
+      toast.error(errorMessage(error, 'Failed to update MCP settings'));
+    },
   });
   const promptResponse = promptQuery.data as
     | { rendered?: string | null; template?: string }
@@ -89,6 +109,9 @@ export function McpTab({ t, activeLibraryId, active }: McpTabProps) {
 
   const origin = window.location.origin;
   const configs = getMcpConfigs(origin);
+  const includeDocumentHintChecked = mcpSettingsMutation.isPending
+    ? mcpSettingsMutation.variables
+    : activeLibrary?.includeDocumentHintInMcpAnswers ?? false;
 
   return (
     <>
@@ -109,6 +132,25 @@ export function McpTab({ t, activeLibraryId, active }: McpTabProps) {
       <div className="workbench-surface p-4 mb-6 text-xs leading-relaxed">
         <div className="section-label mb-1.5">{t('admin.mcpParityTitle')}</div>
         <p className="text-muted-foreground">{t('admin.mcpParityDesc')}</p>
+      </div>
+      <div className="workbench-surface p-4 mb-4">
+        <label className="flex items-start gap-3">
+          <Checkbox
+            checked={includeDocumentHintChecked}
+            disabled={!activeLibraryId || mcpSettingsMutation.isPending}
+            onCheckedChange={(checked) => {
+              mcpSettingsMutation.mutate(checked === true);
+            }}
+          />
+          <span className="min-w-0">
+            <span className="block text-sm font-semibold">
+              {t('admin.mcp.includeDocumentHint')}
+            </span>
+            <span className="mt-1 block text-xs text-muted-foreground">
+              {t('admin.mcp.includeDocumentHintHelp')}
+            </span>
+          </span>
+        </label>
       </div>
       <div className="workbench-surface p-4 mb-4">
         <div className="flex items-center justify-between mb-2">

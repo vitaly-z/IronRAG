@@ -705,7 +705,7 @@ fn assemble_answer_context_excludes_recent_documents_for_mcp_ui_parity_focused()
     let retrieved_documents = vec![RuntimeRetrievedDocumentBrief {
         title: "knowledge_graph_wikipedia.md".to_string(),
         preview_excerpt: "A knowledge graph is a structured representation.".to_string(),
-        source_uri: None,
+        document_hint: None,
     }];
     let context = assemble_answer_context(
         &summary,

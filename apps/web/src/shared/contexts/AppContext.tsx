@@ -66,6 +66,7 @@ function mapSessionToState(session: SessionResolveResponse, locale: Locale) {
       workspaceId: lib.workspaceId,
       name: localizedShellName(lib.slug, lib.name, locale),
       createdAt: '',
+      includeDocumentHintInMcpAnswers: lib.includeDocumentHintInMcpAnswers ?? false,
       ingestionReady: lib.ingestionReady,
       queryReady: libraryQueryReady(lib.ingestionReady, lib.queryReady, missingBindingPurposes),
       missingBindingPurposes,

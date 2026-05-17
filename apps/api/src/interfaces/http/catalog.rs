@@ -63,6 +63,7 @@ pub struct CatalogLibraryResponse {
     pub web_ingest_policy: WebIngestPolicy,
     pub recognition_policy: LibraryRecognitionPolicy,
     pub lifecycle_state: String,
+    pub include_document_hint_in_mcp_answers: bool,
     pub ingestion_readiness: CatalogLibraryIngestionReadinessResponse,
 }
 
@@ -97,6 +98,7 @@ pub struct UpdateCatalogLibraryRequest {
     pub description: Option<String>,
     pub extraction_prompt: Option<String>,
     pub lifecycle_state: Option<String>,
+    pub include_document_hint_in_mcp_answers: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -593,6 +595,9 @@ pub async fn update_library(
                 description: payload.description,
                 extraction_prompt: payload.extraction_prompt,
                 lifecycle_state: parse_lifecycle_state_input(lifecycle_state)?,
+                include_document_hint_in_mcp_answers: payload
+                    .include_document_hint_in_mcp_answers
+                    .unwrap_or(existing.include_document_hint_in_mcp_answers),
             },
         )
         .await?;
@@ -936,6 +941,7 @@ fn map_library(library: CatalogLibrary) -> CatalogLibraryResponse {
         web_ingest_policy: library.web_ingest_policy,
         recognition_policy: library.recognition_policy,
         lifecycle_state: lifecycle_state_label(&library.lifecycle_state).to_string(),
+        include_document_hint_in_mcp_answers: library.include_document_hint_in_mcp_answers,
         ingestion_readiness: CatalogLibraryIngestionReadinessResponse {
             ready: library.ingestion_readiness.ready,
             missing_binding_purposes: library.ingestion_readiness.missing_binding_purposes,

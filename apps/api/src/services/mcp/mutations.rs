@@ -462,6 +462,7 @@ pub(crate) async fn process_upload_mutation(
                 source_identity: Some(payload_identity),
                 file_name,
                 title,
+                document_hint: None,
                 mime_type,
                 file_bytes,
             },

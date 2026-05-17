@@ -965,7 +965,7 @@ fn map_prepared_segment_reference(
         section_path: reference.section_path,
         document_id: reference.document_id,
         document_title: reference.document_title,
-        source_uri: reference.source_uri,
+        document_hint: reference.document_hint,
         source_access: reference.source_access.map(|access| {
             ironrag_contracts::assistant::AssistantContentSourceAccess {
                 kind: match access.kind {

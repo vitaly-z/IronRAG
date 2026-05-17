@@ -28,6 +28,7 @@ pub struct CreateRevisionCommand {
     pub title: Option<String>,
     pub language_code: Option<String>,
     pub source_uri: Option<String>,
+    pub document_hint: Option<String>,
     pub storage_key: Option<String>,
     pub created_by_principal_id: Option<Uuid>,
 }
@@ -107,6 +108,7 @@ pub struct RevisionAdmissionMetadata {
     pub title: Option<String>,
     pub language_code: Option<String>,
     pub source_uri: Option<String>,
+    pub document_hint: Option<String>,
     pub storage_key: Option<String>,
 }
 
@@ -163,6 +165,7 @@ pub struct UploadInlineDocumentCommand {
     pub source_identity: Option<String>,
     pub file_name: String,
     pub title: Option<String>,
+    pub document_hint: Option<String>,
     pub mime_type: Option<String>,
     pub file_bytes: Vec<u8>,
 }

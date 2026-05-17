@@ -269,6 +269,8 @@
     "status": "Статус",
     "documentId": "ID документа",
     "externalKey": "Внешний ключ",
+    "documentHint": "Подсказка",
+    "documentHintHelp": "URL источника или произвольная подсказка для ассистента",
     "pipeline": "Конвейер обработки",
     "pipelineStage": "Этап",
     "pipelineTime": "Время",
@@ -672,7 +674,11 @@
   "admin": {
     "title": "Администрирование",
     "access": "Доступ",
-    "mcp": "MCP",
+    "mcp": {
+      "label": "MCP",
+      "includeDocumentHint": "Включать подсказки источников в ответы MCP",
+      "includeDocumentHintHelp": "Когда включено, MCP-агенты получают подсказку об источнике в каждой цитате."
+    },
     "operations": "Операции",
     "ingestQueue": "Очередь",
     "ai": "AI",

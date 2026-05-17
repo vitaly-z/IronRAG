@@ -14,6 +14,7 @@ pub struct ParsedUploadMultipart {
     pub external_key: Option<String>,
     pub idempotency_key: Option<String>,
     pub title: Option<String>,
+    pub document_hint: Option<String>,
     pub file_name: String,
     pub mime_type: Option<String>,
     pub file_bytes: Vec<u8>,
@@ -41,6 +42,7 @@ pub(super) async fn parse_upload_multipart(
     let mut external_key = None;
     let mut idempotency_key = None;
     let mut title = None;
+    let mut document_hint = None;
     let mut file_name = None;
     let mut mime_type = None;
     let mut file_bytes = None;
@@ -82,6 +84,14 @@ pub(super) async fn parse_upload_multipart(
                         .map_err(|_| ApiError::BadRequest("invalid title".to_string()))?,
                 );
             }
+            "document_hint" => {
+                document_hint = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|_| ApiError::BadRequest("invalid document_hint".to_string()))?,
+                );
+            }
             "file" => {
                 let parsed_file = read_multipart_file_field(state, field).await?;
                 file_name = Some(parsed_file.file_name);
@@ -98,6 +108,7 @@ pub(super) async fn parse_upload_multipart(
         external_key: external_key.and_then(normalize_optional_text),
         idempotency_key: idempotency_key.and_then(normalize_optional_text),
         title: title.and_then(normalize_optional_text),
+        document_hint: normalize_optional_document_hint(document_hint)?,
         file_name: file_name.unwrap_or_else(|| format!("upload-{}", Uuid::now_v7())),
         mime_type,
         file_bytes: file_bytes.ok_or_else(|| {
@@ -204,6 +215,18 @@ fn map_content_multipart_file_body_error(
 fn normalize_optional_text(value: String) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn normalize_optional_document_hint(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value.and_then(normalize_optional_text) else {
+        return Ok(None);
+    };
+    if value.chars().count() > 1024 {
+        return Err(ApiError::BadRequest(
+            "document_hint must be at most 1024 characters".to_string(),
+        ));
+    }
+    Ok(Some(value))
 }
 
 pub(super) fn resolve_upload_external_key(

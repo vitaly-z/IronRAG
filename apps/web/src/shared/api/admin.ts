@@ -1,4 +1,5 @@
 import { Admin, Ai, Audit, Catalog, Iam, Ops } from "./generated";
+import { client } from "./generated/client.gen";
 import { unwrap } from "./runtime";
 import {
   resolveProviderBaseUrlPolicy,
@@ -68,6 +69,9 @@ export type {
 
 type RecognitionPolicy = UpdateLibraryRecognitionPolicyRequest;
 type WebIngestPolicy = UpdateLibraryWebIngestPolicyRequest;
+type UpdateLibraryMcpSettingsRequest = {
+  includeDocumentHintInMcpAnswers: boolean;
+};
 
 function toGeneratedRequest<T extends object>(value: object): T {
   const body: Record<string, unknown> = {};
@@ -353,6 +357,21 @@ export const adminApi = {
       path: { libraryId },
       body: policy,
     }).then((result) => unwrap<CatalogLibraryResponse>(result)),
+  updateLibraryMcpSettings: (
+    libraryId: string,
+    body: UpdateLibraryMcpSettingsRequest,
+  ) =>
+    client
+      .patch<{ 200: CatalogLibraryResponse }, unknown>({
+        security: [{ scheme: "bearer", type: "http" }],
+        url: "/v1/libraries/{libraryId}",
+        path: { libraryId },
+        body,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      })
+      .then((result) => unwrap<CatalogLibraryResponse>(result)),
   createWorkspace: (name: string) =>
     Catalog.createCatalogWorkspace({ body: { displayName: name } }).then(
       (result) => unwrap<CatalogWorkspaceResponse>(result),

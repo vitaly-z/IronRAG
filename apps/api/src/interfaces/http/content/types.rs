@@ -110,6 +110,8 @@ pub struct ContentDocumentListItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_access: Option<ContentSourceAccess>,
     /// Summed cost across every billable execution attributed to this
     /// document (ingest + graph extraction). Serialized as a decimal
@@ -188,6 +190,7 @@ pub struct CreateDocumentRequest {
     pub title: Option<String>,
     pub language_code: Option<String>,
     pub source_uri: Option<String>,
+    pub document_hint: Option<String>,
     pub storage_key: Option<String>,
 }
 
@@ -206,6 +209,7 @@ pub struct CreateMutationRequest {
     pub title: Option<String>,
     pub language_code: Option<String>,
     pub source_uri: Option<String>,
+    pub document_hint: Option<String>,
     pub storage_key: Option<String>,
 }
 
@@ -352,6 +356,7 @@ pub(super) fn build_revision_metadata(
             title: payload.title.clone(),
             language_code: payload.language_code.clone(),
             source_uri: payload.source_uri.clone(),
+            document_hint: payload.document_hint.clone(),
             storage_key: payload.storage_key.clone(),
         })),
         _ => Err(ApiError::BadRequest(
@@ -372,6 +377,7 @@ pub(super) fn build_reprocess_revision_metadata(
         title: source.title,
         language_code: active_revision.language_code.clone(),
         source_uri: source.source_uri,
+        document_hint: active_revision.document_hint.clone(),
         storage_key: Some(source.storage_key),
     }
 }
@@ -394,6 +400,7 @@ pub(super) fn build_web_refetch_revision_metadata(
         title: active_revision.title.clone(),
         language_code: active_revision.language_code.clone(),
         source_uri: active_revision.source_uri.clone(),
+        document_hint: active_revision.document_hint.clone(),
         storage_key: Some(refetched.storage_key),
     }
 }

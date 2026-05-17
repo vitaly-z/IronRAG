@@ -511,6 +511,7 @@ export type CatalogLibraryResponse = {
     displayName: string;
     extractionPrompt?: string | null;
     id: string;
+    includeDocumentHintInMcpAnswers: boolean;
     ingestionReadiness: CatalogLibraryIngestionReadinessResponse;
     lifecycleState: string;
     recognitionPolicy: LibraryRecognitionPolicy;
@@ -624,10 +625,11 @@ export type ContentDocumentListItem = {
      * string to avoid IEEE-754 rounding in the browser. Always present
      * (zero when no billable execution landed) so the frontend can
      * render the column without a second roundtrip.
-     */
+    */
     cost: string;
     costCurrencyCode: string;
     documentState: string;
+    documentHint?: string | null;
     /**
      * Canonical connector identity (`content_document.external_key`).
      */
@@ -1787,6 +1789,7 @@ export type LibraryRecognitionPolicy = {
 export type LibrarySummary = {
     description?: string | null;
     id: string;
+    includeDocumentHintInMcpAnswers: boolean;
     ingestionReady: boolean;
     lifecycleState: string;
     missingBindingPurposes: Array<BootstrapBindingPurpose>;
@@ -2582,6 +2585,7 @@ export type UpdateCatalogLibraryRequest = {
     description?: string | null;
     displayName: string;
     extractionPrompt?: string | null;
+    includeDocumentHintInMcpAnswers?: boolean;
     lifecycleState?: string | null;
     slug?: string | null;
 };

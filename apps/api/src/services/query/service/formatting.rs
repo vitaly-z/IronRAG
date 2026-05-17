@@ -119,6 +119,7 @@ pub(crate) fn build_prepared_segment_references(
                 document_id: Some(block.document_id),
                 document_title: info.document_title,
                 source_uri: info.source_uri,
+                document_hint: info.document_hint,
                 source_access: info.source_access,
             };
             Some((
@@ -194,6 +195,7 @@ pub(crate) fn build_assistant_document_references(
                 document_id: Some(reference.document_id),
                 document_title: Some(reference.document_title.clone()),
                 source_uri: reference.source_uri.clone(),
+                document_hint: reference.source_uri.clone(),
                 source_access: reference.source_access.clone(),
             }
         })
@@ -221,15 +223,20 @@ pub(crate) fn render_answer_source_links(
     let mut lines = Vec::new();
 
     for reference in references {
-        let access = match reference.source_access.as_ref() {
-            Some(access) => access,
+        let href = match reference
+            .document_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+        {
+            Some(href) => href,
             None => continue,
         };
-        if !seen.insert(access.href.clone()) {
+        if !seen.insert(href.to_string()) {
             continue;
         }
-        let label = answer_source_link_label(reference, access.href.as_str());
-        lines.push(format!("- [{label}](<{}>)", access.href));
+        let label = answer_source_link_label(reference, href);
+        lines.push(format!("- [{label}](<{href}>)"));
         if lines.len() >= MAX_ANSWER_SOURCE_LINKS {
             break;
         }

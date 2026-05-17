@@ -59,6 +59,7 @@ pub(crate) struct ConversationRuntimeContext {
 pub(crate) struct PreparedSegmentRevisionInfo {
     pub(crate) document_title: Option<String>,
     pub(crate) source_uri: Option<String>,
+    pub(crate) document_hint: Option<String>,
     pub(crate) source_access: Option<crate::domains::content::ContentSourceAccess>,
 }
 

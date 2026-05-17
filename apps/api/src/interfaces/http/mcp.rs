@@ -774,8 +774,20 @@ fn grounded_answer_human_text(answer_text: &str) -> String {
 fn grounded_answer_structured_content(
     execution_detail: &ironrag_contracts::assistant::AssistantExecutionDetail,
 ) -> Value {
+    let mut sanitized_execution_detail = json!(execution_detail);
+    if let Some(references) = sanitized_execution_detail
+        .get_mut("preparedSegmentReferences")
+        .and_then(Value::as_array_mut)
+    {
+        for reference in references {
+            if let Some(object) = reference.as_object_mut() {
+                object.remove("sourceUri");
+                object.remove("sourceAccess");
+            }
+        }
+    }
     json!({
-        "executionDetail": execution_detail,
+        "executionDetail": sanitized_execution_detail,
         "runtimeExecutionId": execution_detail.execution.runtime_execution_id,
         "executionId": execution_detail.execution.id,
         "conversationId": execution_detail.execution.conversation_id,

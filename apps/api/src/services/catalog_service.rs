@@ -72,6 +72,7 @@ pub struct UpdateLibraryCommand {
     pub description: Option<String>,
     pub extraction_prompt: Option<String>,
     pub lifecycle_state: CatalogLifecycleState,
+    pub include_document_hint_in_mcp_answers: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -484,6 +485,7 @@ impl CatalogService {
             extraction_prompt,
             lifecycle_state_as_str(&command.lifecycle_state)
                 .map_err(CatalogLifecycleError::into_request_error)?,
+            command.include_document_hint_in_mcp_answers,
         )
         .await
         .map_err(|e| ApiError::internal_with_log(e, "internal"))?
@@ -1003,6 +1005,7 @@ fn map_library_row(
         recognition_policy,
         lifecycle_state: parse_lifecycle_state(&row.lifecycle_state)
             .map_err(CatalogLifecycleError::into_persisted_error)?,
+        include_document_hint_in_mcp_answers: row.include_document_hint_in_mcp_answers,
         chunking_template: ChunkingTemplate::from_db_str(&row.chunking_template),
         runtime_readiness,
         ingestion_readiness,

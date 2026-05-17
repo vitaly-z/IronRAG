@@ -22,7 +22,7 @@ function parseTab(value: string | null): AdminTab {
 export default function AdminPage() {
   const { t } = useTranslation();
   const [searchParams, setSearchParams] = useSearchParams();
-  const { activeWorkspace, activeLibrary, locale, setLocale } = useApp();
+  const { activeWorkspace, activeLibrary, locale, refreshSession, setLocale } = useApp();
 
   const activeTab = parseTab(searchParams.get('tab'));
 
@@ -38,7 +38,7 @@ export default function AdminPage() {
 
   const tabDescriptors = [
     { value: 'access' as const, label: t('admin.access'), icon: Key },
-    { value: 'mcp' as const, label: t('admin.mcp'), icon: Terminal },
+    { value: 'mcp' as const, label: t('admin.mcp.label'), icon: Terminal },
     { value: 'operations' as const, label: t('admin.operations'), icon: Activity },
     { value: 'queue' as const, label: t('admin.ingestQueue'), icon: ListOrdered },
     { value: 'ai' as const, label: t('admin.ai'), icon: Brain },
@@ -95,7 +95,12 @@ export default function AdminPage() {
           </TabsContent>
 
           <TabsContent value="mcp" className="mt-0 flex-1 min-h-0 overflow-auto p-6 animate-fade-in">
-            <McpTab t={t} activeLibraryId={activeLibrary?.id} active={activeTab === 'mcp'} />
+            <McpTab
+              t={t}
+              activeLibrary={activeLibrary}
+              active={activeTab === 'mcp'}
+              refreshSession={refreshSession}
+            />
           </TabsContent>
 
           <TabsContent value="operations" className="mt-0 flex-1 min-h-0 overflow-auto p-6 animate-fade-in">

@@ -3,6 +3,8 @@ import type { TFunction } from "i18next";
 import { FolderOpen, Link as LinkIcon, Loader2, RotateCw, Upload, AlertTriangle, Settings } from "lucide-react";
 
 import { Button } from "@/shared/components/ui/button";
+import { Input } from "@/shared/components/ui/input";
+import { Label } from "@/shared/components/ui/label";
 import type { WebBoundaryPolicy, WebIngestMode } from "@/shared/api";
 
 import { DOCUMENT_FILE_INPUT_ACCEPT } from "../model/uploadAccept";
@@ -11,6 +13,7 @@ type DocumentsPageHeaderProps = {
   activeLibraryName: string;
   activeTab: "documents" | "web";
   documentsCount: number;
+  documentHint: string;
   fileInputRef: RefObject<HTMLInputElement | null>;
   folderInputRef: RefObject<HTMLInputElement | null>;
   handleFileSelect: (event: ChangeEvent<HTMLInputElement>) => void;
@@ -23,6 +26,7 @@ type DocumentsPageHeaderProps = {
   setMaxPages: (value: string) => void;
   setSeedUrl: (value: string) => void;
   onRefreshWebRuns: () => void;
+  setDocumentHint: (value: string) => void;
   t: TFunction;
   webRunsRefreshing: boolean;
   webRunsCount: number;
@@ -34,6 +38,7 @@ export function DocumentsPageHeader({
   activeLibraryName,
   activeTab,
   documentsCount,
+  documentHint,
   fileInputRef,
   folderInputRef,
   handleFileSelect,
@@ -46,6 +51,7 @@ export function DocumentsPageHeader({
   setMaxPages,
   setSeedUrl,
   onRefreshWebRuns,
+  setDocumentHint,
   t,
   webRunsRefreshing,
   webRunsCount,
@@ -123,71 +129,89 @@ export function DocumentsPageHeader({
           </button>
         </div>
 
-        <div className="flex gap-2">
+        <div className="flex flex-col items-end gap-1.5">
+          <div className="flex gap-2">
+            {activeTab === "documents" && (
+              <>
+                <Button size="sm" disabled={!ingestionReady} onClick={() => fileInputRef.current?.click()}>
+                  <Upload className="h-3.5 w-3.5 mr-1.5" />{" "}
+                  {t("documents.uploadFiles")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!ingestionReady}
+                  onClick={() => folderInputRef.current?.click()}
+                >
+                  <FolderOpen className="h-3.5 w-3.5 mr-1.5" />{" "}
+                  {t("documents.uploadFolder")}
+                </Button>
+              </>
+            )}
+            {activeTab === "web" && (
+              <>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={webRunsRefreshing}
+                  onClick={onRefreshWebRuns}
+                >
+                  {webRunsRefreshing ? (
+                    <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                  ) : (
+                    <RotateCw className="h-3.5 w-3.5 mr-1.5" />
+                  )}{" "}
+                  {t("documents.refreshRuns")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setSeedUrl("");
+                    setCrawlMode("recursive_crawl");
+                    setBoundaryPolicy("same_host");
+                    setMaxDepth("3");
+                    setMaxPages("30");
+                    setAddLinkOpen(true);
+                  }}
+                >
+                  <LinkIcon className="h-3.5 w-3.5 mr-1.5" />{" "}
+                  {t("documents.addLink")}
+                </Button>
+              </>
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept={DOCUMENT_FILE_INPUT_ACCEPT}
+              className="hidden"
+              onChange={handleFileSelect}
+            />
+            <input
+              ref={folderInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={handleFolderSelect}
+            />
+          </div>
           {activeTab === "documents" && (
-            <>
-              <Button size="sm" disabled={!ingestionReady} onClick={() => fileInputRef.current?.click()}>
-                <Upload className="h-3.5 w-3.5 mr-1.5" />{" "}
-                {t("documents.uploadFiles")}
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={!ingestionReady}
-                onClick={() => folderInputRef.current?.click()}
-              >
-                <FolderOpen className="h-3.5 w-3.5 mr-1.5" />{" "}
-                {t("documents.uploadFolder")}
-              </Button>
-            </>
+            <div className="w-72 max-w-[min(18rem,calc(100vw-2rem))]">
+              <Label htmlFor="document-upload-hint" className="text-xs">
+                {t("documents.documentHint")}
+              </Label>
+              <Input
+                id="document-upload-hint"
+                className="mt-1 h-8 text-xs"
+                value={documentHint}
+                onChange={(event) => setDocumentHint(event.target.value)}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                {t("documents.documentHintHelp")}
+              </p>
+            </div>
           )}
-          {activeTab === "web" && (
-            <>
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={webRunsRefreshing}
-                onClick={onRefreshWebRuns}
-              >
-                {webRunsRefreshing ? (
-                  <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
-                ) : (
-                  <RotateCw className="h-3.5 w-3.5 mr-1.5" />
-                )}{" "}
-                {t("documents.refreshRuns")}
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  setSeedUrl("");
-                  setCrawlMode("recursive_crawl");
-                  setBoundaryPolicy("same_host");
-                  setMaxDepth("3");
-                  setMaxPages("30");
-                  setAddLinkOpen(true);
-                }}
-              >
-                <LinkIcon className="h-3.5 w-3.5 mr-1.5" />{" "}
-                {t("documents.addLink")}
-              </Button>
-            </>
-          )}
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            accept={DOCUMENT_FILE_INPUT_ACCEPT}
-            className="hidden"
-            onChange={handleFileSelect}
-          />
-          <input
-            ref={folderInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={handleFolderSelect}
-          />
         </div>
       </div>
     </div>

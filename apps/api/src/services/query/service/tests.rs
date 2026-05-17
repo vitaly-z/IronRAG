@@ -403,6 +403,7 @@ fn render_answer_source_links_deduplicates_hrefs_and_preserves_titles() {
             document_id: Some(document_id),
             document_title: Some("runtime-upload-check.pdf".to_string()),
             source_uri: Some("upload://runtime-upload-check.pdf".to_string()),
+            document_hint: Some("runtime-upload-check.pdf".to_string()),
             source_access: Some(crate::domains::content::ContentSourceAccess {
                 kind: crate::domains::content::ContentSourceAccessKind::StoredDocument,
                 href: stored_href.clone(),
@@ -421,6 +422,7 @@ fn render_answer_source_links_deduplicates_hrefs_and_preserves_titles() {
             document_id: Some(document_id),
             document_title: Some("runtime-upload-check.pdf".to_string()),
             source_uri: Some("upload://runtime-upload-check.pdf".to_string()),
+            document_hint: Some("runtime-upload-check.pdf".to_string()),
             source_access: Some(crate::domains::content::ContentSourceAccess {
                 kind: crate::domains::content::ContentSourceAccessKind::StoredDocument,
                 href: stored_href,
@@ -439,6 +441,7 @@ fn render_answer_source_links_deduplicates_hrefs_and_preserves_titles() {
             document_id: Some(Uuid::now_v7()),
             document_title: Some("Docs".to_string()),
             source_uri: Some("https://example.com/docs".to_string()),
+            document_hint: Some("https://example.com/docs".to_string()),
             source_access: Some(crate::domains::content::ContentSourceAccess {
                 kind: crate::domains::content::ContentSourceAccessKind::ExternalUrl,
                 href: "https://example.com/docs".to_string(),
@@ -450,8 +453,7 @@ fn render_answer_source_links_deduplicates_hrefs_and_preserves_titles() {
         render_answer_source_links(&references).expect("answer source links should render");
 
     assert!(rendered.starts_with("Sources\n"));
-    assert_eq!(rendered.lines().filter(|line| line.starts_with("- ")).count(), 2);
-    assert!(rendered.contains("runtime-upload-check.pdf"));
+    assert_eq!(rendered.lines().filter(|line| line.starts_with("- ")).count(), 1);
     assert!(rendered.contains("https://example.com/docs"));
 }
 

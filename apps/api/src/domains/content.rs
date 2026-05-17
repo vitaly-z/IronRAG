@@ -62,6 +62,7 @@ pub struct ContentRevision {
     pub title: Option<String>,
     pub language_code: Option<String>,
     pub source_uri: Option<String>,
+    pub document_hint: Option<String>,
     pub storage_key: Option<String>,
     pub created_by_principal_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,

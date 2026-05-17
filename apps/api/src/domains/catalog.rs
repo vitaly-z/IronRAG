@@ -97,6 +97,7 @@ pub struct CatalogLibrary {
     pub web_ingest_policy: WebIngestPolicy,
     pub recognition_policy: LibraryRecognitionPolicy,
     pub lifecycle_state: CatalogLifecycleState,
+    pub include_document_hint_in_mcp_answers: bool,
     pub chunking_template: ChunkingTemplate,
     pub ingestion_readiness: CatalogLibraryIngestionReadiness,
     pub runtime_readiness: CatalogLibraryRuntimeReadiness,

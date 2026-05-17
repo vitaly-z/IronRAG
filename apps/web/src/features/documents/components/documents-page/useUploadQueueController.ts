@@ -38,6 +38,7 @@ export function useUploadQueueController({
   t,
 }: UploadQueueControllerInput) {
   const [dragOver, setDragOver] = useState(false);
+  const [documentHint, setDocumentHint] = useState("");
   const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
   const [duplicateConflict, setDuplicateConflict] = useState<{
     candidate: UploadCandidate;
@@ -52,7 +53,9 @@ export function useUploadQueueController({
       if (!activeLibrary) return;
       setUploadQueue((prev) => [...prev, { name: candidate.name, state: "uploading" }]);
       try {
+        const trimmedDocumentHint = documentHint.trim();
         await documentsApi.upload(activeLibrary.id, candidate.file, {
+          documentHint: trimmedDocumentHint || undefined,
           externalKey: candidate.name,
           fileName: candidate.file.name,
           title: candidate.name,
@@ -74,7 +77,7 @@ export function useUploadQueueController({
         );
       }
     },
-    [activeLibrary, activateListPollGrace, errorMessage, t],
+    [activeLibrary, activateListPollGrace, documentHint, errorMessage, t],
   );
 
   const doReplaceFile = useCallback(
@@ -176,6 +179,7 @@ export function useUploadQueueController({
 
   return {
     dragOver,
+    documentHint,
     duplicateConflict,
     fileInputRef,
     folderInputRef,
@@ -186,6 +190,7 @@ export function useUploadQueueController({
       [uploadQueue],
     ),
     resolveDuplicate,
+    setDocumentHint,
     dropTargetProps: {
       onDragLeave: () => setDragOver(false),
       onDragOver: (event: DragEvent) => {

@@ -122,13 +122,9 @@ pub(crate) struct RuntimeMatchedChunk {
 pub(crate) struct RuntimeRetrievedDocumentBrief {
     pub(crate) title: String,
     pub(crate) preview_excerpt: String,
-    /// Canonical source pointer for the document. For web-ingested
-    /// pages this carries the original URL so the assistant can
-    /// quote it inline ("see <url>"). For file uploads it may be
-    /// `None` or a logical reference like `file://<key>`. The value
-    /// comes from `content_revision.source_uri` on the document's
-    /// readable (or active) revision.
-    pub(crate) source_uri: Option<String>,
+    /// LLM-visible document citation hint resolved from the revision's
+    /// explicit hint, safe web URL fallback, or document title.
+    pub(crate) document_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]

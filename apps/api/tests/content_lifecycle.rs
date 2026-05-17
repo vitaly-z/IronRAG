@@ -402,6 +402,7 @@ async fn canonical_content_lifecycle_edit_mutation_persists_source_for_reprocess
                         title: edit_revision.title.clone(),
                         language_code: edit_revision.language_code.clone(),
                         source_uri: edit_revision.source_uri.clone(),
+                        document_hint: edit_revision.document_hint.clone(),
                         storage_key: Some(storage_key),
                     }),
                     parent_async_operation_id: None,
@@ -443,6 +444,7 @@ async fn canonical_content_lifecycle_inline_upload_admits_background_ingest_job(
                     source_identity: Some("content-lifecycle-inline-upload".to_string()),
                     file_name: "inline-upload.txt".to_string(),
                     title: Some("Inline Upload".to_string()),
+                    document_hint: None,
                     mime_type: Some("text/plain".to_string()),
                     file_bytes: b"Ada Lovelace wrote the note.\nCharles Babbage built the engine."
                         .to_vec(),

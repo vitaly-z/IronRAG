@@ -27,6 +27,7 @@ export interface Library {
   workspaceId: string;
   name: string;
   createdAt: string;
+  includeDocumentHintInMcpAnswers: boolean;
   ingestionReady: boolean;
   queryReady: boolean;
   missingBindingPurposes: BootstrapBindingPurpose[];
@@ -66,6 +67,7 @@ export interface DocumentItem {
   failureMessage?: string;
   statusReason?: string;
   canRetry?: boolean;
+  documentHint?: string;
   sourceKind?:
     | "upload"
     | "web_page"

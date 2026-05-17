@@ -220,7 +220,7 @@ fn assemble_answer_context_excludes_recent_documents_for_mcp_ui_parity() {
     let retrieved_documents = vec![RuntimeRetrievedDocumentBrief {
         title: "spec.md".to_string(),
         preview_excerpt: "IronRAG stores graph knowledge.".to_string(),
-        source_uri: None,
+        document_hint: None,
     }];
     let context = assemble_answer_context(
         &summary,
@@ -257,7 +257,7 @@ fn assemble_answer_context_can_prioritize_graph_context_before_document_briefs()
     let retrieved_documents = vec![RuntimeRetrievedDocumentBrief {
         title: "spec.md".to_string(),
         preview_excerpt: "Long document preview.".to_string(),
-        source_uri: None,
+        document_hint: None,
     }];
     let context = assemble_answer_context(
         &summary,

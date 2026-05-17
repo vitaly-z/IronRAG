@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+## 0.4.13 — 2026-05-17
+
+### Connectors: document_hint citation surface
+
+- New per-revision `document_hint` field surfaces a free-form
+  user-facing label (canonical browser URL or arbitrary text) to MCP
+  agents in `grounded_answer` citations and in the built-in answer
+  pipeline. Defaults to None; when unset the citation resolver falls
+  back to `source_uri` for web-ingested revisions, then to the
+  document title. The internal `source_uri` is no longer surfaced to
+  the agent (closes a class of citation-as-link XSS by removing
+  unsanitized `upload://` and arbitrary scheme leakage to LLM
+  context). Admin list/detail responses keep `source_uri` for
+  trace/audit.
+- New per-library `include_document_hint_in_mcp_answers` flag (default
+  ON). Admin → MCP tab exposes a per-library toggle for operators to
+  opt out of source citation in MCP/answer payloads without removing
+  the data itself.
+- Connectors can now attach a `document_hint` per item; the
+  multipart upload form accepts an optional `document_hint` field
+  (≤1024 chars, free-form text).
+- Documents inspector now shows the document hint (clickable when it
+  is a URL).
+- Manual upload form gained an optional "Hint" input.
+- The new
+  [IronRAG.ConnectorTemplate 0.0.2](https://github.com/mlimarenko/IronRAG.ConnectorTemplate)
+  framework exposes `SourceItem.document_hint` and the
+  [BookStack connector 0.0.2](https://github.com/mlimarenko/IronRAG.BookStack)
+  fills it with the per-kind BookStack URL (page / attachment /
+  inline image).
+
 ## 0.4.12 — 2026-05-17
 
 ### Connectors: external_key surfaced

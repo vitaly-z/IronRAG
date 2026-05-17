@@ -93,6 +93,7 @@ pub struct ContentRevisionRow {
     pub title: Option<String>,
     pub language_code: Option<String>,
     pub source_uri: Option<String>,
+    pub document_hint: Option<String>,
     pub storage_key: Option<String>,
     pub created_by_principal_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
@@ -177,6 +178,7 @@ pub struct NewContentRevision<'a> {
     pub title: Option<&'a str>,
     pub language_code: Option<&'a str>,
     pub source_uri: Option<&'a str>,
+    pub document_hint: Option<&'a str>,
     pub storage_key: Option<&'a str>,
     pub created_by_principal_id: Option<Uuid>,
 }
@@ -610,6 +612,7 @@ pub async fn get_library_readable_content_fingerprint(
                         coalesce(revision.byte_size::text, ''),
                         coalesce(revision.title, ''),
                         coalesce(revision.source_uri, ''),
+                        coalesce(revision.document_hint, ''),
                         coalesce(chunks.chunk_count::text, '0'),
                         coalesce(chunks.chunk_fingerprint, '')
                     ],
@@ -656,6 +659,7 @@ pub async fn list_revisions_by_document(
             title,
             language_code,
             source_uri,
+            document_hint,
             storage_key,
             created_by_principal_id,
             created_at
@@ -687,6 +691,7 @@ pub async fn get_revision_by_id(
             title,
             language_code,
             source_uri,
+            document_hint,
             storage_key,
             created_by_principal_id,
             created_at
@@ -721,6 +726,7 @@ pub async fn update_revision_storage_key(
             title,
             language_code,
             source_uri,
+            document_hint,
             storage_key,
             created_by_principal_id,
             created_at",
@@ -754,6 +760,7 @@ pub async fn list_revisions_by_ids(
             title,
             language_code,
             source_uri,
+            document_hint,
             storage_key,
             created_by_principal_id,
             created_at
@@ -784,6 +791,7 @@ pub async fn get_latest_revision_for_document(
             title,
             language_code,
             source_uri,
+            document_hint,
             storage_key,
             created_by_principal_id,
             created_at
@@ -816,6 +824,7 @@ pub async fn create_revision(
             title,
             language_code,
             source_uri,
+            document_hint,
             storage_key,
             created_by_principal_id,
             created_at
@@ -836,6 +845,7 @@ pub async fn create_revision(
             $13,
             $14,
             $15,
+            $16,
             now()
         )
         returning
@@ -852,6 +862,7 @@ pub async fn create_revision(
             title,
             language_code,
             source_uri,
+            document_hint,
             storage_key,
             created_by_principal_id,
             created_at",
@@ -869,6 +880,7 @@ pub async fn create_revision(
     .bind(new_revision.title)
     .bind(new_revision.language_code)
     .bind(new_revision.source_uri)
+    .bind(new_revision.document_hint)
     .bind(new_revision.storage_key)
     .bind(new_revision.created_by_principal_id)
     .fetch_one(postgres)
@@ -1470,6 +1482,7 @@ pub struct ContentDocumentListRow {
     pub revision_mime_type: Option<String>,
     pub revision_byte_size: Option<i64>,
     pub revision_source_uri: Option<String>,
+    pub revision_document_hint: Option<String>,
     pub revision_content_source_kind: Option<String>,
     pub revision_storage_key: Option<String>,
 
@@ -1678,6 +1691,7 @@ pub async fn list_document_page_rows(
                 r.mime_type as revision_mime_type,
                 r.byte_size as revision_byte_size,
                 r.source_uri as revision_source_uri,
+                r.document_hint as revision_document_hint,
                 r.content_source_kind::text as revision_content_source_kind,
                 r.storage_key as revision_storage_key,
                 ij.id as job_id,
@@ -1744,6 +1758,7 @@ pub async fn list_document_page_rows(
             p.revision_mime_type,
             p.revision_byte_size,
             p.revision_source_uri,
+            p.revision_document_hint,
             p.revision_content_source_kind,
             p.revision_storage_key,
             p.mutation_id,

@@ -69,12 +69,14 @@ export function DocumentsPage() {
       <DocumentsPageHeader
         activeLibraryName={activeLibrary.name}
         activeTab={activeTab} documentsCount={documents.totalCount ?? documents.items.length}
+        documentHint={uploadQueue.documentHint}
         fileInputRef={uploadQueue.fileInputRef} folderInputRef={uploadQueue.folderInputRef}
         handleFileSelect={uploadQueue.handleFileSelect}
         handleFolderSelect={uploadQueue.handleFolderSelect}
         onRefreshWebRuns={() => void webIngest.refreshWebRuns()}
         setActiveTab={setActiveTab} setAddLinkOpen={webIngest.setAddLinkOpen}
         setBoundaryPolicy={webIngest.setBoundaryPolicy} setCrawlMode={webIngest.setCrawlMode}
+        setDocumentHint={uploadQueue.setDocumentHint}
         setMaxDepth={webIngest.setMaxDepth} setMaxPages={webIngest.setMaxPages}
         setSeedUrl={webIngest.setSeedUrl} t={t}
         webRunsCount={webIngest.webRuns.length} webRunsRefreshing={webIngest.webRunsRefreshing}
