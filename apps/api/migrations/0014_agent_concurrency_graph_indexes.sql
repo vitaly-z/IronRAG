@@ -14,7 +14,6 @@ create index if not exists idx_runtime_graph_node_projection_entity_support
         library_id,
         projection_version,
         support_count desc,
-        label asc,
         created_at asc,
         id asc
     )
@@ -30,9 +29,8 @@ create index if not exists idx_runtime_graph_node_entity_label_exact
     on runtime_graph_node (
         library_id,
         projection_version,
-        lower(label),
+        md5(lower(label)),
         support_count desc,
-        label asc,
         created_at asc,
         id asc
     )
@@ -73,7 +71,6 @@ create index if not exists idx_runtime_graph_edge_projection_support_admitted
         library_id,
         projection_version,
         support_count desc,
-        relation_type asc,
         created_at asc,
         id asc
     )

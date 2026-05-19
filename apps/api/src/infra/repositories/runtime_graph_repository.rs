@@ -2736,6 +2736,7 @@ pub async fn search_admitted_runtime_graph_entities_by_query_text(
                     where n.library_id = $1
                       and n.projection_version = $2
                       and n.node_type <> 'document'
+                      and md5(lower(n.label)) = md5($3)
                       and lower(n.label) = $3
                     order by n.support_count desc, n.label asc, n.created_at asc, n.id asc
                     limit $6

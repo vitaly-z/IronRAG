@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.17 — 2026-05-19
+
+### Migrations
+
+- Fixed the graph read-path index migration so populated installations
+  with long extracted graph labels can apply it successfully. The exact
+  label lookup index now uses a bounded hash expression plus a full-text
+  equality check instead of storing unbounded label text in the btree key.
+- Removed free-form label and relation-type text from graph support
+  btree keys while keeping the intended support-count ordering. This
+  prevents PostgreSQL index row-size failures without changing answer
+  semantics.
+- Added a regression test that applies the graph index migration after
+  inserting a synthetic long graph label and verifies exact entity search
+  still returns the expected node.
+
 ## 0.4.16 — 2026-05-19
 
 ### Kubernetes / Helm

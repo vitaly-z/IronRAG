@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
+use std::{borrow::Cow, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, migrate::Migrator, postgres::PgPoolOptions};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -25,7 +25,7 @@ use ironrag_backend::{
     infra::{
         arangodb::client::ArangoClient,
         persistence::{Persistence, canonical_ai_catalog_seeded, canonical_baseline_present},
-        repositories::catalog_repository,
+        repositories::{self, catalog_repository},
     },
     integrations::llm::{
         ChatRequest, ChatResponse, EmbeddingBatchRequest, EmbeddingBatchResponse, EmbeddingRequest,
@@ -248,6 +248,23 @@ async fn table_exists(postgres: &PgPool, table_name: &str) -> Result<bool> {
         .with_context(|| format!("failed to inspect table {table_name}"))
 }
 
+fn migrator_with_versions(source: &Migrator, min_version: i64, max_version: i64) -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(
+            source
+                .iter()
+                .filter(|migration| {
+                    migration.version >= min_version && migration.version <= max_version
+                })
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
 async fn response_json(response: axum::response::Response) -> Result<Value> {
     let bytes =
         response.into_body().collect().await.context("failed to collect response body")?.to_bytes();
@@ -321,6 +338,117 @@ async fn seed_orphaned_default_catalog_ai_runtime(
         .context("failed to seed orphaned bootstrap AI runtime")?;
 
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires local postgres service"]
+async fn graph_index_migration_accepts_long_entity_labels() -> Result<()> {
+    let settings =
+        Settings::from_env().context("failed to load settings for graph index migration test")?;
+    let temp_database = TempDatabase::create(&settings.database_url).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&temp_database.database_url)
+        .await
+        .context("failed to connect graph index migration test postgres")?;
+
+    let result = async {
+        let migrations = Migrator::new(Path::new("./migrations"))
+            .await
+            .context("failed to load migration files")?;
+        migrator_with_versions(&migrations, 1, 13)
+            .run(&pool)
+            .await
+            .context("failed to apply migrations before graph index migration")?;
+
+        let suffix = Uuid::now_v7().simple().to_string();
+        let workspace = catalog_repository::create_workspace(
+            &pool,
+            &format!("graph-index-{suffix}"),
+            "Graph Index Migration",
+            None,
+        )
+        .await
+        .context("failed to create graph index migration workspace")?;
+        let library = catalog_repository::create_library(
+            &pool,
+            workspace.id,
+            &format!("graph-index-library-{suffix}"),
+            "Graph Index Migration Library",
+            None,
+            None,
+        )
+        .await
+        .context("failed to create graph index migration library")?;
+
+        let long_label = format!("{}{}", "Alpha ".repeat(700), suffix);
+        let node = repositories::upsert_runtime_graph_node(
+            &pool,
+            library.id,
+            &format!("entity:{suffix}"),
+            &long_label,
+            "entity",
+            None,
+            json!([]),
+            Some("Graph index migration long label fixture"),
+            json!({}),
+            3,
+            1,
+        )
+        .await
+        .context("failed to insert long-label runtime graph node")?;
+
+        migrations
+            .run(&pool)
+            .await
+            .context("failed to apply graph index migration with long labels")?;
+
+        let exact_index_definition =
+            sqlx::query_scalar::<_, String>("select indexdef from pg_indexes where indexname = $1")
+                .bind("idx_runtime_graph_node_entity_label_exact")
+                .fetch_one(&pool)
+                .await
+                .context("failed to inspect exact graph label index")?;
+        let exact_index_definition = exact_index_definition.to_lowercase();
+        assert!(exact_index_definition.contains("md5(lower"));
+        assert!(!exact_index_definition.contains("lower(label),"));
+
+        let projection_index_definition =
+            sqlx::query_scalar::<_, String>("select indexdef from pg_indexes where indexname = $1")
+                .bind("idx_runtime_graph_node_projection_entity_support")
+                .fetch_one(&pool)
+                .await
+                .context("failed to inspect graph projection support index")?
+                .to_lowercase();
+        assert!(!projection_index_definition.contains("label"));
+
+        let edge_index_definition =
+            sqlx::query_scalar::<_, String>("select indexdef from pg_indexes where indexname = $1")
+                .bind("idx_runtime_graph_edge_projection_support_admitted")
+                .fetch_one(&pool)
+                .await
+                .context("failed to inspect graph edge support index")?
+                .to_lowercase();
+        assert!(!edge_index_definition.contains("relation_type asc"));
+
+        let rows = repositories::search_admitted_runtime_graph_entities_by_query_text(
+            &pool,
+            library.id,
+            1,
+            &long_label,
+            5,
+        )
+        .await
+        .context("failed to search exact long-label runtime graph node")?;
+        assert_eq!(rows.first().map(|row| row.id), Some(node.id));
+
+        Ok(())
+    }
+    .await;
+
+    pool.close().await;
+    temp_database.drop().await?;
+    result
 }
 
 #[tokio::test]
