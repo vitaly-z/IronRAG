@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.16 — 2026-05-19
+
+### Kubernetes / Helm
+
+- Fixed Helm chart defaults so API, worker, and web deployments reference
+  the Docker image tag derived from chart `appVersion` instead of stale
+  per-component tags in `values.yaml`. The rendered default image refs now
+  use the current published `v`-prefixed Docker tags.
+- The shared web nginx template now proxies to the configured upstream
+  directly, without a Docker-only resolver directive. Docker Compose
+  and Kubernetes use the same image template and only differ by the
+  `IRONRAG_API_UPSTREAM` value supplied by the runtime.
+- Added Helm lint/template rendering to the main local check gate so
+  bundled, filesystem, and external-service chart profiles are validated
+  with every full `make check`.
+- The minikube HA validation script now restarts app deployments after
+  rebuilding same-tag dev images, so repeated smoke runs exercise the
+  images produced by the current run instead of stale pods.
+- The web image now ships one nginx security-header snippet and applies it
+  without changing API proxy behavior.
+- Swagger UI now has a route-specific CSP that allows same-origin embedding
+  inside the application while keeping the rest of the web app frame-locked.
+
 ## 0.4.15 — 2026-05-19
 
 ### Assistant MCP agent loop

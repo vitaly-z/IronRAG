@@ -197,18 +197,11 @@ helm upgrade --install ironrag charts/ironrag \
   --wait --timeout 20m
 ```
 
+By default the chart deploys the API, worker, and web images with the
+`v<appVersion>` image tag derived from `Chart.appVersion`. Override
+`api.image.tag`, `worker.image.tag`, and `web.image.tag` only when pinning
+a different published image, for example `--set web.image.tag=v0.4.16`.
+
 ## License
 
 [MIT](./LICENSE)
-
----
-
-<p align="center">
-  <a href="https://www.buymeacoffee.com/mlimarencka">
-    <img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=%E2%98%95&slug=mlimarencka&button_colour=FFDD00&font_colour=000000&font_family=Inter&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" />
-  </a>
-</p>
-
-<p align="center">
-  <sub>Support open-source work on IronRAG, Piping, and practical developer infrastructure.</sub>
-</p>

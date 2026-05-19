@@ -1,3 +1,4 @@
+import "./zodRuntime";
 import { Component, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import i18n from "@/shared/i18n";

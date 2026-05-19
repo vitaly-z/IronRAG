@@ -28,7 +28,7 @@ spec:
       {{- end }}
       containers:
         - name: worker
-          image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
+          image: "{{ include "ironrag.appImage" (dict "root" . "image" .Values.worker.image) }}"
           imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
           securityContext:
             runAsNonRoot: true

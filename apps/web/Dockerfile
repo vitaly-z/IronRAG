@@ -17,7 +17,8 @@ RUN npx vite build
 
 FROM nginx:1.30-alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
-RUN rm /etc/nginx/conf.d/default.conf
+RUN rm /etc/nginx/conf.d/default.conf && mkdir -p /etc/nginx/snippets
+COPY security-headers.conf /etc/nginx/snippets/ironrag-security-headers.conf
 COPY nginx.conf.template /etc/nginx/templates/default.conf.template
 # IRONRAG_API_UPSTREAM defaults to http://127.0.0.1:8080 via this ENV instruction.
 # Override at runtime to point nginx reverse-proxy at the actual API backend.

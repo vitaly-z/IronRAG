@@ -25,7 +25,7 @@ spec:
         {{- include "ironrag.startupDependencyWaitInitContainer" . | nindent 8 }}
       containers:
         - name: startup
-          image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}"
+          image: "{{ include "ironrag.appImage" (dict "root" . "image" .Values.api.image) }}"
           imagePullPolicy: {{ .Values.api.image.pullPolicy }}
           securityContext:
             runAsNonRoot: true

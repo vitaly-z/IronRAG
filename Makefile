@@ -40,6 +40,7 @@ FRONTEND_CARGO_TARGET_DIR ?= $(CURDIR)/.cargo-target/web
 	frontend-e2e \
 	frontend-visual \
 	frontend-check \
+	helm-chart-check \
 	pre-commit-install \
 	check \
 	check-strict \
@@ -168,9 +169,12 @@ frontend-mocks-regen:
 # residual fast-refresh / strict-react-hooks warnings tracked separately.
 frontend-check: frontend-lint frontend-typecheck frontend-test frontend-build frontend-bundle-check
 
-check: backend-change-gate frontend-check
+helm-chart-check:
+	scripts/minikube/render-all.sh
 
-check-strict: backend-change-gate backend-doc frontend-check
+check: backend-change-gate frontend-check helm-chart-check
+
+check-strict: backend-change-gate backend-doc frontend-check helm-chart-check
 
 pre-commit-install:
 	pre-commit install --install-hooks

@@ -26,7 +26,7 @@ spec:
         fsGroup: {{ .Values.security.runAsUser | default 1000 }}
       containers:
         - name: web
-          image: "{{ .Values.web.image.repository }}:{{ .Values.web.image.tag }}"
+          image: "{{ include "ironrag.appImage" (dict "root" . "image" .Values.web.image) }}"
           imagePullPolicy: {{ .Values.web.image.pullPolicy }}
           securityContext:
             runAsNonRoot: true

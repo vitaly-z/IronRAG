@@ -8,13 +8,18 @@ server {
     server_name _;
     root /usr/share/nginx/html;
     index index.html;
-    # Backend/worker containers are recreated independently during deploys.
-    # nginx's default one-shot name resolution can pin /v1 traffic to a stale
-    # container IP until the frontend itself restarts, so re-resolve Docker DNS.
-    resolver 127.0.0.11 ipv6=off valid=10s;
-    set $ironrag_api_upstream ${IRONRAG_API_UPSTREAM};
 
     client_max_body_size 100M;
+
+    include /etc/nginx/snippets/ironrag-security-headers.conf;
+
+    location ~ /\.(?!well-known(?:/|$)) {
+        return 404;
+    }
+
+    location ~* ^/(?:actuator|debug/pprof|metrics|nginx_status|server-status)(?:/|$) {
+        return 404;
+    }
 
     location ~ ^/v1/content/libraries/[^/]+/snapshot$ {
         client_max_body_size 0;
@@ -31,7 +36,7 @@ server {
         send_timeout 1800s;
         proxy_request_buffering off;
         proxy_buffering off;
-        proxy_pass $ironrag_api_upstream;
+        proxy_pass ${IRONRAG_API_UPSTREAM};
     }
 
     location /v1/ {
@@ -58,18 +63,31 @@ server {
         # snapshot uploads use the dedicated location above, so request
         # buffering stays on for the rest of /v1.
         proxy_buffering off;
-        proxy_pass $ironrag_api_upstream;
+        proxy_pass ${IRONRAG_API_UPSTREAM};
     }
 
     location /assets/ {
         expires 1y;
         add_header Cache-Control "public, immutable";
+        include /etc/nginx/snippets/ironrag-security-headers.conf;
         try_files $uri =404;
+    }
+
+    location = /swagger.html {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        add_header Pragma "no-cache";
+        add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http: https: ws: wss:; worker-src 'self' blob:" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        try_files /swagger.html =404;
     }
 
     location / {
         add_header Cache-Control "no-cache, no-store, must-revalidate";
         add_header Pragma "no-cache";
+        include /etc/nginx/snippets/ironrag-security-headers.conf;
         try_files $uri $uri/ /index.html;
     }
 }

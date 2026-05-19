@@ -15,10 +15,19 @@ SKIP_IMAGE_BUILD="${SKIP_IMAGE_BUILD:-0}"
 RUN_CONTENT_SMOKE="${RUN_CONTENT_SMOKE:-1}"
 STRICT_CONTENT_SMOKE="${STRICT_CONTENT_SMOKE:-0}"
 MINIKUBE_RESET_ON_FAILURE="${MINIKUBE_RESET_ON_FAILURE:-1}"
+FORCE_WORKLOAD_RESTART="${FORCE_WORKLOAD_RESTART:-}"
 BOOTSTRAP_LOGIN="${BOOTSTRAP_LOGIN:-admin}"
 BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD:-ChangeMe123!}"
 BOOTSTRAP_DISPLAY_NAME="${BOOTSTRAP_DISPLAY_NAME:-Admin}"
 WEB_LOCAL_PORT="${WEB_LOCAL_PORT:-}"
+
+if [ -z "${FORCE_WORKLOAD_RESTART}" ]; then
+  if [ "${SKIP_IMAGE_BUILD}" = "1" ]; then
+    FORCE_WORKLOAD_RESTART=0
+  else
+    FORCE_WORKLOAD_RESTART=1
+  fi
+fi
 
 . "${ROOT_DIR}/scripts/minikube/common.sh"
 
@@ -149,6 +158,14 @@ PY
 fi
 recover_helm_release "${HELM_BIN}" "${KUBECTL_BIN}" "${NAMESPACE}" "${RELEASE}"
 "${HELM_BIN}" "${HELM_ARGS[@]}"
+
+if [ "${FORCE_WORKLOAD_RESTART}" = "1" ]; then
+  # Repeated minikube runs rebuild the same dev tags; restart the deployments
+  # so the smoke test exercises the images built in this run.
+  "${KUBECTL_BIN}" -n "${NAMESPACE}" rollout restart "deployment/${FULLNAME}-api"
+  "${KUBECTL_BIN}" -n "${NAMESPACE}" rollout restart "deployment/${FULLNAME}-worker"
+  "${KUBECTL_BIN}" -n "${NAMESPACE}" rollout restart "deployment/${FULLNAME}-web"
+fi
 
 STARTUP_JOB="$("${KUBECTL_BIN}" -n "${NAMESPACE}" get jobs \
   -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=startup" \

@@ -108,6 +108,13 @@ disabled
 {{- printf "http://%s-api:%v" (include "ironrag.fullname" .) .Values.api.service.port -}}
 {{- end -}}
 
+{{- define "ironrag.appImage" -}}
+{{- $root := .root -}}
+{{- $image := .image -}}
+{{- $repository := required "image.repository is required" $image.repository -}}
+{{- printf "%s:%s" $repository (default (printf "v%s" $root.Chart.AppVersion) $image.tag) -}}
+{{- end -}}
+
 {{- define "ironrag.runtimeSecretName" -}}
 {{- if .Values.runtimeSecret.existingSecret -}}
 {{ .Values.runtimeSecret.existingSecret }}
