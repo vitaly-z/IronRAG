@@ -448,8 +448,13 @@ pub async fn build_runtime_file_extraction_plan(
     let file_kind = detect_upload_file_kind(file_name, mime_type, &file_bytes);
 
     if let Some(source_format) = docling_source_format(file_kind, file_name, mime_type) {
-        let recognition_profile =
-            docling_owned_recognition_profile(file_kind, source_format, recognition_policy)?;
+        let vision_binding_available = vision_provider.is_some();
+        let recognition_profile = docling_owned_recognition_profile(
+            file_kind,
+            source_format,
+            recognition_policy,
+            vision_binding_available,
+        )?;
         return match recognition_profile.engine {
             RecognitionEngine::Docling => {
                 let mut output =
@@ -459,7 +464,10 @@ pub async fn build_runtime_file_extraction_plan(
                             file_kind,
                             message: error.to_string(),
                         })?;
-                if docling_embedded_picture_vision_enabled(recognition_policy) {
+                if docling_embedded_picture_vision_enabled(
+                    recognition_policy,
+                    vision_binding_available,
+                ) {
                     augment_with_vision_picture_ocr(
                         &mut output,
                         file_kind,
@@ -471,6 +479,7 @@ pub async fn build_runtime_file_extraction_plan(
                     )
                     .await?;
                 } else {
+                    append_docling_picture_ocr_fallback(&mut output);
                     output.extracted_images.clear();
                 }
                 Ok(build_plan_from_extraction(file_kind, output, recognition_profile))
@@ -619,7 +628,12 @@ fn build_plan_from_extraction(
     // extracted_images dropped here — image bytes no longer needed.
     drop(extracted_images);
 
-    let normalized = normalize_extracted_content(file_kind, &content_text, &structure_hints);
+    let normalized = normalize_extracted_content(
+        file_kind,
+        recognition_profile.engine,
+        &content_text,
+        &structure_hints,
+    );
     let has_source_text = !normalized.source_text.trim().is_empty();
     let has_normalized_text = !normalized.normalized_text.trim().is_empty();
     let source_format_metadata = ExtractionSourceMetadata {
@@ -678,6 +692,7 @@ async fn augment_with_vision_picture_ocr(
     );
     let extracted_images = std::mem::take(&mut output.extracted_images);
     if extracted_images.is_empty() {
+        append_docling_picture_ocr_fallback(output);
         return Ok(());
     }
     let Some(vision_provider) = vision_provider else {
@@ -689,6 +704,9 @@ async fn augment_with_vision_picture_ocr(
     let empty_extra_parameters = serde_json::json!({});
     let extra_parameters_json = extra_parameters_json.unwrap_or(&empty_extra_parameters);
     let mut snippets: Vec<String> = Vec::with_capacity(extracted_images.len());
+    let image_count = extracted_images.len();
+    let mut usage_items = Vec::with_capacity(image_count);
+    let mut failed_picture_count = 0usize;
     for (idx, image) in extracted_images.into_iter().enumerate() {
         let mime = if image.mime_type.is_empty() { "image/png" } else { image.mime_type.as_str() };
         match extraction::image::extract_image_with_provider(
@@ -705,6 +723,7 @@ async fn augment_with_vision_picture_ocr(
         {
             Ok(picture_output) => {
                 let trimmed = picture_output.content_text.trim();
+                usage_items.push(picture_output.usage_json);
                 tracing::debug!(
                     picture_index = idx,
                     snippet_len = trimmed.len(),
@@ -721,29 +740,60 @@ async fn augment_with_vision_picture_ocr(
                 }
             }
             Err(error) => {
-                return Err(FileExtractError::ExtractionFailed {
-                    file_kind,
-                    message: format!("vision OCR for embedded picture {} failed: {error}", idx + 1),
-                });
+                failed_picture_count += 1;
+                output
+                    .warnings
+                    .push(format!("vision OCR for embedded picture {} failed: {error}", idx + 1));
             }
         }
     }
+    if failed_picture_count == image_count {
+        return Err(FileExtractError::ExtractionFailed {
+            file_kind,
+            message: format!(
+                "vision OCR failed for every embedded picture ({failed_picture_count}/{image_count})"
+            ),
+        });
+    }
+    output.provider_kind = Some(vision_provider.provider_kind.clone());
+    output.model_name = Some(vision_provider.model_name.clone());
+    output.usage_json = aggregate_vision_picture_usage_json(usage_items);
+    output.source_map["vision_picture_ocr"] = serde_json::json!({
+        "engine": "vision",
+        "imageCount": image_count,
+        "snippetCount": snippets.len(),
+        "failedImageCount": failed_picture_count,
+    });
     tracing::debug!(
         snippet_count = snippets.len(),
         content_text_len_before = output.content_text.len(),
         "augment_with_vision_picture_ocr exit summary"
     );
+    let stripped_content = strip_docling_picture_ocr_scaffold(&output.content_text);
+    let content_changed = stripped_content != output.content_text;
     if !snippets.is_empty() {
         let block = snippets.join("\n\n");
-        if output.content_text.trim().is_empty() {
+        if stripped_content.trim().is_empty() {
             output.content_text = block;
         } else {
-            output.content_text = format!("{}\n\n{}", output.content_text, block);
+            output.content_text = format!("{stripped_content}\n\n{block}");
         }
         tracing::debug!(
             content_text_len_after = output.content_text.len(),
             "augment_with_vision_picture_ocr appended"
         );
+    } else {
+        output.warnings.push(
+            "vision OCR returned no embedded picture text; kept Docling picture OCR fallback"
+                .to_string(),
+        );
+        if content_changed && !docling_picture_ocr_fallback_snippets(&output.source_map).is_empty()
+        {
+            output.content_text = stripped_content;
+            append_docling_picture_ocr_fallback(output);
+        }
+    }
+    if !snippets.is_empty() || content_changed {
         // Rebuild structure_hints from the augmented content_text so the
         // downstream normalizer / chunker actually sees the appended OCR
         // lines. structure_hints.lines is built from a snapshot of
@@ -758,6 +808,51 @@ async fn augment_with_vision_picture_ocr(
             i32::try_from(output.structure_hints.lines.len()).unwrap_or(i32::MAX);
     }
     Ok(())
+}
+
+pub(crate) fn aggregate_vision_picture_usage_json(
+    usages: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    if usages.is_empty() {
+        return serde_json::json!({});
+    }
+
+    let mut usage_json = serde_json::json!({
+        "embedded_picture_ocr_call_count": usages.len(),
+        "embedded_picture_ocr_usage": usages,
+    });
+    if let Some(prompt_tokens) =
+        sum_numeric_usage_key(&usage_json["embedded_picture_ocr_usage"], "prompt_tokens").or_else(
+            || sum_numeric_usage_key(&usage_json["embedded_picture_ocr_usage"], "input_tokens"),
+        )
+    {
+        usage_json["prompt_tokens"] = serde_json::json!(prompt_tokens);
+    }
+    if let Some(completion_tokens) =
+        sum_numeric_usage_key(&usage_json["embedded_picture_ocr_usage"], "completion_tokens")
+            .or_else(|| {
+                sum_numeric_usage_key(&usage_json["embedded_picture_ocr_usage"], "output_tokens")
+            })
+    {
+        usage_json["completion_tokens"] = serde_json::json!(completion_tokens);
+    }
+    if let Some(total_tokens) =
+        sum_numeric_usage_key(&usage_json["embedded_picture_ocr_usage"], "total_tokens")
+    {
+        usage_json["total_tokens"] = serde_json::json!(total_tokens);
+    }
+    usage_json
+}
+
+fn sum_numeric_usage_key(usages: &serde_json::Value, key: &str) -> Option<i64> {
+    let total =
+        usages.as_array()?.iter().filter_map(|usage| usage.get(key)).fold(0_i64, |acc, value| {
+            acc + value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .unwrap_or_default()
+        });
+    (total > 0).then_some(total)
 }
 
 pub async fn augment_docling_output_with_vision_picture_ocr(
@@ -781,11 +876,58 @@ pub async fn augment_docling_output_with_vision_picture_ocr(
     .await
 }
 
+pub fn append_docling_picture_ocr_fallback(output: &mut ExtractionOutput) {
+    let snippets = docling_picture_ocr_fallback_snippets(&output.source_map);
+    if snippets.is_empty() {
+        return;
+    }
+
+    let block = snippets
+        .into_iter()
+        .enumerate()
+        .map(|(idx, snippet)| format!("--- Embedded image {} ---\n{}", idx + 1, snippet))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if output.content_text.trim().is_empty() {
+        output.content_text = block;
+    } else {
+        output.content_text = format!("{}\n\n{}", output.content_text, block);
+    }
+    let layout =
+        crate::shared::extraction::build_text_layout_from_content(output.content_text.trim());
+    output.content_text = layout.content_text;
+    output.structure_hints = layout.structure_hints;
+    output.source_metadata.line_count =
+        i32::try_from(output.structure_hints.lines.len()).unwrap_or(i32::MAX);
+}
+
+fn docling_picture_ocr_fallback_snippets(source_map: &serde_json::Value) -> Vec<String> {
+    source_map
+        .get("docling_picture_ocr_text")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|snippet| !snippet.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 #[must_use]
 pub fn docling_embedded_picture_vision_enabled(
     recognition_policy: &LibraryRecognitionPolicy,
+    vision_binding_available: bool,
 ) -> bool {
-    recognition_policy.raster_image_engine == RecognitionEngine::Vision
+    raster_image_vision_enabled(recognition_policy, vision_binding_available)
+}
+
+#[must_use]
+pub fn raster_image_vision_enabled(
+    recognition_policy: &LibraryRecognitionPolicy,
+    vision_binding_available: bool,
+) -> bool {
+    recognition_policy.raster_image_engine == RecognitionEngine::Vision && vision_binding_available
 }
 
 pub fn build_docling_pdf_extraction_plan(output: ExtractionOutput) -> FileExtractionPlan {
@@ -863,6 +1005,7 @@ fn docling_owned_recognition_profile(
     file_kind: UploadFileKind,
     source_format: &str,
     recognition_policy: &LibraryRecognitionPolicy,
+    vision_binding_available: bool,
 ) -> Result<RecognitionProfile, FileExtractError> {
     match file_kind {
         UploadFileKind::Pdf | UploadFileKind::Docx | UploadFileKind::Pptx => {
@@ -872,16 +1015,20 @@ fn docling_owned_recognition_profile(
                 structure_tier: RecognitionStructureTier::Layout,
             })
         }
-        UploadFileKind::Image => match recognition_policy.raster_image_engine {
-            RecognitionEngine::Docling => Ok(RecognitionProfile {
-                capability: RecognitionCapability::ImageOcr,
-                engine: RecognitionEngine::Docling,
-                structure_tier: RecognitionStructureTier::Layout,
-            }),
-            RecognitionEngine::Vision => Ok(RecognitionProfile {
+        UploadFileKind::Image
+            if raster_image_vision_enabled(recognition_policy, vision_binding_available) =>
+        {
+            Ok(RecognitionProfile {
                 capability: RecognitionCapability::ImageOcr,
                 engine: RecognitionEngine::Vision,
                 structure_tier: RecognitionStructureTier::Flat,
+            })
+        }
+        UploadFileKind::Image => match recognition_policy.raster_image_engine {
+            RecognitionEngine::Docling | RecognitionEngine::Vision => Ok(RecognitionProfile {
+                capability: RecognitionCapability::ImageOcr,
+                engine: RecognitionEngine::Docling,
+                structure_tier: RecognitionStructureTier::Layout,
             }),
             engine => Err(unsupported_recognition_engine_error(
                 file_kind,
@@ -898,6 +1045,31 @@ fn docling_owned_recognition_profile(
             })
         }
     }
+}
+
+fn strip_docling_picture_ocr_scaffold(content_text: &str) -> String {
+    let mut applied = false;
+    let mut lines = Vec::new();
+    let mut blank_run = 0usize;
+
+    for line in content_text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "<!-- image -->" || trimmed.starts_with("> Image OCR:") {
+            applied = true;
+            continue;
+        }
+        if trimmed.is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 {
+                lines.push(String::new());
+            }
+            continue;
+        }
+        blank_run = 0;
+        lines.push(line.trim_end().to_string());
+    }
+
+    if applied { lines.join("\n").trim().to_string() } else { content_text.to_string() }
 }
 
 fn with_plan_recognition_profile(
@@ -1024,9 +1196,12 @@ fn lower_file_extension(file_name: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Write};
+    use std::{
+        io::{Cursor, Write},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
-    use anyhow::Result;
+    use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use image::{DynamicImage, ImageFormat};
     use zip::write::SimpleFileOptions;
@@ -1036,6 +1211,7 @@ mod tests {
         ChatRequest, ChatResponse, EmbeddingBatchRequest, EmbeddingBatchResponse, EmbeddingRequest,
         EmbeddingResponse, VisionRequest, VisionResponse,
     };
+    use crate::shared::extraction::ExtractedImage;
 
     fn valid_png_bytes() -> Vec<u8> {
         let image = DynamicImage::new_rgba8(2, 2);
@@ -1120,6 +1296,9 @@ mod tests {
 
     struct FakeGateway;
     struct EmptyVisionGateway;
+    struct PartialFailureVisionGateway {
+        calls: AtomicUsize,
+    }
 
     #[async_trait]
     impl LlmGateway for FakeGateway {
@@ -1143,7 +1322,11 @@ mod tests {
                 provider_kind: request.provider_kind,
                 model_name: request.model_name,
                 output_text: "Acme Corp\nBudget 2026".to_string(),
-                usage_json: serde_json::json!({}),
+                usage_json: serde_json::json!({
+                    "prompt_tokens": 11,
+                    "completion_tokens": 3,
+                    "total_tokens": 14,
+                }),
             })
         }
     }
@@ -1171,6 +1354,41 @@ mod tests {
                 model_name: request.model_name,
                 output_text: String::new(),
                 usage_json: serde_json::json!({}),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmGateway for PartialFailureVisionGateway {
+        async fn generate(&self, _request: ChatRequest) -> Result<ChatResponse> {
+            unreachable!("generate is not used in file extraction tests")
+        }
+
+        async fn embed(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+            unreachable!("embed is not used in file extraction tests")
+        }
+
+        async fn embed_many(
+            &self,
+            _request: EmbeddingBatchRequest,
+        ) -> Result<EmbeddingBatchResponse> {
+            unreachable!("embed_many is not used in file extraction tests")
+        }
+
+        async fn vision_extract(&self, request: VisionRequest) -> Result<VisionResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
+                return Err(anyhow!("synthetic picture OCR failure"));
+            }
+            Ok(VisionResponse {
+                provider_kind: request.provider_kind,
+                model_name: request.model_name,
+                output_text: "First embedded diagram text".to_string(),
+                usage_json: serde_json::json!({
+                    "prompt_tokens": 7,
+                    "completion_tokens": 2,
+                    "total_tokens": 9,
+                }),
             })
         }
     }
@@ -1672,25 +1890,18 @@ mod tests {
         assert_eq!(result.source_map["recognition"]["engine"], serde_json::json!("vision"));
     }
 
-    #[tokio::test]
-    async fn runtime_plan_requires_vision_binding_for_vision_image_policy() {
+    #[test]
+    fn vision_image_policy_without_binding_uses_docling_profile() {
         let policy = LibraryRecognitionPolicy { raster_image_engine: RecognitionEngine::Vision };
 
-        let error = build_runtime_file_extraction_plan(FileExtractionRequest {
-            gateway: &FakeGateway,
-            vision_provider: None,
-            vision_api_key: None,
-            vision_base_url: None,
-            vision_extra_parameters_json: None,
-            file_name: Some("scan.png"),
-            mime_type: Some("image/png"),
-            file_bytes: valid_png_bytes(),
-            recognition_policy: &policy,
-        })
-        .await
-        .expect_err("vision policy must fail loudly when binding is missing");
+        let profile =
+            docling_owned_recognition_profile(UploadFileKind::Image, "png", &policy, false).expect(
+                "missing vision binding should fall back to Docling for Docling-supported images",
+            );
 
-        assert!(error.to_string().contains("vision binding is not configured"));
+        assert_eq!(profile.engine, RecognitionEngine::Docling);
+        assert_eq!(profile.capability, RecognitionCapability::ImageOcr);
+        assert_eq!(profile.structure_tier, RecognitionStructureTier::Layout);
     }
 
     #[tokio::test]
@@ -1721,8 +1932,9 @@ mod tests {
     #[test]
     fn missing_vision_binding_keeps_static_raster_images_on_docling() {
         let policy = LibraryRecognitionPolicy::default();
-        let profile = docling_owned_recognition_profile(UploadFileKind::Image, "png", &policy)
-            .expect("docling-supported static raster image should stay on docling");
+        let profile =
+            docling_owned_recognition_profile(UploadFileKind::Image, "png", &policy, false)
+                .expect("docling-supported static raster image should stay on docling");
 
         assert_eq!(profile.engine, RecognitionEngine::Docling);
         assert_eq!(profile.capability, RecognitionCapability::ImageOcr);
@@ -1731,12 +1943,343 @@ mod tests {
 
     #[test]
     fn docling_embedded_picture_ocr_follows_library_recognition_policy() {
-        let docling_policy = LibraryRecognitionPolicy::default();
+        let docling_policy =
+            LibraryRecognitionPolicy { raster_image_engine: RecognitionEngine::Docling };
         let vision_policy =
             LibraryRecognitionPolicy { raster_image_engine: RecognitionEngine::Vision };
 
-        assert!(!docling_embedded_picture_vision_enabled(&docling_policy));
-        assert!(docling_embedded_picture_vision_enabled(&vision_policy));
+        assert!(!docling_embedded_picture_vision_enabled(&docling_policy, true));
+        assert!(docling_embedded_picture_vision_enabled(&vision_policy, true));
+        assert!(!docling_embedded_picture_vision_enabled(&vision_policy, false));
+    }
+
+    #[test]
+    fn vision_picture_augmentation_strips_docling_picture_ocr_scaffold() {
+        let content =
+            "# Manual\n\n<!-- image -->\n\n> Image OCR: Low confidence glyph soup\n\nBody";
+
+        let stripped = strip_docling_picture_ocr_scaffold(content);
+
+        assert_eq!(stripped, "# Manual\n\nBody");
+    }
+
+    #[test]
+    fn docling_picture_ocr_fallback_appends_only_when_vision_is_unavailable() {
+        let layout = crate::shared::extraction::build_text_layout_from_content("# Manual");
+        let mut output = ExtractionOutput {
+            extraction_kind: "docling_markdown".to_string(),
+            content_text: layout.content_text,
+            page_count: Some(1),
+            warnings: Vec::new(),
+            source_metadata: ExtractionSourceMetadata {
+                source_format: "pdf".to_string(),
+                page_count: Some(1),
+                line_count: 1,
+            },
+            structure_hints: layout.structure_hints,
+            source_map: serde_json::json!({
+                "docling_picture_ocr_text": ["", "Architecture diagram labels"]
+            }),
+            provider_kind: None,
+            model_name: None,
+            usage_json: serde_json::json!({}),
+            extracted_images: Vec::new(),
+        };
+
+        append_docling_picture_ocr_fallback(&mut output);
+
+        assert!(output.content_text.contains("# Manual"));
+        assert!(output.content_text.contains("Architecture diagram labels"));
+        assert_eq!(output.source_metadata.line_count, 4);
+    }
+
+    #[tokio::test]
+    async fn vision_picture_augmentation_records_provider_and_usage() {
+        let layout = crate::shared::extraction::build_text_layout_from_content(
+            "# Manual\n\n<!-- image -->\n\n> Image OCR: stale local OCR",
+        );
+        let mut output = ExtractionOutput {
+            extraction_kind: "docling_markdown".to_string(),
+            content_text: layout.content_text,
+            page_count: Some(1),
+            warnings: Vec::new(),
+            source_metadata: ExtractionSourceMetadata {
+                source_format: "pdf".to_string(),
+                page_count: Some(1),
+                line_count: 1,
+            },
+            structure_hints: layout.structure_hints,
+            source_map: serde_json::json!({
+                "docling_picture_ocr_text": ["stale local OCR"]
+            }),
+            provider_kind: None,
+            model_name: None,
+            usage_json: serde_json::json!({}),
+            extracted_images: vec![
+                ExtractedImage {
+                    page: 1,
+                    image_bytes: valid_png_bytes(),
+                    mime_type: "image/png".to_string(),
+                    width: 32,
+                    height: 32,
+                },
+                ExtractedImage {
+                    page: 1,
+                    image_bytes: valid_png_bytes(),
+                    mime_type: "image/png".to_string(),
+                    width: 64,
+                    height: 64,
+                },
+            ],
+        };
+        let provider = ProviderModelSelection {
+            provider_kind: "openai".to_string(),
+            model_name: "gpt-5.4-mini".to_string(),
+        };
+
+        augment_docling_output_with_vision_picture_ocr(
+            &mut output,
+            UploadFileKind::Pdf,
+            &FakeGateway,
+            Some(&provider),
+            Some("test-key"),
+            None,
+            None,
+        )
+        .await
+        .expect("embedded pictures should be routed to vision");
+
+        assert_eq!(output.provider_kind.as_deref(), Some("openai"));
+        assert_eq!(output.model_name.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(output.usage_json["embedded_picture_ocr_call_count"], serde_json::json!(2));
+        assert_eq!(output.usage_json["prompt_tokens"], serde_json::json!(22));
+        assert_eq!(output.usage_json["completion_tokens"], serde_json::json!(6));
+        assert_eq!(output.usage_json["total_tokens"], serde_json::json!(28));
+        assert_eq!(output.source_map["vision_picture_ocr"]["imageCount"], serde_json::json!(2));
+        assert!(output.content_text.contains("--- Embedded image 1 (32x32) ---"));
+        assert!(!output.content_text.contains("stale local OCR"));
+    }
+
+    #[tokio::test]
+    async fn vision_picture_augmentation_keeps_docling_fallback_when_image_bytes_are_missing() {
+        let layout = crate::shared::extraction::build_text_layout_from_content("# Manual");
+        let mut output = ExtractionOutput {
+            extraction_kind: "docling_markdown".to_string(),
+            content_text: layout.content_text,
+            page_count: Some(1),
+            warnings: Vec::new(),
+            source_metadata: ExtractionSourceMetadata {
+                source_format: "pdf".to_string(),
+                page_count: Some(1),
+                line_count: 1,
+            },
+            structure_hints: layout.structure_hints,
+            source_map: serde_json::json!({
+                "docling_picture_ocr_text": ["Diagram label from local extraction"]
+            }),
+            provider_kind: None,
+            model_name: None,
+            usage_json: serde_json::json!({}),
+            extracted_images: Vec::new(),
+        };
+        let provider = ProviderModelSelection {
+            provider_kind: "openai".to_string(),
+            model_name: "gpt-5.4-mini".to_string(),
+        };
+
+        augment_docling_output_with_vision_picture_ocr(
+            &mut output,
+            UploadFileKind::Pdf,
+            &FakeGateway,
+            Some(&provider),
+            Some("test-key"),
+            None,
+            None,
+        )
+        .await
+        .expect("missing embedded image bytes should keep local fallback text");
+
+        assert!(output.content_text.contains("Diagram label from local extraction"));
+        assert!(output.provider_kind.is_none());
+        assert_eq!(output.source_metadata.line_count, 4);
+    }
+
+    #[tokio::test]
+    async fn vision_picture_augmentation_keeps_docling_fallback_when_vision_returns_empty_text() {
+        let layout = crate::shared::extraction::build_text_layout_from_content(
+            "# Manual\n\n<!-- image -->\n\n> Image OCR: local fallback text",
+        );
+        let mut output = ExtractionOutput {
+            extraction_kind: "docling_markdown".to_string(),
+            content_text: layout.content_text,
+            page_count: Some(1),
+            warnings: Vec::new(),
+            source_metadata: ExtractionSourceMetadata {
+                source_format: "pdf".to_string(),
+                page_count: Some(1),
+                line_count: 1,
+            },
+            structure_hints: layout.structure_hints,
+            source_map: serde_json::json!({
+                "docling_picture_ocr_text": ["local fallback text"]
+            }),
+            provider_kind: None,
+            model_name: None,
+            usage_json: serde_json::json!({}),
+            extracted_images: vec![ExtractedImage {
+                page: 1,
+                image_bytes: valid_png_bytes(),
+                mime_type: "image/png".to_string(),
+                width: 32,
+                height: 32,
+            }],
+        };
+        let provider = ProviderModelSelection {
+            provider_kind: "openai".to_string(),
+            model_name: "gpt-5.4-mini".to_string(),
+        };
+
+        augment_docling_output_with_vision_picture_ocr(
+            &mut output,
+            UploadFileKind::Pdf,
+            &EmptyVisionGateway,
+            Some(&provider),
+            Some("test-key"),
+            None,
+            None,
+        )
+        .await
+        .expect("empty embedded picture OCR should keep local fallback text");
+
+        assert_eq!(output.provider_kind.as_deref(), Some("openai"));
+        assert_eq!(output.model_name.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(output.usage_json["embedded_picture_ocr_call_count"], serde_json::json!(1));
+        assert_eq!(output.source_map["vision_picture_ocr"]["snippetCount"], serde_json::json!(0));
+        assert!(output.content_text.contains("--- Embedded image 1 ---"));
+        assert!(output.content_text.contains("local fallback text"));
+        assert!(!output.content_text.contains("> Image OCR:"));
+    }
+
+    #[tokio::test]
+    async fn vision_picture_augmentation_keeps_inline_docling_ocr_when_fallback_source_map_is_empty()
+     {
+        let layout = crate::shared::extraction::build_text_layout_from_content(
+            "# Manual\n\n<!-- image -->\n\n> Image OCR: inline fallback only",
+        );
+        let mut output = ExtractionOutput {
+            extraction_kind: "docling_markdown".to_string(),
+            content_text: layout.content_text,
+            page_count: Some(1),
+            warnings: Vec::new(),
+            source_metadata: ExtractionSourceMetadata {
+                source_format: "pdf".to_string(),
+                page_count: Some(1),
+                line_count: 1,
+            },
+            structure_hints: layout.structure_hints,
+            source_map: serde_json::json!({}),
+            provider_kind: None,
+            model_name: None,
+            usage_json: serde_json::json!({}),
+            extracted_images: vec![ExtractedImage {
+                page: 1,
+                image_bytes: valid_png_bytes(),
+                mime_type: "image/png".to_string(),
+                width: 32,
+                height: 32,
+            }],
+        };
+        let provider = ProviderModelSelection {
+            provider_kind: "openai".to_string(),
+            model_name: "gpt-5.4-mini".to_string(),
+        };
+
+        augment_docling_output_with_vision_picture_ocr(
+            &mut output,
+            UploadFileKind::Pdf,
+            &EmptyVisionGateway,
+            Some(&provider),
+            Some("test-key"),
+            None,
+            None,
+        )
+        .await
+        .expect("empty embedded picture OCR should not discard inline local OCR");
+
+        assert_eq!(output.provider_kind.as_deref(), Some("openai"));
+        assert_eq!(output.usage_json["embedded_picture_ocr_call_count"], serde_json::json!(1));
+        assert!(output.content_text.contains("<!-- image -->"));
+        assert!(output.content_text.contains("> Image OCR: inline fallback only"));
+    }
+
+    #[tokio::test]
+    async fn vision_picture_augmentation_preserves_usage_after_partial_picture_failure() {
+        let layout = crate::shared::extraction::build_text_layout_from_content(
+            "# Manual\n\n<!-- image -->\n\n> Image OCR: stale local OCR",
+        );
+        let mut output = ExtractionOutput {
+            extraction_kind: "docling_markdown".to_string(),
+            content_text: layout.content_text,
+            page_count: Some(1),
+            warnings: Vec::new(),
+            source_metadata: ExtractionSourceMetadata {
+                source_format: "pdf".to_string(),
+                page_count: Some(1),
+                line_count: 1,
+            },
+            structure_hints: layout.structure_hints,
+            source_map: serde_json::json!({
+                "docling_picture_ocr_text": ["stale local OCR"]
+            }),
+            provider_kind: None,
+            model_name: None,
+            usage_json: serde_json::json!({}),
+            extracted_images: vec![
+                ExtractedImage {
+                    page: 1,
+                    image_bytes: valid_png_bytes(),
+                    mime_type: "image/png".to_string(),
+                    width: 32,
+                    height: 32,
+                },
+                ExtractedImage {
+                    page: 1,
+                    image_bytes: valid_png_bytes(),
+                    mime_type: "image/png".to_string(),
+                    width: 64,
+                    height: 64,
+                },
+            ],
+        };
+        let provider = ProviderModelSelection {
+            provider_kind: "openai".to_string(),
+            model_name: "gpt-5.4-mini".to_string(),
+        };
+        let gateway = PartialFailureVisionGateway { calls: AtomicUsize::new(0) };
+
+        augment_docling_output_with_vision_picture_ocr(
+            &mut output,
+            UploadFileKind::Pdf,
+            &gateway,
+            Some(&provider),
+            Some("test-key"),
+            None,
+            None,
+        )
+        .await
+        .expect("partial embedded picture failure should keep successful OCR and usage");
+
+        assert_eq!(output.provider_kind.as_deref(), Some("openai"));
+        assert_eq!(output.usage_json["embedded_picture_ocr_call_count"], serde_json::json!(1));
+        assert_eq!(output.usage_json["prompt_tokens"], serde_json::json!(7));
+        assert_eq!(output.source_map["vision_picture_ocr"]["imageCount"], serde_json::json!(2));
+        assert_eq!(
+            output.source_map["vision_picture_ocr"]["failedImageCount"],
+            serde_json::json!(1)
+        );
+        assert!(output.content_text.contains("First embedded diagram text"));
+        assert!(!output.content_text.contains("stale local OCR"));
+        assert!(output.warnings.iter().any(|warning| warning.contains("embedded picture 2")));
     }
 
     #[test]

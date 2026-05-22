@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     app::state::AppState,
-    domains::recognition::{LibraryRecognitionPolicy, RecognitionEngine},
+    domains::recognition::LibraryRecognitionPolicy,
     domains::{
         ai::AiBindingPurpose,
         catalog::{
@@ -767,16 +767,10 @@ impl CatalogService {
         }
 
         let mut readiness = HashMap::with_capacity(library_policies.len());
-        for (library_id, recognition_policy) in library_policies {
+        for (library_id, _recognition_policy) in library_policies {
             let present = purposes_by_library.get(library_id);
-            let mut missing_binding_purposes =
+            let missing_binding_purposes =
                 missing_required_purposes(present, INGEST_REQUIRED_BINDINGS);
-            if recognition_policy.raster_image_engine == RecognitionEngine::Vision
-                && !present
-                    .is_some_and(|bindings| bindings.contains(AiBindingPurpose::Vision.as_str()))
-            {
-                missing_binding_purposes.push(AiBindingPurpose::Vision);
-            }
             readiness.insert(
                 *library_id,
                 CatalogLibraryBindingReadiness {

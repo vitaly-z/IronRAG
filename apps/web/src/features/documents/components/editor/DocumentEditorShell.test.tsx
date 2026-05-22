@@ -18,16 +18,29 @@ const {
     activeTable: false,
     activeCodeBlock: false,
     activeBulletList: false,
+    activeOrderedList: false,
     activeBlockquote: false,
     activeHeadingLevel: 0,
+    activeBold: false,
+    activeItalic: false,
+    activeLink: false,
+    linkHref: '',
   };
 
   const editorChain = {
     focus: vi.fn(() => editorChain),
     toggleHeading: vi.fn(() => editorChain),
+    toggleBold: vi.fn(() => editorChain),
+    toggleItalic: vi.fn(() => editorChain),
     toggleBulletList: vi.fn(() => editorChain),
+    toggleOrderedList: vi.fn(() => editorChain),
     toggleBlockquote: vi.fn(() => editorChain),
     toggleCodeBlock: vi.fn(() => editorChain),
+    extendMarkRange: vi.fn(() => editorChain),
+    insertContent: vi.fn(() => editorChain),
+    setLink: vi.fn(() => editorChain),
+    unsetLink: vi.fn(() => editorChain),
+    setImage: vi.fn(() => editorChain),
     insertTable: vi.fn(() => editorChain),
     addRowAfter: vi.fn(() => editorChain),
     addColumnAfter: vi.fn(() => editorChain),
@@ -45,6 +58,17 @@ const {
       focus: vi.fn(),
     },
     chain: vi.fn(() => editorChain),
+    getAttributes: vi.fn((name: string) => {
+      if (name === 'link') {
+        return { href: editorState.linkHref };
+      }
+      return {};
+    }),
+    state: {
+      selection: {
+        empty: false,
+      },
+    },
     isActive: vi.fn((name: string, attrs?: { level?: number }) => {
       if (name === 'table') {
         return editorState.activeTable;
@@ -55,8 +79,20 @@ const {
       if (name === 'bulletList') {
         return editorState.activeBulletList;
       }
+      if (name === 'orderedList') {
+        return editorState.activeOrderedList;
+      }
       if (name === 'blockquote') {
         return editorState.activeBlockquote;
+      }
+      if (name === 'bold') {
+        return editorState.activeBold;
+      }
+      if (name === 'italic') {
+        return editorState.activeItalic;
+      }
+      if (name === 'link') {
+        return editorState.activeLink;
       }
       if (name === 'heading') {
         return editorState.activeHeadingLevel === (attrs?.level ?? 0);
@@ -115,8 +151,14 @@ describe('DocumentEditorShell', () => {
     editorState.activeTable = false;
     editorState.activeCodeBlock = false;
     editorState.activeBulletList = false;
+    editorState.activeOrderedList = false;
     editorState.activeBlockquote = false;
     editorState.activeHeadingLevel = 0;
+    editorState.activeBold = false;
+    editorState.activeItalic = false;
+    editorState.activeLink = false;
+    editorState.linkHref = '';
+    mockEditor.state.selection.empty = false;
     container = document.createElement('div');
     document.body.appendChild(container);
     root = null;
@@ -142,7 +184,7 @@ describe('DocumentEditorShell', () => {
       root = createRoot(container);
       root.render(
         <DocumentEditorShell
-          documentName="employees.xlsx"
+          documentName={props?.documentName ?? 'employees.xlsx'}
           error={null}
           loading={false}
           markdown={props?.markdown ?? '## Employees\n\n| Name | Team |\n| --- | --- |\n| Elena | AI |'}
@@ -152,6 +194,7 @@ describe('DocumentEditorShell', () => {
           readOnly={props?.readOnly ?? false}
           saving={props?.saving ?? false}
           sourceFormat={props?.sourceFormat ?? 'xlsx'}
+          sourceHref={props?.sourceHref}
           t={i18n.t.bind(i18n)}
         />,
       );
@@ -171,6 +214,9 @@ describe('DocumentEditorShell', () => {
 
     expect(container.textContent).toContain('All changes saved');
     expect(container.textContent).not.toContain('Unsaved changes');
+
+    const saveButton = Array.from(container.querySelectorAll('button')).at(-1);
+    expect(saveButton?.getAttribute('disabled')).not.toBeNull();
   });
 
   it('shows table-focused copy for spreadsheet documents', async () => {
@@ -181,8 +227,108 @@ describe('DocumentEditorShell', () => {
 
     expect(container.textContent).toContain('Table');
     expect(container.textContent).toContain('Scroll inside the table to reach hidden columns.');
-    expect(container.textContent).toContain('Row+');
-    expect(container.textContent).toContain('Col+');
+    expect(container.querySelector('button[aria-label="Wrap text"]')).toBeTruthy();
+    expect(container.querySelector('button[aria-label="Bold"]')).toBeTruthy();
+    expect(container.querySelector('button[aria-label="Link"]')).toBeTruthy();
+    expect(container.querySelector('button[aria-label="Row+"]')).toBeTruthy();
+    expect(container.querySelector('button[aria-label="Col+"]')).toBeTruthy();
+  });
+
+  it('wires prose toolbar actions through canonical Tiptap commands', async () => {
+    editorState.markdown = '# Notes\n\nParagraph';
+    const promptSpy = vi.spyOn(window, 'prompt')
+      .mockReturnValueOnce('https://example.test/reference')
+      .mockReturnValueOnce('/assets/diagram.png');
+
+    await renderShell({
+      documentName: 'notes.md',
+      markdown: '# Notes\n\nParagraph',
+      sourceFormat: 'md',
+    });
+
+    const clickByLabel = async (label: string) => {
+      const button = Array.from(container.querySelectorAll('button')).find(
+        (candidate) => candidate.getAttribute('aria-label') === label,
+      );
+      expect(button, label).toBeTruthy();
+      await act(async () => {
+        button?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      });
+    };
+
+    await clickByLabel('Bold');
+    await clickByLabel('Italic');
+    await clickByLabel('Numbered list');
+    await clickByLabel('Link');
+    await clickByLabel('Image');
+
+    expect(editorChain.toggleBold).toHaveBeenCalled();
+    expect(editorChain.toggleItalic).toHaveBeenCalled();
+    expect(editorChain.toggleOrderedList).toHaveBeenCalled();
+    expect(editorChain.setLink).toHaveBeenCalledWith({ href: 'https://example.test/reference' });
+    expect(editorChain.setImage).toHaveBeenCalledWith({ src: '/assets/diagram.png' });
+    expect(promptSpy).toHaveBeenCalledTimes(2);
+
+    promptSpy.mockRestore();
+  });
+
+  it('inserts a visible markdown link when no text is selected', async () => {
+    editorState.markdown = '# Notes\n\nParagraph';
+    mockEditor.state.selection.empty = true;
+    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValueOnce('https://example.test/reference');
+
+    await renderShell({
+      documentName: 'notes.md',
+      markdown: '# Notes\n\nParagraph',
+      sourceFormat: 'md',
+    });
+
+    const linkButton = Array.from(container.querySelectorAll('button')).find(
+      (candidate) => candidate.getAttribute('aria-label') === 'Link',
+    );
+    expect(linkButton).toBeTruthy();
+
+    await act(async () => {
+      linkButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(editorChain.insertContent).toHaveBeenCalledWith({
+      type: 'text',
+      text: 'https://example.test/reference',
+      marks: [
+        {
+          type: 'link',
+          attrs: { href: 'https://example.test/reference' },
+        },
+      ],
+    });
+    expect(editorChain.setLink).not.toHaveBeenCalled();
+
+    promptSpy.mockRestore();
+    mockEditor.state.selection.empty = false;
+  });
+
+  it('can remove an existing markdown link from the toolbar', async () => {
+    editorState.markdown = '[Reference](https://example.test/reference)';
+    editorState.activeLink = true;
+    editorState.linkHref = 'https://example.test/reference';
+
+    await renderShell({
+      documentName: 'notes.md',
+      markdown: '[Reference](https://example.test/reference)',
+      sourceFormat: 'md',
+    });
+
+    const unlinkButton = Array.from(container.querySelectorAll('button')).find(
+      (candidate) => candidate.getAttribute('aria-label') === 'Remove link',
+    );
+    expect(unlinkButton).toBeTruthy();
+
+    await act(async () => {
+      unlinkButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(editorChain.unsetLink).toHaveBeenCalled();
   });
 
   it('shows code-focused copy for code documents', async () => {
@@ -269,6 +415,74 @@ describe('DocumentEditorShell', () => {
     expect(container.textContent).not.toContain('Bullets');
     expect(getLatestEditorConfig()?.editable).toBe(false);
     expect(mockEditor.setEditable).toHaveBeenCalledWith(false);
+  });
+
+  it('keeps line wrapping enabled by default and lets the toolbar disable it', async () => {
+    await renderShell({
+      documentName: 'notes.txt',
+      markdown: 'A very long line should wrap by default.',
+      sourceFormat: 'txt',
+    });
+
+    const textarea = container.querySelector('textarea');
+    expect(textarea?.className).toContain('document-editor-raw-textarea--wrap');
+
+    const wrapButton = Array.from(container.querySelectorAll('button')).find(
+      (candidate) => candidate.getAttribute('aria-label') === 'Wrap text',
+    );
+    expect(wrapButton).toBeTruthy();
+
+    await act(async () => {
+      wrapButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(container.querySelector('textarea')?.className).not.toContain('document-editor-raw-textarea--wrap');
+  });
+
+  it('uses viewport-width table content while line wrapping is enabled', async () => {
+    editorState.markdown = [
+      '# Readme',
+      '',
+      '| Badge | Description |',
+      '| --- | --- |',
+      '| Stars | IronRAG pipeline from messy data to structured knowledge |',
+    ].join('\n');
+
+    await renderShell({
+      documentName: 'README.md',
+      markdown: editorState.markdown,
+      sourceFormat: 'md',
+    });
+
+    const tableContent = container.querySelector('[data-testid="document-editor-table-content"]');
+    expect(tableContent?.className).toContain('w-full');
+    expect(tableContent?.className).not.toContain('w-max');
+
+    const wrapButton = Array.from(container.querySelectorAll('button')).find(
+      (candidate) => candidate.getAttribute('aria-label') === 'Wrap text',
+    );
+    expect(wrapButton).toBeTruthy();
+
+    await act(async () => {
+      wrapButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(container.querySelector('[data-testid="document-editor-table-content"]')?.className).toContain('w-max');
+  });
+
+  it('uses the stored source as the read-only PDF viewer frame', async () => {
+    await renderShell({
+      documentName: 'guide.pdf',
+      markdown: '',
+      readOnly: true,
+      sourceFormat: 'pdf',
+      sourceHref: '/v1/content/documents/doc-1/source',
+    });
+
+    const iframe = container.querySelector('iframe');
+    expect(iframe).toBeTruthy();
+    expect(iframe?.getAttribute('src')).toBe('/v1/content/documents/doc-1/source');
+    expect(iframe?.getAttribute('title')).toBe('guide.pdf');
   });
 
   it('becomes dirty only after a real content update', async () => {

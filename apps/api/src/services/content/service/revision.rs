@@ -59,9 +59,10 @@ use crate::{
     },
     shared::extraction::file_extract::{
         FileExtractError, FileExtractionPlan, FileExtractionRequest, UploadAdmissionError,
-        UploadFileKind, augment_docling_output_with_vision_picture_ocr,
-        build_docling_pdf_extraction_plan, build_runtime_file_extraction_plan,
-        docling_embedded_picture_vision_enabled, validate_upload_file_admission,
+        UploadFileKind, append_docling_picture_ocr_fallback,
+        augment_docling_output_with_vision_picture_ocr, build_docling_pdf_extraction_plan,
+        build_runtime_file_extraction_plan, docling_embedded_picture_vision_enabled,
+        validate_upload_file_admission,
     },
     shared::extraction::{
         ExtractionOutput,
@@ -220,7 +221,22 @@ impl ContentService {
             .ai_catalog
             .resolve_active_runtime_binding(state, library_id, AiBindingPurpose::Vision)
             .await
-            .unwrap_or(None);
+            .map_err(|error| {
+                UploadAdmissionError::from_file_extract_error(
+                    file_name,
+                    mime_type,
+                    file_size_bytes,
+                    &FileExtractError::ExtractionFailed {
+                        file_kind: validate_upload_file_admission(
+                            Some(file_name),
+                            mime_type,
+                            file_bytes,
+                        )
+                        .unwrap_or(UploadFileKind::Binary),
+                        message: format!("failed to resolve vision binding: {error}"),
+                    },
+                )
+            })?;
         let vision_provider = vision_binding.as_ref().map(|binding| ProviderModelSelection {
             provider_kind: binding.provider_kind.clone(),
             model_name: binding.model_name.clone(),
@@ -296,23 +312,26 @@ impl ContentService {
                 });
             }
         };
-        if !docling_embedded_picture_vision_enabled(&recognition_policy) {
-            output.extracted_images.clear();
-            return Ok(());
-        }
         let vision_binding = state
             .canonical_services
             .ai_catalog
             .resolve_active_runtime_binding(state, library_id, AiBindingPurpose::Vision)
             .await
-            .unwrap_or(None);
+            .map_err(|error| {
+                output.extracted_images.clear();
+                FileExtractError::ExtractionFailed {
+                    file_kind: UploadFileKind::Pdf,
+                    message: format!("failed to resolve vision binding: {error}"),
+                }
+            })?;
+        if !docling_embedded_picture_vision_enabled(&recognition_policy, vision_binding.is_some()) {
+            append_docling_picture_ocr_fallback(output);
+            output.extracted_images.clear();
+            return Ok(());
+        }
         let Some(vision_binding) = vision_binding else {
             output.extracted_images.clear();
-            return Err(FileExtractError::ExtractionFailed {
-                file_kind: UploadFileKind::Pdf,
-                message: "vision recognition policy is active but no Vision binding is configured"
-                    .to_string(),
-            });
+            return Ok(());
         };
         let vision_provider = ProviderModelSelection {
             provider_kind: vision_binding.provider_kind.clone(),

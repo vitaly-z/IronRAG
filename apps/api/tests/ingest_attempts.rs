@@ -19,15 +19,13 @@ use ironrag_backend::{
     },
     services::{
         catalog_service::{CreateLibraryCommand, CreateWorkspaceCommand},
+        content::service::{CreateDocumentCommand, CreateRevisionCommand, PromoteHeadCommand},
         ingest::service::{
             AdmitIngestJobCommand, FinalizeAttemptCommand, LeaseAttemptCommand,
             RecordStageEventCommand,
         },
         ingest::web::CreateWebIngestRunCommand,
-        knowledge::service::{
-            CreateKnowledgeDocumentCommand, CreateKnowledgeRevisionCommand,
-            PromoteKnowledgeDocumentCommand, RefreshKnowledgeLibraryGenerationCommand,
-        },
+        knowledge::service::CreateKnowledgeRevisionCommand,
         ops::service::CreateAsyncOperationCommand,
     },
 };
@@ -224,25 +222,45 @@ impl IngestAttemptsFixture {
             .await
             .context("failed to create ingest_attempts library")?;
 
-        let document_id = Uuid::now_v7();
-        let revision_id = Uuid::now_v7();
-        state
+        let document = state
             .canonical_services
-            .knowledge
-            .create_document_shell(
+            .content
+            .create_document(
                 &state,
-                CreateKnowledgeDocumentCommand {
-                    document_id,
+                CreateDocumentCommand {
                     workspace_id: workspace.id,
                     library_id: library.id,
-                    external_key: format!("ingest-attempts-doc-{}", Uuid::now_v7().simple()),
+                    external_key: Some(format!("ingest-attempts-doc-{}", Uuid::now_v7().simple())),
                     file_name: None,
-                    title: Some("Ingest Attempts Fixture".to_string()),
-                    document_state: "active".to_string(),
+                    created_by_principal_id: None,
                 },
             )
             .await
-            .context("failed to create ingest_attempts document shell")?;
+            .context("failed to create ingest_attempts content document")?;
+        let document_id = document.id;
+        let content_revision = state
+            .canonical_services
+            .content
+            .create_revision(
+                &state,
+                CreateRevisionCommand {
+                    document_id,
+                    content_source_kind: "upload".to_string(),
+                    checksum: format!("checksum-{document_id}"),
+                    mime_type: "text/plain".to_string(),
+                    byte_size: 128,
+                    title: Some("Ingest Attempts Fixture".to_string()),
+                    language_code: None,
+                    source_uri: Some(format!("memory://ingest-attempts/source/{document_id}")),
+                    document_hint: None,
+                    storage_key: Some(format!("memory://ingest-attempts/{document_id}")),
+                    created_by_principal_id: None,
+                },
+            )
+            .await
+            .context("failed to create ingest_attempts content revision")?;
+        let revision_id = content_revision.id;
+        let generation_id = Uuid::now_v7();
         state
             .canonical_services
             .knowledge
@@ -281,39 +299,19 @@ impl IngestAttemptsFixture {
             .context("failed to write ingest_attempts revision")?;
         state
             .canonical_services
-            .knowledge
-            .promote_document(
+            .content
+            .promote_document_head(
                 &state,
-                PromoteKnowledgeDocumentCommand {
+                PromoteHeadCommand {
                     document_id,
-                    document_state: "active".to_string(),
                     active_revision_id: Some(revision_id),
                     readable_revision_id: Some(revision_id),
-                    latest_revision_no: Some(1),
-                    deleted_at: None,
+                    latest_mutation_id: None,
+                    latest_successful_attempt_id: None,
                 },
             )
             .await
             .context("failed to promote ingest_attempts document")?;
-
-        let generation_id = Uuid::now_v7();
-        state
-            .canonical_services
-            .knowledge
-            .refresh_library_generation(
-                &state,
-                RefreshKnowledgeLibraryGenerationCommand {
-                    generation_id,
-                    workspace_id: workspace.id,
-                    library_id: library.id,
-                    active_text_generation: 1,
-                    active_vector_generation: 0,
-                    active_graph_generation: 0,
-                    degraded_state: "extracting".to_string(),
-                },
-            )
-            .await
-            .context("failed to refresh ingest_attempts knowledge generation")?;
 
         Ok(Self {
             state,

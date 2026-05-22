@@ -57,6 +57,12 @@ pub struct OpsLibraryStateSnapshot {
     pub knowledge_generations: Vec<KnowledgeLibraryGeneration>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OpsLibraryStateSnapshotWithWarnings {
+    pub snapshot: OpsLibraryStateSnapshot,
+    pub warnings: Vec<OpsLibraryWarning>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentKnowledgeCoverageState {
     pub processing_active: bool,
@@ -259,6 +265,14 @@ impl OpsService {
         state: &AppState,
         library_id: Uuid,
     ) -> Result<OpsLibraryStateSnapshot, ApiError> {
+        Ok(self.get_library_state_snapshot_with_warnings(state, library_id).await?.snapshot)
+    }
+
+    pub async fn get_library_state_snapshot_with_warnings(
+        &self,
+        state: &AppState,
+        library_id: Uuid,
+    ) -> Result<OpsLibraryStateSnapshotWithWarnings, ApiError> {
         let facts = ops_repository::get_library_facts(&state.persistence.postgres, library_id)
             .await
             .map_err(|e| ApiError::internal_with_log(e, "internal"))?
@@ -291,7 +305,16 @@ impl OpsService {
             !failed_attempts.is_empty(),
             !bundle_failures.is_empty(),
         );
-        Ok(OpsLibraryStateSnapshot { state, knowledge_generations })
+        let warnings = build_library_warnings_from_aggregate(
+            library_id,
+            &readiness,
+            &failed_attempts,
+            &bundle_failures,
+        );
+        Ok(OpsLibraryStateSnapshotWithWarnings {
+            snapshot: OpsLibraryStateSnapshot { state, knowledge_generations },
+            warnings,
+        })
     }
 
     pub async fn list_library_warnings(
@@ -504,8 +527,8 @@ impl OpsService {
 /// surfaces. Replaces the previous O(N) `list_documents` + N+1 prefetch
 /// storm that ran per-document Arango + Postgres fan-outs — on a 5k-doc
 /// library the old path took 7+ seconds and gated the query execution
-/// context. This path is 2 queries total: one Postgres aggregate over
-/// `derived_status` and one point lookup on `runtime_graph_snapshot`.
+/// context. This path is two Postgres reads plus one bounded Arango aggregate
+/// for vector-inventory drift; it stays off the query-turn hot path.
 pub struct LibraryCoverageFast {
     /// Canonical per-library metrics row produced by
     /// `aggregate_library_document_metrics`. Replaces the retired
@@ -516,6 +539,7 @@ pub struct LibraryCoverageFast {
     pub metrics: ironrag_contracts::documents::LibraryDocumentMetrics,
     pub graph_snapshot: Option<repositories::RuntimeGraphSnapshotRow>,
     pub latest_generation_id: Option<Uuid>,
+    pub vector_inventory_mismatch_count: i64,
 }
 
 pub async fn load_library_coverage_fast(
@@ -529,14 +553,25 @@ pub async fn load_library_coverage_fast(
     )
     .await
     .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
-    let graph_snapshot =
-        repositories::get_runtime_graph_snapshot(&state.persistence.postgres, library_id)
-            .await
-            .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
+    let (graph_snapshot, vector_inventory_mismatch_count) = tokio::try_join!(
+        async {
+            repositories::get_runtime_graph_snapshot(&state.persistence.postgres, library_id)
+                .await
+                .map_err(|e| ApiError::internal_with_log(e, "internal"))
+        },
+        async {
+            state
+                .arango_document_store
+                .count_vector_ready_revisions_missing_chunk_vectors(library_id)
+                .await
+                .map_err(|e| ApiError::internal_with_log(e, "internal"))
+        },
+    )?;
     Ok(LibraryCoverageFast {
         metrics,
         graph_snapshot,
         latest_generation_id: latest_generation.map(|generation| generation.id),
+        vector_inventory_mismatch_count,
     })
 }
 
@@ -558,7 +593,9 @@ fn map_library_facts_from_aggregate(
     // degraded_state heuristic.
     let in_flight = coverage.metrics.processing + coverage.metrics.queued;
     let processing_count_usize = usize::try_from(in_flight).unwrap_or(0);
-    let stale_vector_count = processing_count_usize;
+    let stale_vector_count = processing_count_usize.saturating_add(
+        usize::try_from(coverage.vector_inventory_mismatch_count).unwrap_or(usize::MAX),
+    );
     let stale_relation_count = processing_count_usize;
 
     OpsLibraryState {
@@ -598,8 +635,10 @@ fn build_library_warnings_from_aggregate(
     // canonical signal here — no per-doc Arango revision reads, no
     // drift vs the dashboard counts.
     let in_flight = coverage.metrics.processing + coverage.metrics.queued;
-    if in_flight > 0 {
+    if in_flight > 0 || coverage.vector_inventory_mismatch_count > 0 {
         warnings.push(derived_warning(library_id, "stale_vectors", "warning", Utc::now()));
+    }
+    if in_flight > 0 {
         warnings.push(derived_warning(library_id, "stale_relations", "warning", Utc::now()));
     }
 
@@ -706,6 +745,13 @@ mod tests {
     use uuid::Uuid;
 
     fn coverage_with_processing(processing_count: i64) -> LibraryCoverageFast {
+        coverage_with_processing_and_vector_mismatch(processing_count, 0)
+    }
+
+    fn coverage_with_processing_and_vector_mismatch(
+        processing_count: i64,
+        vector_inventory_mismatch_count: i64,
+    ) -> LibraryCoverageFast {
         LibraryCoverageFast {
             metrics: LibraryDocumentMetrics {
                 total: processing_count.max(1),
@@ -720,6 +766,7 @@ mod tests {
             },
             graph_snapshot: None,
             latest_generation_id: None,
+            vector_inventory_mismatch_count,
         }
     }
 
@@ -824,6 +871,23 @@ mod tests {
             warnings
                 .iter()
                 .any(|warning: &OpsLibraryWarning| warning.warning_kind == "stale_vectors")
+        );
+    }
+
+    #[test]
+    fn build_library_warnings_reports_vector_inventory_mismatch_without_relation_warning() {
+        let coverage = coverage_with_processing_and_vector_mismatch(0, 2);
+        let warnings = build_library_warnings_from_aggregate(Uuid::now_v7(), &coverage, &[], &[]);
+
+        assert!(
+            warnings
+                .iter()
+                .any(|warning: &OpsLibraryWarning| warning.warning_kind == "stale_vectors")
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning: &OpsLibraryWarning| warning.warning_kind != "stale_relations")
         );
     }
 }

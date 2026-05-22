@@ -159,7 +159,7 @@ describe('AppContext workspace-library scoping', () => {
     expect(container.querySelector('[data-testid="visible-libraries"]')?.textContent).toBe('lib-default');
   });
 
-  it('clears the active library and filters visible libraries when workspace changes', async () => {
+  it('selects the first library and filters visible libraries when workspace changes', async () => {
     localStorage.setItem('ironrag_active_workspace', 'ws-qg');
     localStorage.setItem('ironrag_active_library', 'lib-qg-1');
     authApiMock.resolveSession.mockResolvedValue(makeSession());
@@ -183,7 +183,7 @@ describe('AppContext workspace-library scoping', () => {
     await flushUi();
 
     expect(container.querySelector('[data-testid="active-workspace"]')?.textContent).toBe('ws-default');
-    expect(container.querySelector('[data-testid="active-library"]')?.textContent).toBe('none');
+    expect(container.querySelector('[data-testid="active-library"]')?.textContent).toBe('lib-default');
     expect(container.querySelector('[data-testid="visible-libraries"]')?.textContent).toBe('lib-default');
   });
 

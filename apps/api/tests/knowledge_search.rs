@@ -28,11 +28,14 @@ use ironrag_backend::{
             KNOWLEDGE_ENTITY_VECTOR_COLLECTION, KNOWLEDGE_SEARCH_VIEW,
         },
         document_store::{
-            ArangoDocumentStore, KnowledgeChunkRow, KnowledgeDocumentRow,
-            KnowledgeLibraryGenerationRow, KnowledgeRevisionRow, KnowledgeTechnicalFactRow,
+            ArangoDocumentStore, KnowledgeChunkRow, KnowledgeDocumentRow, KnowledgeRevisionRow,
+            KnowledgeTechnicalFactRow,
         },
         graph_store::{ArangoGraphStore, NewKnowledgeEntity, NewKnowledgeEvidence},
-        search_store::{ArangoSearchStore, KnowledgeChunkVectorRow, KnowledgeEntityVectorRow},
+        search_store::{
+            ArangoSearchStore, KNOWLEDGE_CHUNK_VECTOR_KIND, KnowledgeChunkVectorRow,
+            KnowledgeEntityVectorRow,
+        },
     },
     infra::repositories::{self, ai_repository, iam_repository},
     integrations::llm::{EmbeddingRequest, EmbeddingResponse, LlmGateway},
@@ -455,7 +458,6 @@ impl KnowledgeSearchHttpFixture {
         let entity_id = Uuid::now_v7();
         let relation_id = Uuid::now_v7();
         let evidence_id = Uuid::now_v7();
-        let generation_id = Uuid::now_v7();
         let now = Utc::now();
 
         state
@@ -504,7 +506,7 @@ impl KnowledgeSearchHttpFixture {
                 text_checksum: Some("knowledge-search-text-checksum".to_string()),
                 image_checksum: None,
                 text_state: "text_readable".to_string(),
-                vector_state: "vector_ready".to_string(),
+                vector_state: "ready".to_string(),
                 graph_state: "graph_ready".to_string(),
                 text_readable_at: Some(now),
                 vector_ready_at: Some(now),
@@ -582,24 +584,6 @@ impl KnowledgeSearchHttpFixture {
             )
             .await
             .context("failed to insert knowledge search technical fact")?;
-        state
-            .arango_document_store
-            .upsert_library_generation(&KnowledgeLibraryGenerationRow {
-                key: format!("{}:{}", library.id, generation_id),
-                arango_id: None,
-                arango_rev: None,
-                generation_id,
-                workspace_id: workspace.id,
-                library_id: library.id,
-                active_text_generation: 1,
-                active_vector_generation: 1,
-                active_graph_generation: 1,
-                degraded_state: "ready".to_string(),
-                updated_at: now,
-            })
-            .await
-            .context("failed to insert knowledge search generation")?;
-
         let entity_doc = json!({
             "_key": entity_id.to_string(),
             "entity_id": entity_id,
@@ -904,6 +888,459 @@ async fn terminate_database_connections(admin_pool: &PgPool, database_name: &str
     .await
     .context("failed to terminate postgres database connections")?;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires local ArangoDB service with database create/drop access"]
+async fn library_generation_signals_count_canonical_chunk_embedding_vectors() -> Result<()> {
+    let fixture = KnowledgeSearchFixture::create().await?;
+    let result = async {
+        let workspace_id = Uuid::now_v7();
+        let library_id = Uuid::now_v7();
+        let document_id = Uuid::now_v7();
+        let revision_id = Uuid::now_v7();
+        let chunk_id = Uuid::now_v7();
+        let model_catalog_id = Uuid::now_v7();
+        let now = Utc::now();
+
+        fixture
+            .document_store
+            .upsert_revision(&KnowledgeRevisionRow {
+                key: revision_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                revision_id,
+                workspace_id,
+                library_id,
+                document_id,
+                revision_number: 2,
+                revision_state: "active".to_string(),
+                revision_kind: "upload".to_string(),
+                storage_ref: Some("memory://revision".to_string()),
+                source_uri: Some("memory://revision/source".to_string()),
+                document_hint: None,
+                mime_type: "text/plain".to_string(),
+                checksum: "revision".to_string(),
+                title: Some("Generation Signal Fixture".to_string()),
+                byte_size: 24,
+                normalized_text: Some("generation signal fixture".to_string()),
+                text_checksum: Some("generation-signal-fixture".to_string()),
+                image_checksum: None,
+                text_state: "accepted".to_string(),
+                vector_state: "vector_ready".to_string(),
+                graph_state: "accepted".to_string(),
+                text_readable_at: None,
+                vector_ready_at: Some(now),
+                graph_ready_at: None,
+                superseded_by_revision_id: None,
+                created_at: now,
+            })
+            .await
+            .context("failed to insert revision for generation signal fixture")?;
+
+        fixture
+            .search_store
+            .upsert_chunk_vector(&KnowledgeChunkVectorRow {
+                key: format!("{chunk_id}:{model_catalog_id}:2"),
+                arango_id: None,
+                arango_rev: None,
+                vector_id: Uuid::now_v7(),
+                workspace_id,
+                library_id,
+                chunk_id,
+                revision_id,
+                embedding_model_key: model_catalog_id.to_string(),
+                vector_kind: KNOWLEDGE_CHUNK_VECTOR_KIND.to_string(),
+                dimensions: 3,
+                vector: vec![0.2, 0.4, 0.6],
+                freshness_generation: 2,
+                created_at: now,
+                occurred_at: None,
+                occurred_until: None,
+            })
+            .await
+            .context("failed to insert canonical chunk embedding vector")?;
+
+        let signals = fixture
+            .document_store
+            .aggregate_library_generation_signals(library_id)
+            .await
+            .context("failed to aggregate library generation signals")?;
+        assert_eq!(signals.active_vector_generation, 2);
+        assert!(signals.has_ready_vector);
+        Ok(())
+    }
+    .await;
+
+    fixture.cleanup().await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires local ArangoDB service with database create/drop access"]
+async fn vector_ready_revisions_missing_chunk_vectors_are_counted() -> Result<()> {
+    let fixture = KnowledgeSearchFixture::create().await?;
+    let result = async {
+        let workspace_id = Uuid::now_v7();
+        let library_id = Uuid::now_v7();
+        let document_id = Uuid::now_v7();
+        let revision_id = Uuid::now_v7();
+        let chunk_id = Uuid::now_v7();
+        let no_chunk_revision_id = Uuid::now_v7();
+        let pending_revision_id = Uuid::now_v7();
+        let pending_chunk_id = Uuid::now_v7();
+        let superseded_revision_id = Uuid::now_v7();
+        let superseded_chunk_id = Uuid::now_v7();
+        let other_library_id = Uuid::now_v7();
+        let other_revision_id = Uuid::now_v7();
+        let other_chunk_id = Uuid::now_v7();
+        let model_catalog_id = Uuid::now_v7();
+        let now = Utc::now();
+
+        fixture
+            .document_store
+            .upsert_revision(&KnowledgeRevisionRow {
+                key: revision_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                revision_id,
+                workspace_id,
+                library_id,
+                document_id,
+                revision_number: 1,
+                revision_state: "active".to_string(),
+                revision_kind: "upload".to_string(),
+                storage_ref: Some("memory://revision".to_string()),
+                source_uri: Some("memory://revision/source".to_string()),
+                document_hint: None,
+                mime_type: "text/plain".to_string(),
+                checksum: "revision".to_string(),
+                title: Some("Vector Inventory Fixture".to_string()),
+                byte_size: 24,
+                normalized_text: Some("vector inventory fixture".to_string()),
+                text_checksum: Some("vector-inventory-fixture".to_string()),
+                image_checksum: None,
+                text_state: "text_readable".to_string(),
+                vector_state: "ready".to_string(),
+                graph_state: "accepted".to_string(),
+                text_readable_at: Some(now),
+                vector_ready_at: Some(now),
+                graph_ready_at: None,
+                superseded_by_revision_id: None,
+                created_at: now,
+            })
+            .await
+            .context("failed to insert vector inventory revision")?;
+        fixture
+            .document_store
+            .upsert_chunk(&KnowledgeChunkRow {
+                key: chunk_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                chunk_id,
+                workspace_id,
+                library_id,
+                document_id,
+                revision_id,
+                chunk_index: 0,
+                content_text: "vector inventory fixture".to_string(),
+                normalized_text: "vector inventory fixture".to_string(),
+                span_start: Some(0),
+                span_end: Some(24),
+                token_count: Some(3),
+                chunk_kind: Some("paragraph".to_string()),
+                support_block_ids: Vec::new(),
+                section_path: Vec::new(),
+                heading_trail: Vec::new(),
+                literal_digest: None,
+                chunk_state: "ready".to_string(),
+                text_generation: Some(1),
+                vector_generation: Some(1),
+                quality_score: None,
+                window_text: None,
+                raptor_level: None,
+                occurred_at: None,
+                occurred_until: None,
+            })
+            .await
+            .context("failed to insert vector inventory chunk")?;
+        fixture
+            .document_store
+            .upsert_revision(&KnowledgeRevisionRow {
+                key: no_chunk_revision_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                revision_id: no_chunk_revision_id,
+                workspace_id,
+                library_id,
+                document_id: Uuid::now_v7(),
+                revision_number: 1,
+                revision_state: "active".to_string(),
+                revision_kind: "upload".to_string(),
+                storage_ref: None,
+                source_uri: None,
+                document_hint: None,
+                mime_type: "text/plain".to_string(),
+                checksum: "no-chunk-revision".to_string(),
+                title: Some("No Chunk Revision".to_string()),
+                byte_size: 1,
+                normalized_text: Some("no chunk".to_string()),
+                text_checksum: Some("no-chunk".to_string()),
+                image_checksum: None,
+                text_state: "text_readable".to_string(),
+                vector_state: "ready".to_string(),
+                graph_state: "accepted".to_string(),
+                text_readable_at: Some(now),
+                vector_ready_at: Some(now),
+                graph_ready_at: None,
+                superseded_by_revision_id: None,
+                created_at: now,
+            })
+            .await
+            .context("failed to insert no-chunk revision")?;
+        fixture
+            .document_store
+            .upsert_revision(&KnowledgeRevisionRow {
+                key: pending_revision_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                revision_id: pending_revision_id,
+                workspace_id,
+                library_id,
+                document_id: Uuid::now_v7(),
+                revision_number: 1,
+                revision_state: "active".to_string(),
+                revision_kind: "upload".to_string(),
+                storage_ref: None,
+                source_uri: None,
+                document_hint: None,
+                mime_type: "text/plain".to_string(),
+                checksum: "pending-revision".to_string(),
+                title: Some("Pending Revision".to_string()),
+                byte_size: 1,
+                normalized_text: Some("pending".to_string()),
+                text_checksum: Some("pending".to_string()),
+                image_checksum: None,
+                text_state: "text_readable".to_string(),
+                vector_state: "pending".to_string(),
+                graph_state: "accepted".to_string(),
+                text_readable_at: Some(now),
+                vector_ready_at: None,
+                graph_ready_at: None,
+                superseded_by_revision_id: None,
+                created_at: now,
+            })
+            .await
+            .context("failed to insert pending revision")?;
+        fixture
+            .document_store
+            .upsert_chunk(&KnowledgeChunkRow {
+                key: pending_chunk_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                chunk_id: pending_chunk_id,
+                workspace_id,
+                library_id,
+                document_id: Uuid::now_v7(),
+                revision_id: pending_revision_id,
+                chunk_index: 0,
+                content_text: "pending".to_string(),
+                normalized_text: "pending".to_string(),
+                span_start: Some(0),
+                span_end: Some(7),
+                token_count: Some(1),
+                chunk_kind: Some("paragraph".to_string()),
+                support_block_ids: Vec::new(),
+                section_path: Vec::new(),
+                heading_trail: Vec::new(),
+                literal_digest: None,
+                chunk_state: "ready".to_string(),
+                text_generation: Some(1),
+                vector_generation: Some(1),
+                quality_score: None,
+                window_text: None,
+                raptor_level: None,
+                occurred_at: None,
+                occurred_until: None,
+            })
+            .await
+            .context("failed to insert pending chunk")?;
+        fixture
+            .document_store
+            .upsert_revision(&KnowledgeRevisionRow {
+                key: superseded_revision_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                revision_id: superseded_revision_id,
+                workspace_id,
+                library_id,
+                document_id: Uuid::now_v7(),
+                revision_number: 1,
+                revision_state: "superseded".to_string(),
+                revision_kind: "upload".to_string(),
+                storage_ref: None,
+                source_uri: None,
+                document_hint: None,
+                mime_type: "text/plain".to_string(),
+                checksum: "superseded-revision".to_string(),
+                title: Some("Superseded Revision".to_string()),
+                byte_size: 1,
+                normalized_text: Some("superseded".to_string()),
+                text_checksum: Some("superseded".to_string()),
+                image_checksum: None,
+                text_state: "text_readable".to_string(),
+                vector_state: "ready".to_string(),
+                graph_state: "accepted".to_string(),
+                text_readable_at: Some(now),
+                vector_ready_at: Some(now),
+                graph_ready_at: None,
+                superseded_by_revision_id: Some(revision_id),
+                created_at: now,
+            })
+            .await
+            .context("failed to insert superseded revision")?;
+        fixture
+            .document_store
+            .upsert_chunk(&KnowledgeChunkRow {
+                key: superseded_chunk_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                chunk_id: superseded_chunk_id,
+                workspace_id,
+                library_id,
+                document_id: Uuid::now_v7(),
+                revision_id: superseded_revision_id,
+                chunk_index: 0,
+                content_text: "superseded".to_string(),
+                normalized_text: "superseded".to_string(),
+                span_start: Some(0),
+                span_end: Some(10),
+                token_count: Some(1),
+                chunk_kind: Some("paragraph".to_string()),
+                support_block_ids: Vec::new(),
+                section_path: Vec::new(),
+                heading_trail: Vec::new(),
+                literal_digest: None,
+                chunk_state: "ready".to_string(),
+                text_generation: Some(1),
+                vector_generation: Some(1),
+                quality_score: None,
+                window_text: None,
+                raptor_level: None,
+                occurred_at: None,
+                occurred_until: None,
+            })
+            .await
+            .context("failed to insert superseded chunk")?;
+        fixture
+            .document_store
+            .upsert_revision(&KnowledgeRevisionRow {
+                key: other_revision_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                revision_id: other_revision_id,
+                workspace_id,
+                library_id: other_library_id,
+                document_id: Uuid::now_v7(),
+                revision_number: 1,
+                revision_state: "active".to_string(),
+                revision_kind: "upload".to_string(),
+                storage_ref: None,
+                source_uri: None,
+                document_hint: None,
+                mime_type: "text/plain".to_string(),
+                checksum: "other-revision".to_string(),
+                title: Some("Other Revision".to_string()),
+                byte_size: 1,
+                normalized_text: Some("other".to_string()),
+                text_checksum: Some("other".to_string()),
+                image_checksum: None,
+                text_state: "text_readable".to_string(),
+                vector_state: "ready".to_string(),
+                graph_state: "accepted".to_string(),
+                text_readable_at: Some(now),
+                vector_ready_at: Some(now),
+                graph_ready_at: None,
+                superseded_by_revision_id: None,
+                created_at: now,
+            })
+            .await
+            .context("failed to insert other-library revision")?;
+        fixture
+            .document_store
+            .upsert_chunk(&KnowledgeChunkRow {
+                key: other_chunk_id.to_string(),
+                arango_id: None,
+                arango_rev: None,
+                chunk_id: other_chunk_id,
+                workspace_id,
+                library_id: other_library_id,
+                document_id: Uuid::now_v7(),
+                revision_id: other_revision_id,
+                chunk_index: 0,
+                content_text: "other".to_string(),
+                normalized_text: "other".to_string(),
+                span_start: Some(0),
+                span_end: Some(5),
+                token_count: Some(1),
+                chunk_kind: Some("paragraph".to_string()),
+                support_block_ids: Vec::new(),
+                section_path: Vec::new(),
+                heading_trail: Vec::new(),
+                literal_digest: None,
+                chunk_state: "ready".to_string(),
+                text_generation: Some(1),
+                vector_generation: Some(1),
+                quality_score: None,
+                window_text: None,
+                raptor_level: None,
+                occurred_at: None,
+                occurred_until: None,
+            })
+            .await
+            .context("failed to insert other-library chunk")?;
+
+        let stale_count = fixture
+            .document_store
+            .count_vector_ready_revisions_missing_chunk_vectors(library_id)
+            .await
+            .context("failed to count vector inventory mismatch")?;
+        assert_eq!(stale_count, 1);
+
+        fixture
+            .search_store
+            .upsert_chunk_vector(&KnowledgeChunkVectorRow {
+                key: format!("{chunk_id}:{model_catalog_id}:1"),
+                arango_id: None,
+                arango_rev: None,
+                vector_id: Uuid::now_v7(),
+                workspace_id,
+                library_id,
+                chunk_id,
+                revision_id,
+                embedding_model_key: model_catalog_id.to_string(),
+                vector_kind: KNOWLEDGE_CHUNK_VECTOR_KIND.to_string(),
+                dimensions: 3,
+                vector: vec![0.2, 0.4, 0.6],
+                freshness_generation: 1,
+                created_at: now,
+                occurred_at: None,
+                occurred_until: None,
+            })
+            .await
+            .context("failed to insert vector inventory row")?;
+        let repaired_count = fixture
+            .document_store
+            .count_vector_ready_revisions_missing_chunk_vectors(library_id)
+            .await
+            .context("failed to count repaired vector inventory")?;
+        assert_eq!(repaired_count, 0);
+        Ok(())
+    }
+    .await;
+
+    fixture.cleanup().await?;
+    result
 }
 
 #[tokio::test]
@@ -1388,8 +1825,7 @@ async fn chunk_and_entity_vectors_roundtrip_with_generation_order() -> Result<()
 
 #[tokio::test]
 #[ignore = "requires local ArangoDB service with database create/drop access"]
-async fn revision_replacement_updates_readiness_generation_and_chunk_search_surface() -> Result<()>
-{
+async fn revision_replacement_updates_readiness_and_chunk_search_surface() -> Result<()> {
     let fixture = KnowledgeSearchFixture::create().await?;
     let result = async {
         let workspace_id = Uuid::now_v7();
@@ -1399,7 +1835,6 @@ async fn revision_replacement_updates_readiness_generation_and_chunk_search_surf
         let revision_two_id = Uuid::now_v7();
         let chunk_one_id = Uuid::now_v7();
         let chunk_two_id = Uuid::now_v7();
-        let generation_id = Uuid::now_v7();
         let now = Utc::now();
 
         fixture
@@ -1493,24 +1928,6 @@ async fn revision_replacement_updates_readiness_generation_and_chunk_search_surf
             })
             .await
             .context("failed to insert revision one chunk")?;
-        fixture
-            .document_store
-            .upsert_library_generation(&KnowledgeLibraryGenerationRow {
-                key: format!("{library_id}:{generation_id}"),
-                arango_id: None,
-                arango_rev: None,
-                generation_id,
-                workspace_id,
-                library_id,
-                active_text_generation: 1,
-                active_vector_generation: 0,
-                active_graph_generation: 0,
-                degraded_state: "text_only".to_string(),
-                updated_at: now,
-            })
-            .await
-            .context("failed to insert generation row for revision one")?;
-
         let old_hits = fixture
             .wait_for_chunk_hits(library_id, "obsolete nebula anchor", &[chunk_one_id])
             .await?;
@@ -1539,7 +1956,7 @@ async fn revision_replacement_updates_readiness_generation_and_chunk_search_surf
                 normalized_text: Some("fresh pulsar anchor".to_string()),
                 text_checksum: Some("replacement-text-checksum-2".to_string()),
                 image_checksum: None,
-                text_state: "graph_ready".to_string(),
+                text_state: "text_readable".to_string(),
                 vector_state: "vector_ready".to_string(),
                 graph_state: "graph_ready".to_string(),
                 text_readable_at: Some(now + chrono::TimeDelta::seconds(1)),
@@ -1619,24 +2036,6 @@ async fn revision_replacement_updates_readiness_generation_and_chunk_search_surf
             .await
             .context("failed to update document pointers after replacement")?
             .ok_or_else(|| anyhow!("document disappeared during pointer update"))?;
-        fixture
-            .document_store
-            .upsert_library_generation(&KnowledgeLibraryGenerationRow {
-                key: format!("{library_id}:{generation_id}"),
-                arango_id: None,
-                arango_rev: None,
-                generation_id,
-                workspace_id,
-                library_id,
-                active_text_generation: 2,
-                active_vector_generation: 2,
-                active_graph_generation: 2,
-                degraded_state: "ready".to_string(),
-                updated_at: now + chrono::TimeDelta::seconds(1),
-            })
-            .await
-            .context("failed to update generation row after replacement")?;
-
         fixture.wait_for_chunk_hits(library_id, "obsolete nebula anchor", &[]).await?;
         let new_hits =
             fixture.wait_for_chunk_hits(library_id, "fresh pulsar anchor", &[chunk_two_id]).await?;
@@ -1671,17 +2070,6 @@ async fn revision_replacement_updates_readiness_generation_and_chunk_search_surf
         assert_eq!(revision_two.graph_state, "graph_ready");
         assert!(revision_two.vector_ready_at.is_some());
         assert!(revision_two.graph_ready_at.is_some());
-
-        let generations = fixture
-            .document_store
-            .list_library_generations(library_id)
-            .await
-            .context("failed to reload library generations")?;
-        assert_eq!(generations.len(), 1);
-        assert_eq!(generations[0].active_text_generation, 2);
-        assert_eq!(generations[0].active_vector_generation, 2);
-        assert_eq!(generations[0].active_graph_generation, 2);
-        assert_eq!(generations[0].degraded_state, "ready");
 
         Ok(())
     }

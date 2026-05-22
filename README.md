@@ -13,10 +13,8 @@
 </p>
 
 <p align="center">
-  <img src="./docs/assets/readme-flow.gif" alt="IronRAG demo: dashboard, documents, grounded assistant, and graph exploration" width="780">
+  <img src="./docs/assets/readme-pipeline-illustration.png" alt="IronRAG pipeline from messy data to structured knowledge" width="980">
 </p>
-
----
 
 ## What IronRAG provides
 
@@ -31,7 +29,13 @@
 - **Restart-safe processing.** Long document jobs keep durable extraction units, reusable embedding / graph outputs, and lease-guarded finalization, so stack restarts or transient network breaks resume from the last completed unit instead of discarding hours of work.
 - **Durable assistant turns.** UI answer streaming is an activity channel over the same persisted query execution; if the browser or proxy drops the stream after work starts, the frontend reloads the completed session result instead of submitting the question again. LLM debug snapshots are stored per execution for post-reload inspection.
 - **Backup and restore.** Streaming `tar.zst` archive with selective sections (catalog only, with blobs, with graph). Restore to the same or a different deployment.
-- **Pluggable source connectors.** Push content into IronRAG from any vendor system via a small Python adapter. Build your own on the [IronRAG Connector Template](https://github.com/mlimarenko/IronRAG.ConnectorTemplate), or run the production [BookStack connector](https://github.com/mlimarenko/IronRAG.BookStack) (pages + attachments + images, periodic poll + webhook intake).
+- **Pluggable source connectors.** Push content into IronRAG from any vendor system via a small Python adapter. Build your own on the [IronRAG Connector Template](https://github.com/mlimarenko/IronRAG.ConnectorTemplate), or run the production [BookStack connector](https://github.com/mlimarenko/IronRAG.BookStack) and [Confluence connector](https://github.com/mlimarenko/IronRAG.Confluence) (pages + attachments + images, periodic poll + webhook intake). With the default connector env + routing setup, you can turn an existing wiki into an agent-ready knowledge library in a few setup clicks.
+
+<p align="center">
+  <img src="./docs/assets/readme-flow.gif" alt="IronRAG demo: dashboard, documents, grounded assistant, and graph exploration" width="780">
+</p>
+
+---
 
 ## Quick start
 
@@ -200,7 +204,7 @@ helm upgrade --install ironrag charts/ironrag \
 By default the chart deploys the API, worker, and web images with the
 `v<appVersion>` image tag derived from `Chart.appVersion`. Override
 `api.image.tag`, `worker.image.tag`, and `web.image.tag` only when pinning
-a different published image, for example `--set web.image.tag=v0.4.18`.
+a different published image, for example `--set web.image.tag=v0.4.19`.
 
 ## License
 

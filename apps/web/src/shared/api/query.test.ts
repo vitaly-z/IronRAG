@@ -47,37 +47,7 @@ describe('queryApi.createTurnStream', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(streamThatFailsAfterActivity(), { status: 200 }),
     );
-    vi.spyOn(Query, 'getQuerySession')
-      .mockResolvedValueOnce({
-        data: {
-          session: {
-            conversationState: 'active',
-            createdAt: '2026-05-13T00:00:00.000Z',
-            id: 'session-1',
-            libraryId: 'library-1',
-            title: 'Question',
-          turnCount: 2,
-          updatedAt: '2026-05-13T00:00:00.000Z',
-          workspaceId: 'workspace-1',
-        },
-          messages: [
-            {
-              content: 'Question',
-              id: 'old-user',
-              role: 'user',
-              timestamp: '2026-05-13T00:00:00.000Z',
-            },
-            {
-              content: 'Old answer',
-              executionId: 'old-execution',
-              id: 'old-assistant',
-              role: 'assistant',
-              timestamp: '2026-05-13T00:00:01.000Z',
-            },
-          ],
-        },
-      } as never)
-      .mockResolvedValue({
+    vi.spyOn(Query, 'getQuerySession').mockResolvedValue({
       data: {
         session: {
           conversationState: 'active',
@@ -168,7 +138,7 @@ describe('queryApi.createTurnStream', () => {
       },
     } as never);
 
-    const result = await queryApi.createTurnStream('session-1', 'Question');
+    const result = await queryApi.createTurnStream('session-1', 'Question', 2);
 
     expect(result.responseTurn?.contentText).toBe('Answer');
     expect(Query.getQuerySession).toHaveBeenCalledWith({ path: { sessionId: 'session-1' } });
@@ -180,25 +150,11 @@ describe('queryApi.createTurnStream', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(streamWithBackendFailureEvent(), { status: 200 }),
     );
-    const getSession = vi.spyOn(Query, 'getQuerySession').mockResolvedValue({
-      data: {
-        session: {
-          conversationState: 'active',
-          createdAt: '2026-05-13T00:00:00.000Z',
-          id: 'session-1',
-          libraryId: 'library-1',
-          title: 'Question',
-          turnCount: 0,
-          updatedAt: '2026-05-13T00:00:00.000Z',
-          workspaceId: 'workspace-1',
-        },
-        messages: [],
-      },
-    } as never);
+    const getSession = vi.spyOn(Query, 'getQuerySession');
 
-    await expect(queryApi.createTurnStream('session-1', 'Question')).rejects.toThrow(
+    await expect(queryApi.createTurnStream('session-1', 'Question', 0)).rejects.toThrow(
       'Error in input stream',
     );
-    expect(getSession).toHaveBeenCalledTimes(1);
+    expect(getSession).not.toHaveBeenCalled();
   });
 });

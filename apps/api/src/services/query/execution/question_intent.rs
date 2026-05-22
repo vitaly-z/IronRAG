@@ -5,7 +5,7 @@
 //! owns language understanding, and this module only translates typed IR
 //! tags into local answer-builder intents.
 
-use crate::domains::query_ir::{LiteralKind, QueryAct, QueryIR};
+use crate::domains::query_ir::{LiteralKind, QueryAct, QueryIR, literal_text_is_identifier_shaped};
 
 /// A recognized question intent. Downstream builders use these to
 /// pick the right answer strategy (fact-store lookup, evidence scan,
@@ -76,8 +76,10 @@ pub fn classify_query_ir_intents(ir: &QueryIR) -> Vec<QuestionIntent> {
         let intent = match literal.kind {
             LiteralKind::Url | LiteralKind::Path => Some(QuestionIntent::Endpoint),
             LiteralKind::Version => Some(QuestionIntent::Version),
-            LiteralKind::Identifier => Some(QuestionIntent::Parameter),
-            LiteralKind::NumericCode | LiteralKind::Other => None,
+            LiteralKind::Identifier if literal_text_is_identifier_shaped(&literal.text) => {
+                Some(QuestionIntent::Parameter)
+            }
+            LiteralKind::Identifier | LiteralKind::NumericCode | LiteralKind::Other => None,
         };
         if let Some(intent) = intent
             && !intents.contains(&intent)
@@ -161,7 +163,7 @@ fn query_ir_has_specific_endpoint_lookup_target(query_ir: &QueryIR) -> bool {
         .any(|value| matches!(canonical_target_type_tag(value).as_str(), "url" | "wsdl"))
 }
 
-fn canonical_target_type_tag(value: &str) -> String {
+pub(crate) fn canonical_target_type_tag(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 

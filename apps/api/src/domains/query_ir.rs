@@ -270,14 +270,70 @@ impl LiteralKind {
             && trimmed.contains('.')
         {
             Self::Version
-        } else if !trimmed.is_empty()
-            && trimmed
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
-        {
+        } else if literal_text_is_identifier_shaped(trimmed) {
             Self::Identifier
         } else {
             Self::Other
+        }
+    }
+}
+
+/// Script-agnostic structural identifier signal.
+///
+/// A plain alphabetic word in any writing system is usually a topic/entity
+/// echo, not a technical identifier. Technical identifier routing should only
+/// trigger when the literal itself carries structural evidence: separators,
+/// digits, mixed Unicode case, or all-uppercase acronym shape.
+#[must_use]
+pub fn literal_text_is_identifier_shaped(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    let mut has_alphabetic = false;
+    let mut has_lowercase = false;
+    let mut has_uppercase = false;
+    let mut has_numeric = false;
+    let mut has_separator = false;
+    let mut seen_lowercase_before = false;
+    let mut has_uppercase_after_lowercase = false;
+
+    for ch in trimmed.chars() {
+        if ch.is_alphabetic() {
+            has_alphabetic = true;
+            if ch.is_uppercase() {
+                has_uppercase = true;
+                has_uppercase_after_lowercase |= seen_lowercase_before;
+            }
+            if ch.is_lowercase() {
+                has_lowercase = true;
+                seen_lowercase_before = true;
+            }
+        } else if ch.is_numeric() {
+            has_numeric = true;
+        } else if matches!(ch, '_' | '-' | '.') {
+            has_separator = true;
+        } else {
+            return false;
+        }
+    }
+
+    has_separator
+        || has_numeric
+        || (has_lowercase && has_uppercase_after_lowercase)
+        || (has_alphabetic && has_uppercase && !has_lowercase)
+}
+
+#[must_use]
+pub fn literal_kind_has_exact_technical_shape(kind: LiteralKind, text: &str) -> bool {
+    match kind {
+        LiteralKind::Url | LiteralKind::Path | LiteralKind::Version | LiteralKind::NumericCode => {
+            true
+        }
+        LiteralKind::Identifier => literal_text_is_identifier_shaped(text),
+        LiteralKind::Other => {
+            text.trim().chars().any(|ch| !ch.is_alphabetic() && !ch.is_whitespace())
         }
     }
 }
@@ -465,7 +521,14 @@ impl QueryIR {
     /// Drives verifier strictness and fact-search bias.
     #[must_use]
     pub fn is_exact_literal_technical(&self) -> bool {
-        matches!(self.act, QueryAct::RetrieveValue) && !self.literal_constraints.is_empty()
+        matches!(self.act, QueryAct::RetrieveValue) && self.has_exact_technical_literal()
+    }
+
+    #[must_use]
+    pub fn has_exact_technical_literal(&self) -> bool {
+        self.literal_constraints.iter().any(|literal| {
+            literal_kind_has_exact_technical_shape(literal.kind, literal.text.as_str())
+        })
     }
 
     /// `true` when the query scope spans multiple documents.
@@ -491,7 +554,7 @@ impl QueryIR {
         matches!(
             self.act,
             QueryAct::Describe | QueryAct::Enumerate | QueryAct::Meta | QueryAct::RetrieveValue
-        ) && self.literal_constraints.is_empty()
+        ) && !self.has_exact_technical_literal()
             && self.comparison.is_none()
             && self.source_slice.is_none()
             && !self.is_follow_up()
@@ -539,7 +602,7 @@ impl QueryIR {
     #[must_use]
     pub fn verification_level(&self) -> VerificationLevel {
         match self.act {
-            QueryAct::RetrieveValue if !self.literal_constraints.is_empty() => {
+            QueryAct::RetrieveValue if self.has_exact_technical_literal() => {
                 VerificationLevel::Strict
             }
             QueryAct::Compare | QueryAct::RetrieveValue => VerificationLevel::Moderate,
@@ -807,6 +870,33 @@ mod tests {
         assert!(ir.is_exact_literal_technical());
         assert_eq!(ir.verification_level(), VerificationLevel::Strict);
         assert!(!ir.is_follow_up());
+    }
+
+    #[test]
+    fn plain_alphabetic_identifier_literal_is_not_exact_technical() {
+        let ir = QueryIR {
+            act: QueryAct::RetrieveValue,
+            scope: QueryScope::SingleDocument,
+            language: QueryLanguage::Auto,
+            target_types: vec!["concept".to_string()],
+            target_entities: vec![],
+            literal_constraints: vec![LiteralSpan {
+                text: "alpha".to_string(),
+                kind: LiteralKind::Identifier,
+            }],
+            temporal_constraints: Vec::new(),
+            comparison: None,
+            document_focus: None,
+            conversation_refs: vec![],
+            needs_clarification: None,
+            source_slice: None,
+            confidence: 0.84,
+        };
+
+        assert!(!ir.has_exact_technical_literal());
+        assert!(!ir.is_exact_literal_technical());
+        assert!(ir.requests_source_coverage_context());
+        assert_eq!(ir.verification_level(), VerificationLevel::Moderate);
     }
 
     #[test]
@@ -1152,6 +1242,15 @@ mod tests {
         };
         assert!(!exact_ir.requests_source_coverage_context());
         assert!(!follow_up_ir.requests_source_coverage_context());
+    }
+
+    #[test]
+    fn literal_kind_infer_keeps_plain_words_out_of_identifier_routing() {
+        assert_eq!(LiteralKind::infer("alpha"), LiteralKind::Other);
+        assert_eq!(LiteralKind::infer("Настройки"), LiteralKind::Other);
+        assert_eq!(LiteralKind::infer("callbackUrl"), LiteralKind::Identifier);
+        assert_eq!(LiteralKind::infer("DATABASE_URL"), LiteralKind::Identifier);
+        assert_eq!(LiteralKind::infer("Настройка_2"), LiteralKind::Identifier);
     }
 
     #[test]

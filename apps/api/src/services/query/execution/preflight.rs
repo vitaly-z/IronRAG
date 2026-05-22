@@ -192,6 +192,7 @@ pub(super) fn select_technical_literal_chunks(
     technical_literal_intent: TechnicalLiteralIntent,
     top_k: usize,
     literal_focus_keywords: &[String],
+    preferred_document_ids: &[Uuid],
     pagination_requested: bool,
 ) -> Vec<RuntimeMatchedChunk> {
     let max_total_chunks = if technical_literal_intent.any() {
@@ -203,7 +204,14 @@ pub(super) fn select_technical_literal_chunks(
     let focused_chunks = if technical_literal_intent.any()
         && question_prefers_single_exact_literal_scope(question, query_ir)
     {
-        select_preflight_literal_document_id(question, query_ir, chunks).map(|document_id| {
+        select_preflight_literal_document_id_from_preferred(
+            question,
+            query_ir,
+            chunks,
+            preferred_document_ids,
+        )
+        .or_else(|| select_preflight_literal_document_id(question, query_ir, chunks))
+        .map(|document_id| {
             chunks
                 .iter()
                 .filter(|chunk| chunk.document_id == document_id)
@@ -300,6 +308,7 @@ pub(super) fn select_preflight_literal_document_id(
     struct ExactLiteralDocumentCandidate<'a> {
         document_id: Uuid,
         document_label: &'a str,
+        target_label_score: usize,
         label_score: usize,
         best_chunk_signal: isize,
         chunk_signal_sum: isize,
@@ -308,6 +317,7 @@ pub(super) fn select_preflight_literal_document_id(
     }
 
     let question_keywords = technical_literal_focus_keywords(question, Some(query_ir));
+    let target_label_keywords = preflight_target_label_keywords(query_ir);
     let pagination_requested = false;
     let mut ordered_document_ids = Vec::<Uuid>::new();
     let mut per_document_chunks = HashMap::<Uuid, Vec<&RuntimeMatchedChunk>>::new();
@@ -335,6 +345,10 @@ pub(super) fn select_preflight_literal_document_id(
                 .iter()
                 .map(|keyword| technical_keyword_weight(&lowered_label, keyword))
                 .sum::<usize>();
+            let target_label_score = target_label_keywords
+                .iter()
+                .map(|keyword| technical_keyword_weight(&lowered_label, keyword))
+                .sum::<usize>();
             let (best_chunk_signal, chunk_signal_sum, retrieval_score_sum) =
                 document_chunks.iter().fold(
                     (isize::MIN, 0isize, 0.0f32),
@@ -354,6 +368,7 @@ pub(super) fn select_preflight_literal_document_id(
             Some(ExactLiteralDocumentCandidate {
                 document_id: *document_id,
                 document_label,
+                target_label_score,
                 label_score,
                 best_chunk_signal,
                 chunk_signal_sum,
@@ -371,6 +386,7 @@ pub(super) fn select_preflight_literal_document_id(
             .best_chunk_signal
             .cmp(&left.best_chunk_signal)
             .then_with(|| right.chunk_signal_sum.cmp(&left.chunk_signal_sum))
+            .then_with(|| right.target_label_score.cmp(&left.target_label_score))
             .then_with(|| right.label_score.cmp(&left.label_score))
             .then_with(|| right.retrieval_score_sum.total_cmp(&left.retrieval_score_sum))
             .then_with(|| left.first_rank.cmp(&right.first_rank))
@@ -378,6 +394,49 @@ pub(super) fn select_preflight_literal_document_id(
     });
 
     Some(candidates[0].document_id)
+}
+
+fn select_preflight_literal_document_id_from_preferred(
+    question: &str,
+    query_ir: &QueryIR,
+    chunks: &[RuntimeMatchedChunk],
+    preferred_document_ids: &[Uuid],
+) -> Option<Uuid> {
+    if chunks.is_empty() || preferred_document_ids.is_empty() {
+        return None;
+    }
+    let preferred = preferred_document_ids.iter().copied().collect::<HashSet<_>>();
+    let preferred_chunks = chunks
+        .iter()
+        .filter(|chunk| preferred.contains(&chunk.document_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    select_preflight_literal_document_id(question, query_ir, &preferred_chunks)
+}
+
+fn preflight_target_label_keywords(query_ir: &QueryIR) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut keywords = Vec::new();
+    if let Some(document_focus) = query_ir.document_focus.as_ref() {
+        push_preflight_label_keywords(&document_focus.hint, &mut seen, &mut keywords);
+    }
+    for entity in &query_ir.target_entities {
+        push_preflight_label_keywords(&entity.label, &mut seen, &mut keywords);
+    }
+    keywords
+}
+
+fn push_preflight_label_keywords(value: &str, seen: &mut HashSet<String>, out: &mut Vec<String>) {
+    for token in value
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '/')
+        .map(str::trim)
+        .filter(|token| token.chars().count() >= 4)
+        .map(str::to_lowercase)
+    {
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+    }
 }
 
 fn filter_runtime_chunks_to_documents(

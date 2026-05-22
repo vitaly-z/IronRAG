@@ -4,6 +4,7 @@ import type { TFunction } from "i18next";
 import {
   ArrowDown,
   ArrowUp,
+  CheckSquare,
   Clock3,
   ExternalLink,
   ListOrdered,
@@ -24,6 +25,11 @@ import type {
 } from "@/shared/api/generated";
 import { useApp } from "@/shared/contexts/app-context";
 import { DataState } from "@/shared/components/DataState";
+import {
+  TABLE_PAGE_SIZE_OPTIONS,
+  TablePaginationFooter,
+  type TablePageSizeOption,
+} from "@/shared/components/TablePaginationFooter";
 import { Button } from "@/shared/components/ui/button";
 import { Input } from "@/shared/components/ui/input";
 import {
@@ -41,8 +47,14 @@ import {
 } from "@/shared/hooks/useTableState";
 
 type QueueStateFilter = "active" | "running" | "queued" | "paused";
-const QUEUE_PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
-type QueuePageSize = (typeof QUEUE_PAGE_SIZE_OPTIONS)[number];
+type QueuePageSize = TablePageSizeOption;
+type QueueScopeOption = {
+  id: string;
+  label: string;
+  count: number;
+};
+
+const ALL_SCOPE_VALUE = "all";
 
 type QueueTableState = {
   pageSize: QueuePageSize;
@@ -152,27 +164,33 @@ function parseQueueTableState(raw: unknown): QueueTableState {
   return {
     pageSize: parseNumberOption(
       raw.pageSize,
-      QUEUE_PAGE_SIZE_OPTIONS,
+      TABLE_PAGE_SIZE_OPTIONS,
       DEFAULT_QUEUE_TABLE_STATE.pageSize,
     ),
   };
 }
 
-function getPageItems(
-  current: number,
-  total: number,
-): Array<number | "ellipsis"> {
-  if (total <= 7) {
-    return Array.from({ length: total }, (_, index) => index + 1);
+function sortScopeOptions(options: QueueScopeOption[]): QueueScopeOption[] {
+  return options.sort((first, second) =>
+    first.label.localeCompare(second.label, undefined, {
+      numeric: true,
+      sensitivity: "base",
+    }),
+  );
+}
+
+async function runQueueJobCommand(
+  jobIds: string[],
+  command: (jobId: string) => Promise<IngestQueueResponse>,
+): Promise<IngestQueueResponse> {
+  let latestQueue: IngestQueueResponse | null = null;
+  for (const jobId of jobIds) {
+    latestQueue = await command(jobId);
   }
-  const items: Array<number | "ellipsis"> = [1];
-  const start = Math.max(2, current - 1);
-  const end = Math.min(total - 1, current + 1);
-  if (start > 2) items.push("ellipsis");
-  for (let page = start; page <= end; page += 1) items.push(page);
-  if (end < total - 1) items.push("ellipsis");
-  items.push(total);
-  return items;
+  if (!latestQueue) {
+    throw new Error("No ingest queue jobs selected");
+  }
+  return latestQueue;
 }
 
 export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
@@ -181,7 +199,13 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
   const { workspaces, setActiveWorkspace, setActiveLibrary } = useApp();
   const [search, setSearch] = useState("");
   const [stateFilter, setStateFilter] = useState<QueueStateFilter>("active");
+  const [workspaceFilter, setWorkspaceFilter] = useState(ALL_SCOPE_VALUE);
+  const [libraryFilter, setLibraryFilter] = useState(ALL_SCOPE_VALUE);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedJobIds, setSelectedJobIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [tableState, setTableState] = useTableState<QueueTableState>({
     tableId: "admin.ingestQueue",
     defaultValue: DEFAULT_QUEUE_TABLE_STATE,
@@ -252,9 +276,120 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
     },
   });
 
+  const bulkCancelMutation = useMutation({
+    mutationFn: (jobIds: string[]) =>
+      runQueueJobCommand(jobIds, (jobId) => adminApi.cancelIngestQueueJob(jobId)),
+    onSuccess: (queue) => {
+      applyQueue(queue);
+      setSelectedJobIds(new Set());
+      setSelectionMode(false);
+      toast.success(
+        t("admin.queueBulkCancelSuccess", { count: selectedJobIds.size }),
+      );
+    },
+    onError: (error) => {
+      toast.error(errorMessage(error, t("admin.queueBulkCancelFailed")));
+    },
+  });
+
+  const bulkPauseMutation = useMutation({
+    mutationFn: (jobIds: string[]) =>
+      runQueueJobCommand(jobIds, (jobId) => adminApi.pauseIngestQueueJob(jobId)),
+    onSuccess: (queue) => {
+      applyQueue(queue);
+      setSelectedJobIds(new Set());
+      toast.success(
+        t("admin.queueBulkPauseSuccess", { count: selectedJobIds.size }),
+      );
+    },
+    onError: (error) => {
+      toast.error(errorMessage(error, t("admin.queueBulkPauseFailed")));
+    },
+  });
+
+  const bulkResumeMutation = useMutation({
+    mutationFn: (jobIds: string[]) =>
+      runQueueJobCommand(jobIds, (jobId) => adminApi.resumeIngestQueueJob(jobId)),
+    onSuccess: (queue) => {
+      applyQueue(queue);
+      setSelectedJobIds(new Set());
+      toast.success(
+        t("admin.queueBulkResumeSuccess", { count: selectedJobIds.size }),
+      );
+    },
+    onError: (error) => {
+      toast.error(errorMessage(error, t("admin.queueBulkResumeFailed")));
+    },
+  });
+
+  const workspaceOptions = useMemo(() => {
+    const byId = new Map<string, QueueScopeOption>();
+    for (const item of queueData?.items ?? []) {
+      const current = byId.get(item.workspaceId);
+      if (current) {
+        current.count += 1;
+      } else {
+        byId.set(item.workspaceId, {
+          id: item.workspaceId,
+          label: item.workspaceName,
+          count: 1,
+        });
+      }
+    }
+    return sortScopeOptions(Array.from(byId.values()));
+  }, [queueData?.items]);
+  const effectiveWorkspaceFilter =
+    workspaceFilter === ALL_SCOPE_VALUE ||
+    workspaceOptions.some((option) => option.id === workspaceFilter)
+      ? workspaceFilter
+      : ALL_SCOPE_VALUE;
+
+  const libraryOptions = useMemo(() => {
+    const byId = new Map<string, QueueScopeOption>();
+    for (const item of queueData?.items ?? []) {
+      if (
+        effectiveWorkspaceFilter !== ALL_SCOPE_VALUE &&
+        item.workspaceId !== effectiveWorkspaceFilter
+      ) {
+        continue;
+      }
+      const current = byId.get(item.libraryId);
+      if (current) {
+        current.count += 1;
+      } else {
+        byId.set(item.libraryId, {
+          id: item.libraryId,
+          label:
+            effectiveWorkspaceFilter === ALL_SCOPE_VALUE
+              ? `${item.libraryName} · ${item.workspaceName}`
+              : item.libraryName,
+          count: 1,
+        });
+      }
+    }
+    return sortScopeOptions(Array.from(byId.values()));
+  }, [effectiveWorkspaceFilter, queueData?.items]);
+  const effectiveLibraryFilter =
+    libraryFilter === ALL_SCOPE_VALUE ||
+    libraryOptions.some((option) => option.id === libraryFilter)
+      ? libraryFilter
+      : ALL_SCOPE_VALUE;
+
   const filteredItems = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return (queueData?.items ?? []).filter((item) => {
+      if (
+        effectiveWorkspaceFilter !== ALL_SCOPE_VALUE &&
+        item.workspaceId !== effectiveWorkspaceFilter
+      ) {
+        return false;
+      }
+      if (
+        effectiveLibraryFilter !== ALL_SCOPE_VALUE &&
+        item.libraryId !== effectiveLibraryFilter
+      ) {
+        return false;
+      }
       if (stateFilter === "running" && item.queueState !== "leased")
         return false;
       if (stateFilter === "queued" && item.queueState !== "queued")
@@ -270,7 +405,13 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
         item.jobKind,
       ].some((value) => value?.toLowerCase().includes(needle));
     });
-  }, [queueData?.items, search, stateFilter]);
+  }, [
+    effectiveLibraryFilter,
+    effectiveWorkspaceFilter,
+    queueData?.items,
+    search,
+    stateFilter,
+  ]);
 
   const pageSize = tableState.pageSize;
   const totalPages = Math.max(1, Math.ceil(filteredItems.length / pageSize));
@@ -283,6 +424,15 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
       filteredItems.slice((currentPage - 1) * pageSize, currentPage * pageSize),
     [currentPage, filteredItems, pageSize],
   );
+  const selectedItems = useMemo(
+    () => filteredItems.filter((item) => selectedJobIds.has(item.jobId)),
+    [filteredItems, selectedJobIds],
+  );
+  const pausableSelectedItems = selectedItems.filter(canPause);
+  const resumableSelectedItems = selectedItems.filter(canResume);
+  const allVisibleSelected =
+    pagedItems.length > 0 &&
+    pagedItems.every((item) => selectedJobIds.has(item.jobId));
 
   const selectedItem = useMemo(() => {
     return (
@@ -337,6 +487,37 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
   const cancelingJobId = cancelMutation.variables;
   const pausingJobId = pauseMutation.variables;
   const resumingJobId = resumeMutation.variables;
+  const bulkActionPending =
+    bulkCancelMutation.isPending || bulkPauseMutation.isPending || bulkResumeMutation.isPending;
+
+  const cancelSelection = () => {
+    setSelectionMode(false);
+    setSelectedJobIds(new Set());
+  };
+
+  const toggleVisibleSelection = () => {
+    setSelectedJobIds((current) => {
+      const next = new Set(current);
+      if (allVisibleSelected) {
+        pagedItems.forEach((item) => next.delete(item.jobId));
+      } else {
+        pagedItems.forEach((item) => next.add(item.jobId));
+      }
+      return next;
+    });
+  };
+
+  const toggleJobSelection = (jobId: string) => {
+    setSelectedJobIds((current) => {
+      const next = new Set(current);
+      if (next.has(jobId)) {
+        next.delete(jobId);
+      } else {
+        next.add(jobId);
+      }
+      return next;
+    });
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -386,8 +567,8 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="mb-3 flex shrink-0 flex-col gap-2 md:flex-row md:items-center md:justify-between">
-            <div className="relative w-full md:max-w-sm">
+          <div className="mb-3 grid shrink-0 grid-cols-1 gap-2 lg:grid-cols-[minmax(220px,1.3fr)_minmax(180px,0.8fr)_minmax(200px,0.9fr)_minmax(220px,1fr)_auto] lg:items-center">
+            <div className="relative min-w-0">
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input
                 className="h-8 pl-9 text-xs"
@@ -397,18 +578,86 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
                   setSearch(event.target.value);
                   setPage(1);
                   setSelectedJobId(null);
+                  setSelectedJobIds(new Set());
                 }}
               />
             </div>
+            <Select
+              value={effectiveWorkspaceFilter}
+              onValueChange={(value) => {
+                setWorkspaceFilter(value);
+                setLibraryFilter(ALL_SCOPE_VALUE);
+                setPage(1);
+                setSelectedJobId(null);
+                setSelectedJobIds(new Set());
+              }}
+            >
+              <SelectTrigger
+                aria-label={t("admin.queueWorkspaceFilter")}
+                className="h-8 w-full text-xs"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_SCOPE_VALUE}>
+                  {t("admin.queueAllWorkspaces", {
+                    count: queueData?.items.length ?? 0,
+                  })}
+                </SelectItem>
+                {workspaceOptions.map((option) => (
+                  <SelectItem key={option.id} value={option.id}>
+                    {t("admin.queueFilterOptionWithCount", {
+                      count: option.count,
+                      name: option.label,
+                    })}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={effectiveLibraryFilter}
+              onValueChange={(value) => {
+                setLibraryFilter(value);
+                setPage(1);
+                setSelectedJobId(null);
+                setSelectedJobIds(new Set());
+              }}
+            >
+              <SelectTrigger
+                aria-label={t("admin.queueLibraryFilter")}
+                className="h-8 w-full text-xs"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_SCOPE_VALUE}>
+                  {t("admin.queueAllLibraries", {
+                    count: libraryOptions.reduce(
+                      (total, option) => total + option.count,
+                      0,
+                    ),
+                  })}
+                </SelectItem>
+                {libraryOptions.map((option) => (
+                  <SelectItem key={option.id} value={option.id}>
+                    {t("admin.queueFilterOptionWithCount", {
+                      count: option.count,
+                      name: option.label,
+                    })}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <Select
               value={stateFilter}
               onValueChange={(value) => {
                 setStateFilter(value as QueueStateFilter);
                 setPage(1);
                 setSelectedJobId(null);
+                setSelectedJobIds(new Set());
               }}
             >
-              <SelectTrigger className="h-8 w-full text-xs md:w-44">
+              <SelectTrigger className="h-8 w-full text-xs">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -426,6 +675,15 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
                 </SelectItem>
               </SelectContent>
             </Select>
+            <Button
+              className="h-8 text-xs lg:justify-self-end"
+              onClick={selectionMode ? cancelSelection : () => setSelectionMode(true)}
+              size="sm"
+              variant={selectionMode ? "default" : "outline"}
+            >
+              <CheckSquare className="mr-1.5 h-3.5 w-3.5" />
+              {selectionMode ? t("admin.queueCancelSelection") : t("admin.queueSelect")}
+            </Button>
           </div>
 
           <div className="min-h-0 flex-1 overflow-hidden">
@@ -449,8 +707,9 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
                   <div className="min-h-0 flex-1 overflow-auto workbench-surface rounded-b-none">
                     <table className="w-full min-w-[1000px] table-fixed text-sm">
                       <colgroup>
+                        {selectionMode && <col className="w-[4%]" />}
                         <col className="w-[7%]" />
-                        <col className="w-[25%]" />
+                        <col className={selectionMode ? "w-[22%]" : "w-[25%]"} />
                         <col className="w-[17%]" />
                         <col className="w-[12%]" />
                         <col className="w-[14%]" />
@@ -466,6 +725,17 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
                         }}
                       >
                         <tr className="border-b text-left">
+                          {selectionMode && (
+                            <th className="px-4 py-3">
+                              <input
+                                aria-label={t("admin.queueSelectVisible")}
+                                checked={allVisibleSelected}
+                                className="h-4 w-4 rounded border-gray-300"
+                                onChange={toggleVisibleSelection}
+                                type="checkbox"
+                              />
+                            </th>
+                          )}
                           <th className="px-4 py-3 section-label">
                             {t("admin.queueOrder")}
                           </th>
@@ -502,6 +772,21 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
                               }`}
                               onClick={() => setSelectedJobId(item.jobId)}
                             >
+                              {selectionMode && (
+                                <td className="px-4 py-3">
+                                  <input
+                                    aria-label={t("admin.queueSelectJob", { name: item.documentName })}
+                                    checked={selectedJobIds.has(item.jobId)}
+                                    className="h-4 w-4 rounded border-gray-300"
+                                    onChange={(event) => {
+                                      event.stopPropagation();
+                                      toggleJobSelection(item.jobId);
+                                    }}
+                                    onClick={(event) => event.stopPropagation()}
+                                    type="checkbox"
+                                  />
+                                </td>
+                              )}
                               <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
                                 {item.queueState === "leased"
                                   ? t("admin.queueNow")
@@ -695,24 +980,52 @@ export function IngestQueueTab({ t, active }: IngestQueueTabProps) {
                     )}
                   </div>
                   {filteredItems.length > 0 && (
-                    <QueuePaginationFooter
-                      currentPage={currentPage}
-                      pageSize={pageSize}
-                      t={t}
-                      totalItems={filteredItems.length}
-                      totalPages={totalPages}
-                      visibleEnd={visibleEnd}
-                      visibleStart={visibleStart}
-                      onPageSizeChange={(nextPageSize) => {
-                        setTableState({ pageSize: nextPageSize });
-                        setPage(1);
-                        setSelectedJobId(null);
-                      }}
-                      onGoToPage={(target) => {
-                        setPage(target);
-                        setSelectedJobId(null);
-                      }}
-                    />
+                    <>
+                      <QueueBulkBar
+                        bulkActionPending={bulkActionPending}
+                        cancelCount={selectedItems.length}
+                        onCancel={() =>
+                          bulkCancelMutation.mutate(
+                            selectedItems.map((item) => item.jobId),
+                          )
+                        }
+                        onClear={() => setSelectedJobIds(new Set())}
+                        onPause={() =>
+                          bulkPauseMutation.mutate(
+                            pausableSelectedItems.map((item) => item.jobId),
+                          )
+                        }
+                        onResume={() =>
+                          bulkResumeMutation.mutate(
+                            resumableSelectedItems.map((item) => item.jobId),
+                          )
+                        }
+                        pauseCount={pausableSelectedItems.length}
+                        resumeCount={resumableSelectedItems.length}
+                        selectedCount={selectedItems.length}
+                        t={t}
+                      />
+                      <QueuePaginationFooter
+                        currentPage={currentPage}
+                        pageSize={pageSize}
+                        t={t}
+                        totalItems={filteredItems.length}
+                        totalPages={totalPages}
+                        visibleEnd={visibleEnd}
+                        visibleStart={visibleStart}
+                        onPageSizeChange={(nextPageSize) => {
+                          setTableState({ pageSize: nextPageSize });
+                          setPage(1);
+                          setSelectedJobId(null);
+                          setSelectedJobIds(new Set());
+                        }}
+                        onGoToPage={(target) => {
+                          setPage(target);
+                          setSelectedJobId(null);
+                          setSelectedJobIds(new Set());
+                        }}
+                      />
+                    </>
                   )}
                 </div>
               )}
@@ -968,6 +1281,82 @@ type QueuePaginationFooterProps = {
   visibleStart: number;
 };
 
+type QueueBulkBarProps = {
+  bulkActionPending: boolean;
+  cancelCount: number;
+  onCancel: () => void;
+  onClear: () => void;
+  onPause: () => void;
+  onResume: () => void;
+  pauseCount: number;
+  resumeCount: number;
+  selectedCount: number;
+  t: TFunction;
+};
+
+function QueueBulkBar({
+  bulkActionPending,
+  cancelCount,
+  onCancel,
+  onClear,
+  onPause,
+  onResume,
+  pauseCount,
+  resumeCount,
+  selectedCount,
+  t,
+}: QueueBulkBarProps) {
+  if (selectedCount <= 0) return null;
+  return (
+    <div className="shrink-0 border-t bg-primary/5 px-4 py-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="mr-auto text-xs font-semibold text-primary tabular-nums">
+          {t("admin.queueSelected", { count: selectedCount })}
+        </span>
+        <Button
+          className="h-8 text-xs"
+          disabled={pauseCount <= 0 || bulkActionPending}
+          onClick={onPause}
+          size="sm"
+          variant="outline"
+        >
+          <Pause className="mr-1.5 h-3.5 w-3.5" />
+          {t("admin.queuePauseSelected", { count: pauseCount })}
+        </Button>
+        <Button
+          className="h-8 text-xs"
+          disabled={resumeCount <= 0 || bulkActionPending}
+          onClick={onResume}
+          size="sm"
+          variant="outline"
+        >
+          <Play className="mr-1.5 h-3.5 w-3.5" />
+          {t("admin.queueResumeSelected", { count: resumeCount })}
+        </Button>
+        <Button
+          className="h-8 text-xs text-status-failed hover:text-status-failed"
+          disabled={cancelCount <= 0 || bulkActionPending}
+          onClick={onCancel}
+          size="sm"
+          variant="outline"
+        >
+          <Square className="mr-1.5 h-3.5 w-3.5" />
+          {t("admin.queueCancelSelected", { count: cancelCount })}
+        </Button>
+        <Button
+          className="h-8 text-xs"
+          disabled={bulkActionPending}
+          onClick={onClear}
+          size="sm"
+          variant="ghost"
+        >
+          {t("admin.queueClearSelection")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function QueuePaginationFooter({
   currentPage,
   onGoToPage,
@@ -980,79 +1369,25 @@ function QueuePaginationFooter({
   visibleStart,
 }: QueuePaginationFooterProps) {
   return (
-    <div className="shrink-0 border-t bg-background/95 px-4 py-3 shadow-[0_-8px_24px_hsl(var(--background)/0.9)] backdrop-blur supports-[backdrop-filter]:bg-background/85">
-      <div className="flex flex-wrap items-center gap-3">
-        <span className="text-xs font-medium text-muted-foreground tabular-nums">
-          {t("documents.paginationSummary", {
-            from: visibleStart,
-            to: visibleEnd,
-            total: totalItems,
-          })}
-        </span>
-        <div className="flex items-center gap-2 md:ml-auto">
-          <span className="text-xs text-muted-foreground">
-            {t("documents.pageSize")}
-          </span>
-          <Select
-            value={String(pageSize)}
-            onValueChange={(value) =>
-              onPageSizeChange(Number(value) as QueuePageSize)
-            }
-          >
-            <SelectTrigger className="h-8 w-[92px] text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {QUEUE_PAGE_SIZE_OPTIONS.map((option) => (
-                <SelectItem key={option} value={String(option)}>
-                  {option}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="flex items-center gap-1">
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-8 text-xs"
-            disabled={currentPage <= 1}
-            onClick={() => onGoToPage(Math.max(1, currentPage - 1))}
-          >
-            {t("documents.previous")}
-          </Button>
-          {getPageItems(currentPage, totalPages).map((item, index) =>
-            item === "ellipsis" ? (
-              <span
-                key={`ellipsis-${index}`}
-                className="px-1.5 text-xs text-muted-foreground"
-              >
-                …
-              </span>
-            ) : (
-              <Button
-                key={item}
-                variant={item === currentPage ? "default" : "outline"}
-                size="sm"
-                className="h-8 min-w-8 px-2 text-xs tabular-nums"
-                aria-current={item === currentPage ? "page" : undefined}
-                onClick={() => onGoToPage(item)}
-              >
-                {item}
-              </Button>
-            ),
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-8 text-xs"
-            disabled={currentPage >= totalPages}
-            onClick={() => onGoToPage(Math.min(totalPages, currentPage + 1))}
-          >
-            {t("documents.next")}
-          </Button>
-        </div>
-      </div>
-    </div>
+    <TablePaginationFooter
+      canGoNext={currentPage < totalPages}
+      canGoPrevious={currentPage > 1}
+      currentPageNumber={currentPage}
+      goToNextPage={() => onGoToPage(Math.min(totalPages, currentPage + 1))}
+      goToPage={onGoToPage}
+      goToPreviousPage={() => onGoToPage(Math.max(1, currentPage - 1))}
+      nextLabel={t("documents.next")}
+      onPageSizeChange={onPageSizeChange}
+      pageSize={pageSize}
+      pageSizeLabel={t("documents.pageSize")}
+        pageSizeOptions={TABLE_PAGE_SIZE_OPTIONS}
+      previousLabel={t("documents.previous")}
+      summary={t("documents.paginationSummary", {
+        from: visibleStart,
+        to: visibleEnd,
+        total: totalItems,
+      })}
+      totalPages={totalPages}
+    />
   );
 }

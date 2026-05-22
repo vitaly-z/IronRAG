@@ -77,10 +77,9 @@ use super::{
     QueryTurnExecutionResult,
     context::{assemble_context_bundle, load_execution_prepared_reference_context},
     formatting::{
-        append_answer_source_links, build_assistant_document_references,
-        build_prepared_segment_references, build_technical_fact_references,
-        hydrate_entity_references, hydrate_relation_references, map_chunk_references,
-        map_entity_references, map_execution_runtime_stage_summaries,
+        build_assistant_document_references, build_prepared_segment_references,
+        build_technical_fact_references, hydrate_entity_references, hydrate_relation_references,
+        map_chunk_references, map_entity_references, map_execution_runtime_stage_summaries,
         map_execution_runtime_summary, map_relation_references, parse_query_verification_state,
         parse_query_verification_warnings, search_runtime_graph_entity_references,
     },
@@ -297,6 +296,8 @@ impl QueryService {
                     library_ref: &library_ref,
                     user_question: &content_text,
                     conversation_history: &conversation_context.prompt_history_messages,
+                    grounded_answer_tool_history: &conversation_context
+                        .grounded_answer_tool_history,
                     request_id: &agent_request_id,
                     grounded_answer_top_k: top_k,
                     iteration_cap: ui_agent_iteration_cap(),
@@ -373,6 +374,7 @@ impl QueryService {
                                 .agent_loop
                                 .as_ref()
                                 .is_some_and(|metadata| metadata.tool_call_count > 0);
+                            let mut adopted_verified_grounded_answer_passthrough = false;
                             if !has_verifiable_tool_evidence {
                                 let (verification_state, verification_warnings) =
                                     if tool_loop_called_any_tool {
@@ -412,10 +414,18 @@ impl QueryService {
                                 )
                                 .await
                                 {
-                                    Ok(Some(source_execution_id)) => {
+                                    Ok(Some(materialized)) => {
+                                        adopted_verified_grounded_answer_passthrough =
+                                            agent_verified_grounded_answer_passthrough_adopted(
+                                                agent_result
+                                                    .verified_grounded_answer_passthrough_execution_id,
+                                                materialized,
+                                            );
                                         tracing::info!(
                                             execution_id = %execution.id,
-                                            source_execution_id = %source_execution_id,
+                                            source_execution_id = %materialized.source_execution_id,
+                                            primary_execution_id = %materialized.primary_execution_id,
+                                            verified_grounded_answer_passthrough = adopted_verified_grounded_answer_passthrough,
                                             "attached child grounded-answer evidence to UI agent execution"
                                         );
                                     }
@@ -431,7 +441,10 @@ impl QueryService {
                                 }
                             }
                             if verify_failure.is_none()
-                                && has_verifiable_tool_evidence
+                                && agent_answer_requires_parent_tool_evidence_verification(
+                                    has_verifiable_tool_evidence,
+                                    adopted_verified_grounded_answer_passthrough,
+                                )
                                 && let Err(error) = verify_agent_answer_against_tool_evidence(
                                     state,
                                     &execution,
@@ -979,7 +992,7 @@ impl QueryService {
                     state,
                     library.id,
                     enriched_query_text,
-                    conversation_context.prompt_history_text.as_deref(),
+                    conversation_context.query_planning_history_text.as_deref(),
                     CANONICAL_QUERY_MODE,
                     top_k,
                     command.include_debug,
@@ -1212,14 +1225,7 @@ impl QueryService {
                                             None,
                                             Some(answer_started),
                                         );
-                                        let answer_text = self
-                                            .decorate_answer_with_source_links_if_enabled(
-                                                state,
-                                                execution.id,
-                                                &content_text,
-                                                answer,
-                                            )
-                                            .await;
+                                        let answer_text = answer;
 
                                         if let Err(failure) = begin_query_runtime_stage(
                                             state.agent_runtime.executor(),
@@ -1998,56 +2004,6 @@ impl QueryService {
             verification_warnings,
         })
     }
-
-    async fn decorate_answer_with_source_links_if_enabled(
-        &self,
-        state: &AppState,
-        execution_id: Uuid,
-        query_text: &str,
-        answer: String,
-    ) -> String {
-        if !state.settings.query_answer_source_links_enabled {
-            return answer;
-        }
-
-        let reference_context = match tokio::time::timeout(
-            REFERENCE_CONTEXT_HYDRATION_TIMEOUT,
-            load_execution_prepared_reference_context(state, execution_id),
-        )
-        .await
-        {
-            Ok(Ok(reference_context)) => reference_context,
-            Ok(Err(error)) => {
-                warn!(
-                    execution_id = %execution_id,
-                    error = %error,
-                    "failed to resolve prepared-segment source links for assistant answer"
-                );
-                return answer;
-            }
-            Err(_) => {
-                warn!(
-                    execution_id = %execution_id,
-                    timeout_ms = REFERENCE_CONTEXT_HYDRATION_TIMEOUT.as_millis(),
-                    "timed out resolving prepared-segment source links for assistant answer"
-                );
-                return answer;
-            }
-        };
-        let mut prepared_segment_references = build_prepared_segment_references(
-            reference_context.bundle_refs.as_ref(),
-            &reference_context.structured_block_rows,
-            &reference_context.block_rank_refs,
-            query_text,
-            &reference_context.segment_revision_info,
-        );
-        prepared_segment_references.extend(build_assistant_document_references(
-            execution_id,
-            &reference_context.assistant_document_references,
-        ));
-
-        append_answer_source_links(answer, &prepared_segment_references)
-    }
 }
 
 async fn build_query_result_cache_context(
@@ -2085,9 +2041,9 @@ async fn build_query_result_cache_context(
         answer_runtime_fingerprint: result_cache::answer_runtime_fingerprint(),
         mode_label: super::runtime_mode_label(CANONICAL_QUERY_MODE),
         top_k,
-        source_links_enabled: state.settings.query_answer_source_links_enabled,
         user_question,
-        prompt_history_text: conversation_context.prompt_history_text.as_deref(),
+        effective_question: &conversation_context.effective_query_text,
+        answer_history_text: conversation_context.prompt_history_text.as_deref(),
     });
     Ok(QueryResultCacheContext {
         cache_key,
@@ -2254,13 +2210,20 @@ fn context_reference_set_grounding_count(
         + reference_set.bundle.selected_fact_ids.len()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaterializedAgentGrounding {
+    source_execution_id: Uuid,
+    primary_execution_id: Uuid,
+}
+
 async fn materialize_agent_grounding_from_child_execution(
     state: &AppState,
     parent_execution: &query_repository::QueryExecutionRow,
     parent_context_bundle_id: Uuid,
     child_query_execution_ids: &[Uuid],
-) -> anyhow::Result<Option<Uuid>> {
+) -> anyhow::Result<Option<MaterializedAgentGrounding>> {
     let mut primary_reference_set: Option<KnowledgeContextBundleReferenceSetRow> = None;
+    let mut primary_execution_id: Option<Uuid> = None;
     let mut grounding_sources = Vec::new();
     let mut chunk_references = HashMap::new();
     let mut entity_references = HashMap::new();
@@ -2301,6 +2264,7 @@ async fn materialize_agent_grounding_from_child_execution(
         let reference_score = context_reference_set_grounding_count(&reference_set);
         if primary_reference_set.is_none() || reference_score > primary_reference_score {
             primary_reference_score = reference_score;
+            primary_execution_id = Some(child_execution.id);
             primary_reference_set = Some(reference_set.clone());
         }
 
@@ -2324,7 +2288,9 @@ async fn materialize_agent_grounding_from_child_execution(
         }
     }
 
-    let Some(reference_set) = primary_reference_set else {
+    let (Some(reference_set), Some(primary_execution_id)) =
+        (primary_reference_set, primary_execution_id)
+    else {
         return Ok(None);
     };
 
@@ -2401,7 +2367,10 @@ async fn materialize_agent_grounding_from_child_execution(
     )
     .await?;
 
-    Ok(grounding_sources.first().map(|(execution_id, _)| *execution_id))
+    Ok(grounding_sources.first().map(|(execution_id, _)| MaterializedAgentGrounding {
+        source_execution_id: *execution_id,
+        primary_execution_id,
+    }))
 }
 
 async fn verify_agent_answer_against_tool_evidence(
@@ -2552,6 +2521,24 @@ fn agent_has_verifiable_tool_evidence(
             .verification_corpus
             .iter()
             .any(|fragment| verification_fragment_is_verifier_grade_tool_evidence(fragment))
+}
+
+fn agent_answer_requires_parent_tool_evidence_verification(
+    has_verifiable_tool_evidence: bool,
+    adopted_verified_grounded_answer_passthrough: bool,
+) -> bool {
+    has_verifiable_tool_evidence && !adopted_verified_grounded_answer_passthrough
+}
+
+fn agent_verified_grounded_answer_passthrough_adopted(
+    verified_grounded_answer_passthrough_execution_id: Option<Uuid>,
+    materialized: MaterializedAgentGrounding,
+) -> bool {
+    // Skip parent verification only when the materialized grounding is dominated
+    // by the same verified child answer that the agent returned verbatim.
+    verified_grounded_answer_passthrough_execution_id == Some(materialized.source_execution_id)
+        && verified_grounded_answer_passthrough_execution_id
+            == Some(materialized.primary_execution_id)
 }
 
 fn verification_fragment_is_verifier_grade_tool_evidence(fragment: &str) -> bool {
@@ -3120,8 +3107,9 @@ mod tests {
 
     use super::{
         ASSISTANT_AGENT_LOOP_DEADLINE_MS, ASSISTANT_AGENT_LOOP_TOOL_COLLECTION_TARGET_MS,
-        agent_has_verifiable_tool_evidence, is_query_vector_source_mismatch,
-        no_agent_tool_evidence_warnings, ui_agent_iteration_cap,
+        MaterializedAgentGrounding, agent_answer_requires_parent_tool_evidence_verification,
+        agent_has_verifiable_tool_evidence, agent_verified_grounded_answer_passthrough_adopted,
+        is_query_vector_source_mismatch, no_agent_tool_evidence_warnings, ui_agent_iteration_cap,
     };
 
     #[test]
@@ -3158,6 +3146,41 @@ mod tests {
         let child_query_execution_ids = [Uuid::nil()];
 
         assert!(agent_has_verifiable_tool_evidence(&child_query_execution_ids, &grounding));
+    }
+
+    #[test]
+    fn ui_agent_verified_grounded_answer_passthrough_skips_parent_reverification() {
+        assert!(!agent_answer_requires_parent_tool_evidence_verification(true, true));
+        assert!(agent_answer_requires_parent_tool_evidence_verification(true, false));
+        assert!(!agent_answer_requires_parent_tool_evidence_verification(false, false));
+    }
+
+    #[test]
+    fn ui_agent_verified_grounded_answer_passthrough_requires_primary_source_match() {
+        let passthrough_id = Uuid::now_v7();
+        let older_id = Uuid::now_v7();
+
+        assert!(agent_verified_grounded_answer_passthrough_adopted(
+            Some(passthrough_id),
+            MaterializedAgentGrounding {
+                source_execution_id: passthrough_id,
+                primary_execution_id: passthrough_id,
+            },
+        ));
+        assert!(!agent_verified_grounded_answer_passthrough_adopted(
+            Some(passthrough_id),
+            MaterializedAgentGrounding {
+                source_execution_id: passthrough_id,
+                primary_execution_id: older_id,
+            },
+        ));
+        assert!(!agent_verified_grounded_answer_passthrough_adopted(
+            None,
+            MaterializedAgentGrounding {
+                source_execution_id: passthrough_id,
+                primary_execution_id: passthrough_id,
+            },
+        ));
     }
 
     #[test]

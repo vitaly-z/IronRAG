@@ -48,7 +48,13 @@ use uuid::Uuid;
 use crate::{
     app::state::AppState,
     infra::repositories::{self, RuntimeGraphNodeRow},
-    services::knowledge::error::KnowledgeServiceError,
+    services::{
+        graph::canonical_projection::{
+            canonicalize_runtime_graph_document_links, canonicalize_runtime_graph_nodes,
+            remap_node_id,
+        },
+        knowledge::error::KnowledgeServiceError,
+    },
 };
 
 const NODE_BATCH: usize = 512;
@@ -447,6 +453,37 @@ async fn build_compact_topology(
         admitted_ids = admitted_node_ids_vec.len(),
         elapsed_ms = nodes_started_at.elapsed().as_millis() as u64,
         "graph topology: nodes loaded via admitted ids",
+    );
+    let canonical_nodes = canonicalize_runtime_graph_nodes(node_rows);
+    let node_rows = canonical_nodes.nodes;
+    let mut edge_rows_compact = edge_rows_compact
+        .into_iter()
+        .filter_map(|mut edge| {
+            edge.from_node_id = remap_node_id(edge.from_node_id, &canonical_nodes.node_id_remap);
+            edge.to_node_id = remap_node_id(edge.to_node_id, &canonical_nodes.node_id_remap);
+            (edge.from_node_id != edge.to_node_id).then_some(edge)
+        })
+        .collect::<Vec<_>>();
+    edge_rows_compact.sort_by(|left, right| {
+        right
+            .support_count
+            .cmp(&left.support_count)
+            .then_with(|| left.relation_type.cmp(&right.relation_type))
+            .then_with(|| left.from_node_id.cmp(&right.from_node_id))
+            .then_with(|| left.to_node_id.cmp(&right.to_node_id))
+    });
+    let mut seen_edge_signatures = HashSet::new();
+    edge_rows_compact.retain(|edge| {
+        seen_edge_signatures.insert((
+            edge.from_node_id,
+            edge.relation_type.trim().to_string(),
+            edge.to_node_id,
+        ))
+    });
+    let document_link_rows = canonicalize_runtime_graph_document_links(
+        document_link_rows,
+        &node_rows,
+        &canonical_nodes.node_id_remap,
     );
 
     // `document` nodes carry their original content_document.id inside

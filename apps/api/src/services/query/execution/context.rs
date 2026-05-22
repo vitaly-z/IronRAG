@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
 use futures::future::join_all;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::{
@@ -19,11 +20,14 @@ use crate::{
             group_visible_references,
         },
         text_match::{
-            normalized_alnum_tokens, select_related_overlap_tokens,
-            token_sequence_exact_or_contains,
+            build_related_token_candidates, normalized_alnum_tokens,
+            select_related_overlap_tokens_from_candidates, token_sequence_exact_or_contains,
         },
     },
-    shared::extraction::text_render::repair_technical_layout_noise,
+    shared::{
+        extraction::text_render::repair_technical_layout_noise,
+        json_coercion::from_value_or_default, text_tokens::literal_wildcard_prefixes,
+    },
 };
 
 use super::retrieve::{
@@ -38,6 +42,12 @@ use super::types::*;
 const BOUNDED_SOURCE_UNIT_CONTEXT_CHARS: usize = 4_000;
 const BOUNDED_ORDINARY_CONTEXT_CHARS: usize = 1_200;
 const ENTITY_MATCH_CONTEXT_LINE_LIMIT: usize = 8;
+const ENTITY_SUMMARY_CONTEXT_CHARS: usize = 320;
+const TARGET_ENTITY_CONTEXT_LINE_LIMIT: usize = 64;
+const TARGET_ENTITY_INVENTORY_CONTEXT_LINE_LIMIT: usize = 192;
+const TARGET_ENTITY_SUMMARY_CONTEXT_CHARS: usize = 180;
+const RETRIEVED_DOCUMENT_BRIEF_PREVIEW_CHARS: usize = 520;
+const RETRIEVED_DOCUMENT_BRIEF_SOURCE_CHUNKS: usize = 3;
 
 #[cfg(test)]
 pub(crate) fn assemble_bounded_context(
@@ -55,6 +65,7 @@ pub(crate) fn assemble_bounded_context(
         &[],
         &[],
         false,
+        false,
     )
 }
 
@@ -67,14 +78,17 @@ fn assemble_bounded_context_from_chunks(
     entity_match_lines: &[String],
     graph_evidence_lines: &[String],
     prefer_graph_first: bool,
+    prefer_entity_nodes_before_evidence: bool,
 ) -> String {
+    let entity_lines = entities.iter().map(graph_node_context_line).collect::<Vec<_>>();
     let mut graph_lines = entity_match_lines.to_vec();
-    graph_lines.extend(graph_evidence_lines.iter().cloned());
-    graph_lines.extend(
-        entities
-            .iter()
-            .map(|entity| format!("[graph-node] {} ({})", entity.label, entity.node_type)),
-    );
+    if prefer_entity_nodes_before_evidence {
+        graph_lines.extend(entity_lines);
+        graph_lines.extend(graph_evidence_lines.iter().cloned());
+    } else {
+        graph_lines.extend(graph_evidence_lines.iter().cloned());
+        graph_lines.extend(entity_lines);
+    }
     graph_lines.extend(relationships.iter().map(RuntimeMatchedRelationship::context_line));
     let document_lines = chunks
         .iter()
@@ -167,6 +181,8 @@ pub(crate) fn assemble_bounded_context_for_query(
         !entities.is_empty() || !relationships.is_empty(),
         !graph_evidence_lines.is_empty(),
     );
+    let prefer_entity_nodes_before_evidence =
+        should_prioritize_entity_nodes_before_evidence(query_ir, !entities.is_empty());
     assemble_bounded_context_from_chunks(
         entities,
         relationships,
@@ -176,7 +192,109 @@ pub(crate) fn assemble_bounded_context_for_query(
         &entity_match_lines,
         graph_evidence_lines,
         prefer_graph_first,
+        prefer_entity_nodes_before_evidence,
     )
+}
+
+pub(crate) fn target_entity_context_lines(
+    query_ir: &QueryIR,
+    graph_index: &QueryGraphIndex,
+) -> Vec<String> {
+    if query_ir.target_entities.is_empty() {
+        return Vec::new();
+    }
+
+    let line_limit = target_entity_context_line_limit(query_ir);
+    let mut seen_nodes = HashSet::<Uuid>::new();
+    let mut lines = Vec::new();
+    for mention in &query_ir.target_entities {
+        if lines.len() >= line_limit {
+            break;
+        }
+        let label = mention.label.trim();
+        if label.is_empty() {
+            continue;
+        }
+        let normalized_label = normalized_prefix_match_text(label);
+        let wildcard_prefixes = literal_wildcard_prefixes(label, 2);
+        if normalized_label.is_empty() && wildcard_prefixes.is_empty() {
+            continue;
+        }
+
+        let mut matches = graph_index
+            .nodes()
+            .filter(|node| node.node_type != "document")
+            .filter(|node| {
+                graph_node_matches_target_label(node, &normalized_label, &wildcard_prefixes)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            left.label
+                .cmp(&right.label)
+                .then_with(|| right.support_count.cmp(&left.support_count))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for node in matches {
+            if lines.len() >= line_limit || !seen_nodes.insert(node.id) {
+                continue;
+            }
+            lines.push(graph_node_target_context_line(node));
+        }
+    }
+    lines
+}
+
+fn target_entity_context_line_limit(query_ir: &QueryIR) -> usize {
+    if matches!(query_ir.act, QueryAct::Enumerate | QueryAct::Meta)
+        && query_ir
+            .target_entities
+            .iter()
+            .any(|mention| !literal_wildcard_prefixes(mention.label.trim(), 2).is_empty())
+    {
+        TARGET_ENTITY_INVENTORY_CONTEXT_LINE_LIMIT
+    } else {
+        TARGET_ENTITY_CONTEXT_LINE_LIMIT
+    }
+}
+
+fn graph_node_matches_target_label(
+    node: &crate::infra::repositories::RuntimeGraphNodeRow,
+    normalized_label: &str,
+    wildcard_prefixes: &[String],
+) -> bool {
+    let label = normalized_prefix_match_text(&node.label);
+    if !normalized_label.is_empty() && label == normalized_label {
+        return true;
+    }
+    let aliases =
+        from_value_or_default::<Vec<String>>("runtime_graph_node.aliases_json", &node.aliases_json);
+    if !normalized_label.is_empty()
+        && aliases.iter().any(|alias| normalized_prefix_match_text(alias) == normalized_label)
+    {
+        return true;
+    }
+    !wildcard_prefixes.is_empty()
+        && wildcard_prefixes.iter().any(|prefix| {
+            label.starts_with(prefix)
+                || aliases
+                    .iter()
+                    .any(|alias| normalized_prefix_match_text(alias).starts_with(prefix))
+        })
+}
+
+fn graph_node_target_context_line(
+    node: &crate::infra::repositories::RuntimeGraphNodeRow,
+) -> String {
+    let tail = format!("{} ({})", node.label, node.node_type);
+    if let Some(summary) = node.summary.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        return format!(
+            "[graph-node] target_match=explicit evidence: {} | entity_hint: {}",
+            excerpt_for(summary, TARGET_ENTITY_SUMMARY_CONTEXT_CHARS),
+            tail
+        );
+    }
+    format!("[graph-node] target_match=explicit entity_hint: {tail}")
 }
 
 fn entity_match_context_lines(
@@ -187,7 +305,7 @@ fn entity_match_context_lines(
         return Vec::new();
     }
 
-    let target_sets = query_ir
+    let target_labels = query_ir
         .target_entities
         .iter()
         .filter_map(|mention| {
@@ -195,20 +313,28 @@ fn entity_match_context_lines(
             if label.is_empty() {
                 return None;
             }
-            if normalized_alnum_tokens(label, 3).is_empty() {
+            if normalized_alnum_tokens(label, 3).is_empty()
+                && literal_wildcard_prefixes(label, 2).is_empty()
+            {
                 return None;
             }
-            let related_tokens = select_related_overlap_tokens(
-                label,
-                entities.iter().map(|entity| entity.label.as_str()),
-                3,
-            );
-            Some((label.to_string(), related_tokens))
+            Some(label.to_string())
         })
         .collect::<Vec<_>>();
-    if target_sets.is_empty() {
+    if target_labels.is_empty() {
         return Vec::new();
     }
+    let related_candidates =
+        build_related_token_candidates(entities.iter().map(|entity| entity.label.as_str()), 3);
+    let target_sets = target_labels
+        .into_iter()
+        .map(|label| {
+            let wildcard_prefixes = literal_wildcard_prefixes(&label, 2);
+            let related_tokens =
+                select_related_overlap_tokens_from_candidates(&label, &related_candidates, 3);
+            (label, wildcard_prefixes, related_tokens)
+        })
+        .collect::<Vec<_>>();
 
     let mut seen_nodes = HashSet::<Uuid>::new();
     let mut lines = Vec::new();
@@ -221,11 +347,16 @@ fn entity_match_context_lines(
             continue;
         }
         let label_tokens = normalized_alnum_tokens(label, 3);
-        if label_tokens.is_empty() {
-            continue;
-        }
+        let label_prefix_text = normalized_prefix_match_text(label);
         let mut best_kind: Option<&'static str> = None;
-        for (target_label, related_tokens) in &target_sets {
+        for (target_label, wildcard_prefixes, related_tokens) in &target_sets {
+            if !wildcard_prefixes.is_empty() {
+                if wildcard_prefixes.iter().any(|prefix| label_prefix_text.starts_with(prefix)) {
+                    best_kind = Some("prefix");
+                    break;
+                }
+                continue;
+            }
             if token_sequence_exact_or_contains(label, target_label, 3) {
                 best_kind = Some("exact");
                 break;
@@ -237,9 +368,30 @@ fn entity_match_context_lines(
         let Some(kind) = best_kind else {
             continue;
         };
-        lines.push(format!("[entity-match {kind}] {} ({})", entity.label, entity.node_type));
+        lines.push(format!("[entity-match {kind}] {}", graph_node_context_tail(entity)));
     }
     lines
+}
+
+fn graph_node_context_line(entity: &RuntimeMatchedEntity) -> String {
+    if let Some(summary) =
+        entity.summary.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        return format!(
+            "[graph-node] evidence: {} | entity_hint: {}",
+            excerpt_for(summary, ENTITY_SUMMARY_CONTEXT_CHARS),
+            graph_node_context_tail(entity)
+        );
+    }
+    format!("[graph-node] {}", graph_node_context_tail(entity))
+}
+
+fn graph_node_context_tail(entity: &RuntimeMatchedEntity) -> String {
+    format!("{} ({})", entity.label, entity.node_type)
+}
+
+fn normalized_prefix_match_text(value: &str) -> String {
+    value.nfkc().flat_map(char::to_lowercase).collect::<String>().trim().to_string()
 }
 
 pub(crate) fn should_prioritize_retrieved_context_for_query(
@@ -258,16 +410,21 @@ fn should_prioritize_graph_context_for_query(
     has_graph_topology_support: bool,
     has_graph_evidence_support: bool,
 ) -> bool {
-    (has_graph_topology_support || has_graph_evidence_support)
-        && !query_ir.target_entities.is_empty()
-        && matches!(
-            query_ir.act,
-            QueryAct::RetrieveValue
-                | QueryAct::Describe
-                | QueryAct::Compare
-                | QueryAct::Enumerate
-                | QueryAct::Meta
-        )
+    if !(has_graph_topology_support || has_graph_evidence_support) {
+        return false;
+    }
+    if matches!(query_ir.act, QueryAct::Enumerate | QueryAct::Meta)
+        && (query_ir.scope == crate::domains::query_ir::QueryScope::LibraryMeta
+            || !query_ir.target_entities.is_empty())
+    {
+        return true;
+    }
+    !query_ir.target_entities.is_empty()
+        && matches!(query_ir.act, QueryAct::RetrieveValue | QueryAct::Describe | QueryAct::Compare)
+}
+
+fn should_prioritize_entity_nodes_before_evidence(query_ir: &QueryIR, has_entities: bool) -> bool {
+    has_entities && matches!(query_ir.act, QueryAct::Enumerate | QueryAct::Meta)
 }
 
 fn order_bounded_context_chunks<'a>(
@@ -319,11 +476,18 @@ fn bounded_context_document_block(
     if chunk.score_kind == RuntimeChunkScoreKind::GraphEvidence {
         let source_text = chunk.source_text.trim();
         let text = if source_text.is_empty() { chunk.excerpt.trim() } else { source_text };
+        let excerpt =
+            focused_excerpt_for(text, ordinary_keywords, BOUNDED_SOURCE_UNIT_CONTEXT_CHARS);
+        let excerpt = if excerpt.trim().is_empty() {
+            excerpt_for(text, BOUNDED_SOURCE_UNIT_CONTEXT_CHARS)
+        } else {
+            excerpt
+        };
         return format!(
             "[document graph_evidence document=\"{}\" ordinal={}]\n{}",
             context_label(&chunk.document_label),
             chunk.chunk_index,
-            excerpt_for(text, BOUNDED_SOURCE_UNIT_CONTEXT_CHARS)
+            excerpt
         );
     }
     if is_structured_source_unit_context_chunk(chunk) {
@@ -950,10 +1114,10 @@ fn focused_preview_from_bundle_chunks(chunks: &[&RuntimeMatchedChunk]) -> Option
             let trimmed = chunk.source_text.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         })
-        .take(3)
+        .take(RETRIEVED_DOCUMENT_BRIEF_SOURCE_CHUNKS)
         .collect::<Vec<_>>()
         .join(" ");
-    (!joined.is_empty()).then(|| excerpt_for(&joined, 240))
+    (!joined.is_empty()).then(|| excerpt_for(&joined, RETRIEVED_DOCUMENT_BRIEF_PREVIEW_CHARS))
 }
 
 async fn load_retrieved_document_hint(
@@ -997,11 +1161,12 @@ async fn load_retrieved_document_preview_and_hint(
             }
             Some(normalized)
         })
-        .take(3)
+        .take(RETRIEVED_DOCUMENT_BRIEF_SOURCE_CHUNKS)
         .collect::<Vec<_>>()
         .join(" ");
 
-    let preview = (!combined.is_empty()).then(|| excerpt_for(&combined, 240));
+    let preview = (!combined.is_empty())
+        .then(|| excerpt_for(&combined, RETRIEVED_DOCUMENT_BRIEF_PREVIEW_CHARS));
 
     Some((preview, document_hint))
 }
@@ -1059,8 +1224,14 @@ pub(crate) fn group_visible_references_for_query(
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+
     use crate::domains::query_ir::{
         EntityMention, EntityRole, QueryAct, QueryLanguage, QueryScope, SourceSliceSpec,
+    };
+    use crate::{
+        infra::repositories::RuntimeGraphNodeRow,
+        services::knowledge::runtime_read::ActiveRuntimeGraphProjection,
     };
 
     use super::*;
@@ -1122,6 +1293,45 @@ mod tests {
         }
     }
 
+    fn inventory_entity_ir(target_label: &str) -> QueryIR {
+        QueryIR {
+            act: QueryAct::Enumerate,
+            scope: QueryScope::LibraryMeta,
+            language: QueryLanguage::Auto,
+            target_types: vec!["software_module".to_string()],
+            target_entities: vec![EntityMention {
+                label: target_label.to_string(),
+                role: EntityRole::Subject,
+            }],
+            literal_constraints: Vec::new(),
+            temporal_constraints: Vec::new(),
+            comparison: None,
+            document_focus: None,
+            conversation_refs: Vec::new(),
+            needs_clarification: None,
+            source_slice: None,
+            confidence: 0.9,
+        }
+    }
+
+    fn library_inventory_ir() -> QueryIR {
+        QueryIR {
+            act: QueryAct::Enumerate,
+            scope: QueryScope::LibraryMeta,
+            language: QueryLanguage::Auto,
+            target_types: Vec::new(),
+            target_entities: Vec::new(),
+            literal_constraints: Vec::new(),
+            temporal_constraints: Vec::new(),
+            comparison: None,
+            document_focus: None,
+            conversation_refs: Vec::new(),
+            needs_clarification: None,
+            source_slice: None,
+            confidence: 0.9,
+        }
+    }
+
     fn source_slice_unit(ordinal: i32, source_text: &str) -> RuntimeMatchedChunk {
         RuntimeMatchedChunk {
             chunk_id: Uuid::now_v7(),
@@ -1165,6 +1375,115 @@ mod tests {
             score: Some(1.0),
             source_text: source_text.to_string(),
         }
+    }
+
+    fn runtime_graph_node(
+        label: &str,
+        node_type: &str,
+        summary: Option<&str>,
+    ) -> RuntimeGraphNodeRow {
+        RuntimeGraphNodeRow {
+            id: Uuid::now_v7(),
+            library_id: Uuid::now_v7(),
+            canonical_key: format!("{node_type}:{label}"),
+            label: label.to_string(),
+            node_type: node_type.to_string(),
+            aliases_json: serde_json::json!([]),
+            summary: summary.map(str::to_string),
+            metadata_json: serde_json::json!({}),
+            support_count: 1,
+            projection_version: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn graph_index_with_nodes(nodes: Vec<RuntimeGraphNodeRow>) -> QueryGraphIndex {
+        let node_positions =
+            nodes.iter().enumerate().map(|(position, node)| (node.id, position)).collect();
+        QueryGraphIndex::new(
+            std::sync::Arc::new(ActiveRuntimeGraphProjection { nodes, edges: Vec::new() }),
+            node_positions,
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn target_entity_context_lines_surface_explicit_graph_summaries() {
+        let mut query_ir = entity_ir();
+        query_ir.target_entities = vec![
+            EntityMention { label: "alpha-core".to_string(), role: EntityRole::Object },
+            EntityMention { label: "alpha-sync".to_string(), role: EntityRole::Object },
+        ];
+        let graph_index = graph_index_with_nodes(vec![
+            runtime_graph_node(
+                "alpha-core",
+                "software_module",
+                Some("Runs the Alpha Suite core service."),
+            ),
+            runtime_graph_node(
+                "alpha-sync",
+                "software_module",
+                Some("Synchronizes Alpha Suite records."),
+            ),
+            runtime_graph_node("beta-core", "software_module", Some("Unrelated component.")),
+        ]);
+
+        let lines = target_entity_context_lines(&query_ir, &graph_index);
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("alpha-core"));
+        assert!(lines[0].contains("Runs the Alpha Suite core service."));
+        assert!(lines[1].contains("alpha-sync"));
+        assert!(!lines.join("\n").contains("beta-core"));
+    }
+
+    #[test]
+    fn wildcard_inventory_target_context_expands_matching_graph_nodes() {
+        let mut query_ir = inventory_entity_ir("alpha-*");
+        query_ir.scope = QueryScope::SingleDocument;
+        let mut nodes = (0..90)
+            .map(|index| {
+                runtime_graph_node(
+                    &format!("alpha-{index:03}"),
+                    "software_module",
+                    Some("Installable Alpha Suite module."),
+                )
+            })
+            .collect::<Vec<_>>();
+        nodes.push(runtime_graph_node(
+            "beta-000",
+            "software_module",
+            Some("Unrelated Beta Suite module."),
+        ));
+        let graph_index = graph_index_with_nodes(nodes);
+
+        let lines = target_entity_context_lines(&query_ir, &graph_index);
+
+        assert!(lines.len() > TARGET_ENTITY_CONTEXT_LINE_LIMIT);
+        assert!(lines.iter().any(|line| line.contains("alpha-089")));
+        assert!(!lines.join("\n").contains("beta-000"));
+    }
+
+    #[test]
+    fn descriptive_wildcard_target_context_keeps_default_cap() {
+        let mut query_ir = inventory_entity_ir("alpha-*");
+        query_ir.act = QueryAct::Describe;
+        let nodes = (0..90)
+            .map(|index| {
+                runtime_graph_node(
+                    &format!("alpha-{index:03}"),
+                    "software_module",
+                    Some("Installable Alpha Suite module."),
+                )
+            })
+            .collect::<Vec<_>>();
+        let graph_index = graph_index_with_nodes(nodes);
+
+        let lines = target_entity_context_lines(&query_ir, &graph_index);
+
+        assert_eq!(lines.len(), TARGET_ENTITY_CONTEXT_LINE_LIMIT);
+        assert!(!lines.iter().any(|line| line.contains("alpha-064")));
     }
 
     #[test]
@@ -1295,6 +1614,18 @@ mod tests {
     }
 
     #[test]
+    fn retrieved_document_brief_preview_keeps_near_intro_identifiers() {
+        let source = format!(
+            "{}GatewayModuleAlpha is the installable module for Provider Alpha.",
+            "Introductory setup context. ".repeat(12)
+        );
+        let chunk = ordinary_chunk("Provider Alpha setup overview.", &source);
+        let preview = focused_preview_from_bundle_chunks(&[&chunk]).unwrap();
+
+        assert!(preview.contains("GatewayModuleAlpha"));
+    }
+
+    #[test]
     fn entity_target_context_prioritizes_graph_lines_before_documents() {
         let context = assemble_bounded_context_for_query(
             &entity_ir(),
@@ -1304,12 +1635,14 @@ mod tests {
                     node_id: Uuid::now_v7(),
                     label: "Project Omega".to_string(),
                     node_type: "person".to_string(),
+                    summary: None,
                     score: Some(0.9),
                 },
                 RuntimeMatchedEntity {
                     node_id: Uuid::now_v7(),
                     label: "Project Omega Peer".to_string(),
                     node_type: "person".to_string(),
+                    summary: None,
                     score: Some(0.8),
                 },
             ],
@@ -1355,6 +1688,100 @@ mod tests {
     }
 
     #[test]
+    fn inventory_context_keeps_matching_graph_nodes_before_long_evidence() {
+        let graph_evidence_lines = vec![format!(
+            "[graph-evidence target=\"Alpha Suite\"]\n{}",
+            "Long supporting evidence. ".repeat(40)
+        )];
+        let context = assemble_bounded_context_for_query(
+            &inventory_entity_ir("alpha-*"),
+            "List alpha-* modules",
+            &[
+                RuntimeMatchedEntity {
+                    node_id: Uuid::now_v7(),
+                    label: "alpha-core".to_string(),
+                    node_type: "software_module".to_string(),
+                    summary: None,
+                    score: Some(0.9),
+                },
+                RuntimeMatchedEntity {
+                    node_id: Uuid::now_v7(),
+                    label: "alpha-desktop".to_string(),
+                    node_type: "software_module".to_string(),
+                    summary: None,
+                    score: Some(0.8),
+                },
+            ],
+            &[],
+            &[ordinary_chunk(
+                "Alpha Suite overview mentions several modules.",
+                "Alpha Suite overview mentions several modules.",
+            )],
+            &graph_evidence_lines,
+            512,
+        );
+
+        let match_index = context.find("[entity-match prefix] alpha-core").unwrap();
+        let node_index = context.find("[graph-node] alpha-core").unwrap();
+        assert!(match_index < node_index);
+        if let Some(evidence_index) = context.find("[graph-evidence") {
+            assert!(node_index < evidence_index);
+        }
+    }
+
+    #[test]
+    fn library_inventory_context_prioritizes_graph_nodes_without_target_entities() {
+        let context = assemble_bounded_context_for_query(
+            &library_inventory_ir(),
+            "List graph inventory",
+            &[RuntimeMatchedEntity {
+                node_id: Uuid::now_v7(),
+                label: "Alpha Gateway".to_string(),
+                node_type: "software_module".to_string(),
+                summary: None,
+                score: Some(0.9),
+            }],
+            &[],
+            &[ordinary_chunk(
+                "A long document overview also exists.",
+                "A long document overview also exists.",
+            )],
+            &[],
+            4096,
+        );
+
+        let graph_index = context.find("[graph-node] Alpha Gateway").unwrap();
+        let document_index = context.find("[document]").unwrap();
+        assert!(graph_index < document_index);
+    }
+
+    #[test]
+    fn graph_node_context_includes_entity_summary_as_answer_evidence() {
+        let context = assemble_bounded_context_for_query(
+            &library_inventory_ir(),
+            "List graph inventory",
+            &[RuntimeMatchedEntity {
+                node_id: Uuid::now_v7(),
+                label: "Alpha Worker".to_string(),
+                node_type: "software_module".to_string(),
+                summary: Some("Runs queued jobs and retries failed deliveries.".to_string()),
+                score: Some(0.9),
+            }],
+            &[],
+            &[ordinary_chunk(
+                "A long document overview also exists.",
+                "A long document overview also exists.",
+            )],
+            &[],
+            4096,
+        );
+
+        assert!(context.contains("[graph-node] evidence:"));
+        assert!(context.contains("Runs queued jobs and retries failed deliveries."));
+        assert!(context.contains("entity_hint: Alpha Worker (software_module)"));
+    }
+
+    #[test]
     fn entity_target_context_marks_exact_and_token_overlap_matches() {
         let context = assemble_bounded_context_for_query(
             &entity_ir(),
@@ -1364,30 +1791,35 @@ mod tests {
                     node_id: Uuid::now_v7(),
                     label: "Project Omega".to_string(),
                     node_type: "person".to_string(),
+                    summary: None,
                     score: Some(0.9),
                 },
                 RuntimeMatchedEntity {
                     node_id: Uuid::now_v7(),
                     label: "Omega Delta".to_string(),
                     node_type: "person".to_string(),
+                    summary: None,
                     score: Some(0.8),
                 },
                 RuntimeMatchedEntity {
                     node_id: Uuid::now_v7(),
                     label: "Project Alpha".to_string(),
                     node_type: "person".to_string(),
+                    summary: None,
                     score: Some(0.7),
                 },
                 RuntimeMatchedEntity {
                     node_id: Uuid::now_v7(),
                     label: "Project Beta".to_string(),
                     node_type: "person".to_string(),
+                    summary: None,
                     score: Some(0.6),
                 },
                 RuntimeMatchedEntity {
                     node_id: Uuid::now_v7(),
                     label: "Unrelated Sigma".to_string(),
                     node_type: "person".to_string(),
+                    summary: None,
                     score: Some(0.1),
                 },
             ],
@@ -1422,12 +1854,14 @@ mod tests {
                     node_id: Uuid::now_v7(),
                     label: "OTO".to_string(),
                     node_type: "organization".to_string(),
+                    summary: None,
                     score: Some(0.9),
                 },
                 RuntimeMatchedEntity {
                     node_id: Uuid::now_v7(),
                     label: "Alex Otoya".to_string(),
                     node_type: "person".to_string(),
+                    summary: None,
                     score: Some(0.8),
                 },
             ],

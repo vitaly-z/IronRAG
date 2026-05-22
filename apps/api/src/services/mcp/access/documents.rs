@@ -171,7 +171,11 @@ pub async fn search_documents(
                 .entry(document.document_id)
                 .or_insert_with(|| McpDocumentAccumulator::from_knowledge(document, revision, hit));
             accumulator.bump_score(hit.score);
-            accumulator.merge_chunk_span_anchor(chunk.span_start, hit.score);
+            accumulator.merge_chunk_span_anchor(
+                chunk.span_start,
+                hit.score,
+                settings.default_read_window_chars,
+            );
             accumulator.merge_chunk_reference(
                 chunk.chunk_id,
                 saturating_rank(index),
@@ -214,7 +218,11 @@ pub async fn search_documents(
                     )
                 });
             accumulator.bump_score(hit.score);
-            accumulator.merge_chunk_span_anchor(chunk.span_start, hit.score);
+            accumulator.merge_chunk_span_anchor(
+                chunk.span_start,
+                hit.score,
+                settings.default_read_window_chars,
+            );
             accumulator.merge_chunk_reference(
                 chunk.chunk_id,
                 saturating_rank(index),

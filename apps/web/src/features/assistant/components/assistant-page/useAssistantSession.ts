@@ -55,6 +55,7 @@ type SendQuestionVariables = {
   optimisticSessionId: string | null;
   pendingMessage: AssistantMessage;
   questionText: string;
+  recoveryMessageStartIndex: number;
   requestScope: string;
   sessionsQueryKey: QueryKey;
   userMessage: AssistantMessage;
@@ -72,6 +73,40 @@ type SendQuestionContext = {
   previousMessages: AssistantMessage[];
   previousSessions: AssistantSessionListItem[] | undefined;
 };
+
+const ACTIVE_SESSION_STORAGE_PREFIX = 'ironrag_assistant_active_session';
+
+function activeSessionStorageKey(scopeKey: string | null): string | null {
+  return scopeKey ? `${ACTIVE_SESSION_STORAGE_PREFIX}:${scopeKey}` : null;
+}
+
+function readActiveSession(scopeKey: string | null): string | null {
+  const key = activeSessionStorageKey(scopeKey);
+  if (!key || typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(key);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    return typeof parsed === 'string' && parsed.length > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeActiveSession(scopeKey: string | null, sessionId: string | null) {
+  const key = activeSessionStorageKey(scopeKey);
+  if (!key || typeof window === 'undefined') return;
+  try {
+    if (sessionId?.startsWith('optimistic-session-')) {
+      window.localStorage.removeItem(key);
+    } else if (sessionId) {
+      window.localStorage.setItem(key, JSON.stringify(sessionId));
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // Persistence is optional; blocked or full storage must not break chat.
+  }
+}
 
 function useScopedState<T>(
   scopeKey: string | null,
@@ -133,7 +168,7 @@ export function useAssistantSession({
   const [isExecuting, setIsExecuting] = useState(false);
   const libraryScopeKey =
     workspaceId && libraryId ? `${workspaceId}:${libraryId}` : null;
-  const [activeSession, setActiveSession] = useScopedState<string | null>(
+  const [activeSession, setActiveSessionState] = useScopedState<string | null>(
     libraryScopeKey,
     null,
   );
@@ -161,9 +196,27 @@ export function useAssistantSession({
   const hydratedSessionRef = useRef<string | null>(null);
   const [optimisticSessionId, setOptimisticSessionId] = useState<string | null>(null);
 
+  const setActiveSession = useCallback(
+    (action: SetStateAction<string | null>) => {
+      setActiveSessionState((current) => {
+        const next = resolveStateAction(action, current);
+        writeActiveSession(libraryScopeKey, next);
+        return next;
+      });
+    },
+    [libraryScopeKey, setActiveSessionState],
+  );
+
   useEffect(() => {
     libraryScopeRef.current = libraryScopeKey;
   }, [libraryScopeKey]);
+
+  useEffect(() => {
+    const storedSessionId = readActiveSession(libraryScopeKey);
+    hydratedSessionRef.current = null;
+    activeSessionRef.current = storedSessionId;
+    setActiveSessionState(storedSessionId);
+  }, [libraryScopeKey, setActiveSessionState]);
 
   useEffect(() => {
     activeSessionRef.current = activeSession;
@@ -239,6 +292,19 @@ export function useAssistantSession({
       .filter((session) => session.libraryId === libraryId);
   }, [libraryId, sessionsData]);
 
+  useEffect(() => {
+    if (!sessionsData || !activeSession || activeSessionIsOptimistic) return;
+    if (sessions.some((session) => session.id === activeSession)) return;
+    activeSessionRef.current = null;
+    setActiveSession(null);
+  }, [
+    activeSession,
+    activeSessionIsOptimistic,
+    sessions,
+    sessionsData,
+    setActiveSession,
+  ]);
+
   const sendQuestionMutation = useMutation<
     SendQuestionResult,
     unknown,
@@ -282,6 +348,7 @@ export function useAssistantSession({
       const result = await queryApi.createTurnStream(
         sessionId,
         variables.questionText,
+        variables.recoveryMessageStartIndex,
         (event) => {
           if (
             libraryScopeRef.current !== variables.requestScope ||
@@ -521,6 +588,7 @@ export function useAssistantSession({
           : `optimistic-session-${now}`,
         pendingMessage,
         questionText,
+        recoveryMessageStartIndex: messages.length,
         requestScope,
         sessionsQueryKey: sessionsQueryOptions.queryKey,
         userMessage: createUserMessage(questionText, now),
@@ -532,6 +600,7 @@ export function useAssistantSession({
     [
       libraryId,
       libraryScopeKey,
+      messages.length,
       mutateSendQuestion,
       sessions,
       sessionsQueryOptions.queryKey,

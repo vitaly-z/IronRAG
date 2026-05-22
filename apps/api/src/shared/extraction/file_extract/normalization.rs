@@ -17,13 +17,20 @@ pub(super) struct NormalizedExtractedContent {
 
 pub(super) fn normalize_extracted_content(
     file_kind: UploadFileKind,
+    recognition_engine: RecognitionEngine,
     content_text: &str,
     structure_hints: &ExtractionStructureHints,
 ) -> NormalizedExtractedContent {
     let scaffold_normalization = strip_docling_image_scaffold_lines(content_text);
+    let source_text = if should_normalize_markdown_transport_escapes(file_kind, recognition_engine)
+    {
+        normalize_markdown_transport_escapes(&scaffold_normalization.text)
+    } else {
+        scaffold_normalization.text
+    };
     let source_text = match file_kind {
-        UploadFileKind::Image => normalize_image_ocr_text(&scaffold_normalization.text),
-        _ => scaffold_normalization.text,
+        UploadFileKind::Image => normalize_image_ocr_text(&source_text),
+        _ => source_text,
     };
     let source_changed = source_text.trim() != content_text.trim();
     let normalized_structure_hints = if source_changed {
@@ -170,6 +177,74 @@ fn collapse_excess_blank_lines(lines: Vec<String>) -> String {
     collapsed.join("\n")
 }
 
+fn should_normalize_markdown_transport_escapes(
+    file_kind: UploadFileKind,
+    recognition_engine: RecognitionEngine,
+) -> bool {
+    recognition_engine == RecognitionEngine::Docling
+        && matches!(
+            file_kind,
+            UploadFileKind::Pdf
+                | UploadFileKind::Docx
+                | UploadFileKind::Pptx
+                | UploadFileKind::Image
+        )
+}
+
+fn normalize_markdown_transport_escapes(content_text: &str) -> String {
+    let unescaped = unescape_markdown_punctuation(content_text);
+    decode_common_text_entities(&unescaped)
+}
+
+fn unescape_markdown_punctuation(content_text: &str) -> String {
+    let mut output = String::with_capacity(content_text.len());
+    let mut chars = content_text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(next) = chars.peek().copied()
+            && is_markdown_escaped_punctuation(next)
+        {
+            output.push(next);
+            let _ = chars.next();
+            continue;
+        }
+        output.push(ch);
+    }
+    output
+}
+
+fn is_markdown_escaped_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '\\' | '`'
+            | '*'
+            | '_'
+            | '{'
+            | '}'
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | '#'
+            | '+'
+            | '-'
+            | '.'
+            | '!'
+            | '|'
+            | '<'
+            | '>'
+    )
+}
+
+fn decode_common_text_entities(content_text: &str) -> String {
+    content_text
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
 fn normalize_image_ocr_text(content_text: &str) -> String {
     let normalized_newlines = content_text.replace("\r\n", "\n").replace('\r', "\n");
     let lines = normalized_newlines.lines().map(str::trim).collect::<Vec<_>>();
@@ -245,6 +320,7 @@ fn strip_wrapper_label_prefix(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::domains::recognition::RecognitionEngine;
     use crate::shared::extraction::{
         build_text_layout_from_content,
         file_extract::{UploadFileKind, normalization::normalize_extracted_content},
@@ -255,7 +331,12 @@ mod tests {
         let content = "<!-- image -->\n\n> Image OCR: AL\n\n# Product Manual\n\nGET /v1/status";
         let hints = build_text_layout_from_content(content).structure_hints;
 
-        let normalized = normalize_extracted_content(UploadFileKind::Pdf, content, &hints);
+        let normalized = normalize_extracted_content(
+            UploadFileKind::Pdf,
+            RecognitionEngine::Docling,
+            content,
+            &hints,
+        );
 
         assert!(!normalized.source_text.contains("<!-- image -->"));
         assert!(!normalized.source_text.contains("Image OCR:"));
@@ -272,15 +353,57 @@ mod tests {
     }
 
     #[test]
-    fn image_normalization_rebuilds_hints_after_ocr_wrapper_cleanup() {
-        let content = "OCR text:\n\nVisible marker 42\n\n<!-- image -->";
+    fn pdf_normalization_removes_markdown_transport_escapes_from_identifiers() {
+        let content =
+            "Config: ALPHA\\_TIMEOUT\\_MS=4500\nPath: NODE\\_ALPHA-42 -&gt; CFG\\_TIMEOUT\\_MS";
         let hints = build_text_layout_from_content(content).structure_hints;
 
-        let normalized = normalize_extracted_content(UploadFileKind::Image, content, &hints);
+        let normalized = normalize_extracted_content(
+            UploadFileKind::Pdf,
+            RecognitionEngine::Docling,
+            content,
+            &hints,
+        );
 
-        assert_eq!(normalized.source_text, "Visible marker 42");
-        assert_eq!(normalized.normalized_text, "Visible marker 42");
+        assert_eq!(
+            normalized.source_text,
+            "Config: ALPHA_TIMEOUT_MS=4500\nPath: NODE_ALPHA-42 -> CFG_TIMEOUT_MS"
+        );
+        assert!(normalized.normalized_text.contains("ALPHA_TIMEOUT_MS=4500"));
+        assert!(normalized.normalized_text.contains("NODE_ALPHA-42 -> CFG_TIMEOUT_MS"));
+    }
+
+    #[test]
+    fn image_normalization_rebuilds_hints_after_ocr_wrapper_cleanup() {
+        let content = "OCR text:\n\nVisible marker 42 ALPHA\\_TIMEOUT\\_MS\n\n<!-- image -->";
+        let hints = build_text_layout_from_content(content).structure_hints;
+
+        let normalized = normalize_extracted_content(
+            UploadFileKind::Image,
+            RecognitionEngine::Docling,
+            content,
+            &hints,
+        );
+
+        assert_eq!(normalized.source_text, "Visible marker 42 ALPHA_TIMEOUT_MS");
+        assert_eq!(normalized.normalized_text, "Visible marker 42 ALPHA_TIMEOUT_MS");
         assert_eq!(normalized.structure_hints.lines.len(), 1);
-        assert_eq!(normalized.structure_hints.lines[0].text, "Visible marker 42");
+        assert_eq!(normalized.structure_hints.lines[0].text, "Visible marker 42 ALPHA_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn native_text_normalization_preserves_literal_backslashes_and_entities() {
+        let content = r"Regex: \d{3}\.\w+; literal entity: &gt; and path C:\\Temp\\file";
+        let hints = build_text_layout_from_content(content).structure_hints;
+
+        let normalized = normalize_extracted_content(
+            UploadFileKind::TextLike,
+            RecognitionEngine::Native,
+            content,
+            &hints,
+        );
+
+        assert_eq!(normalized.source_text, content);
+        assert_eq!(normalized.normalized_text, content);
     }
 }

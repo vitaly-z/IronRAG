@@ -75,8 +75,7 @@ pub(crate) async fn finalize_structured_query(
     let context_chunks = assembly_stage.rerank.retrieval.bundle.chunks.clone();
     let ordered_source_units =
         collect_ordered_source_units(&assembly_stage.rerank.retrieval.bundle.chunks);
-    let graph_evidence_context_lines =
-        assembly_stage.rerank.retrieval.graph_evidence_context_lines.clone();
+    let graph_evidence_context_lines = assembly_stage.graph_evidence_context_lines.clone();
     let graph_entity_references = assembly_stage.rerank.retrieval.bundle.entities.clone();
     let graph_relation_references = assembly_stage.rerank.retrieval.bundle.relationships.clone();
 
@@ -248,6 +247,14 @@ pub(crate) async fn retrieve_structured_query(
     let question_embedding = vector_search_embedding;
     let graph_index = &planning.graph_index;
     let document_index = &planning.document_index;
+    let target_profile_started = std::time::Instant::now();
+    let target_entity_profiles = graph_target_entity_profiles(query_ir, graph_index);
+    tracing::info!(
+        stage = "retrieval.graph_target_profiles",
+        target_profile_count = target_entity_profiles.len(),
+        elapsed_ms = target_profile_started.elapsed().as_millis(),
+        "graph target entity profiles prepared for query execution",
+    );
     let candidate_limit = planning.candidate_limit;
     let document_filter_ids =
         resolve_scoped_target_document_ids(question, query_ir, document_index);
@@ -278,6 +285,7 @@ pub(crate) async fn retrieve_structured_query(
                 provider_profile,
                 plan,
                 query_ir,
+                &target_entity_profiles,
                 candidate_limit,
                 question_embedding,
                 graph_index,
@@ -291,6 +299,7 @@ pub(crate) async fn retrieve_structured_query(
                 provider_profile,
                 plan,
                 query_ir,
+                &target_entity_profiles,
                 candidate_limit,
                 question_embedding,
                 graph_index,
@@ -304,6 +313,7 @@ pub(crate) async fn retrieve_structured_query(
                 provider_profile,
                 plan,
                 query_ir,
+                &target_entity_profiles,
                 candidate_limit,
                 question_embedding,
                 graph_index,
@@ -325,32 +335,19 @@ pub(crate) async fn retrieve_structured_query(
             bundle
         }
         RuntimeQueryMode::Mix => {
-            let mut local = retrieve_local_bundle(
+            let mut bundle = retrieve_mixed_graph_bundle(
                 state,
                 library_id,
                 provider_profile,
                 plan,
                 query_ir,
+                &target_entity_profiles,
                 candidate_limit,
                 question_embedding,
                 graph_index,
             )
             .await?;
-            let global = retrieve_global_bundle(
-                state,
-                library_id,
-                provider_profile,
-                plan,
-                query_ir,
-                candidate_limit,
-                question_embedding,
-                graph_index,
-            )
-            .await?;
-            local.entities = merge_entities(local.entities, global.entities, candidate_limit);
-            local.relationships =
-                merge_relationships(local.relationships, global.relationships, candidate_limit);
-            local.chunks = retrieve_document_chunks(
+            bundle.chunks = retrieve_document_chunks(
                 state,
                 library_id,
                 provider_profile,
@@ -363,7 +360,7 @@ pub(crate) async fn retrieve_structured_query(
                 query_ir,
             )
             .await?;
-            local
+            bundle
         }
     };
 
@@ -375,6 +372,7 @@ pub(crate) async fn retrieve_structured_query(
         &bundle.relationships,
         plan,
         query_ir,
+        &target_entity_profiles,
         graph_index,
         document_index,
         &document_filter_ids,
@@ -403,6 +401,7 @@ pub(crate) async fn retrieve_structured_query(
         planning,
         bundle,
         graph_evidence_context_lines: graph_evidence.context_lines,
+        graph_evidence_source_document_ids: graph_evidence.source_document_ids,
     })
 }
 
@@ -447,7 +446,7 @@ async fn assemble_structured_query(
     rerank.retrieval.planning.technical_literal_intent = technical_literal_intent;
     let plan = &rerank.retrieval.planning.plan;
     let bundle = &mut rerank.retrieval.bundle;
-    let effective_top_k = source_slice_context_top_k(query_ir, plan.top_k);
+    let effective_top_k = structured_source_context_top_k(query_ir, plan.top_k);
     let retrieved_documents = load_retrieved_document_briefs(
         state,
         &bundle.chunks,
@@ -465,6 +464,7 @@ async fn assemble_structured_query(
         technical_literal_intent,
         effective_top_k,
         &literal_focus_keywords,
+        &rerank.retrieval.graph_evidence_source_document_ids,
         pagination_requested,
     );
     let technical_literal_groups =
@@ -484,7 +484,9 @@ async fn assemble_structured_query(
     );
     let effective_context_budget =
         source_slice_context_budget_chars(query_ir, plan.context_budget_chars);
-    let graph_evidence_lines = rerank.retrieval.graph_evidence_context_lines.clone();
+    let mut graph_evidence_lines =
+        target_entity_context_lines(query_ir, &rerank.retrieval.planning.graph_index);
+    graph_evidence_lines.extend(rerank.retrieval.graph_evidence_context_lines.clone());
     let context_text = assemble_bounded_context_for_query(
         query_ir,
         question,
@@ -505,6 +507,7 @@ async fn assemble_structured_query(
     Ok(StructuredQueryAssemblyStage {
         rerank,
         context_text,
+        graph_evidence_context_lines: graph_evidence_lines,
         technical_literals_text,
         technical_literal_chunks,
         retrieved_documents,
@@ -660,6 +663,7 @@ mod tests {
             TechnicalLiteralIntent::default(),
             8,
             &focus_keywords,
+            &[],
             false,
         );
         assert!(
@@ -681,6 +685,7 @@ mod tests {
             technical_intent,
             8,
             &focus_keywords,
+            &[],
             false,
         );
 

@@ -56,11 +56,6 @@ pub(crate) const SINGLE_SHOT_CONFIDENT_ANSWER_CHARS: usize = 80;
 /// the `ready`-bucket / decline case.
 pub(crate) const SINGLE_SHOT_RETRIEVAL_ESCALATION_MIN_DOCUMENTS: usize = 5;
 
-/// Maximum number of `[Title](url)` entries in the auto-appended
-/// Sources block at the end of a grounded answer. Keeps long answers
-/// from ending in a 20-bullet reference dump.
-pub(crate) const MAX_APPENDED_SOURCES: usize = 5;
-
 /// Upper bound on the number of chunks the winning document may
 /// occupy in the final retrieval bundle when `focused_document_consolidation`
 /// picks a high-confidence single-document winner (hint /

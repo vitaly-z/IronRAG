@@ -7,6 +7,7 @@ fn build_references_keeps_chunk_node_edge_order_and_ranks() {
             node_id: Uuid::now_v7(),
             label: "IronRAG".to_string(),
             node_type: "entity".to_string(),
+            summary: None,
             score: Some(0.9),
         }],
         &[RuntimeMatchedRelationship {
@@ -91,6 +92,7 @@ fn assemble_bounded_context_interleaves_graph_and_document_support() {
             node_id: Uuid::now_v7(),
             label: "IronRAG".to_string(),
             node_type: "entity".to_string(),
+            summary: None,
             score: Some(0.9),
         }],
         &[RuntimeMatchedRelationship {
@@ -144,9 +146,13 @@ fn build_answer_prompt_prioritizes_library_context() {
     );
     assert!(prompt.contains("Treat the active library as the primary source of truth"));
     assert!(prompt.contains("exhaust the provided library context"));
+    assert!(prompt.contains("Hard output boundary"));
+    assert!(prompt.contains("Never write about future assistant actions"));
     assert!(prompt.contains("recent document metadata"));
     assert!(prompt.contains("Present the answer directly."));
     assert!(prompt.contains("Do not narrate the retrieval process"));
+    assert!(prompt.contains("Do not add follow-up offers"));
+    assert!(prompt.contains("state the coverage limit directly"));
     assert!(prompt.contains("Do not ask the user to upload"));
     assert!(prompt.contains("Exact technical literals section"));
     assert!(prompt.contains("copy those literals verbatim from Context"));
@@ -154,6 +160,8 @@ fn build_answer_prompt_prioritizes_library_context() {
     assert!(prompt.contains("matched excerpt"));
     assert!(prompt.contains("Do not combine parts from different snippets"));
     assert!(prompt.contains("prefer the next distinct item after the excluded one"));
+    assert!(prompt.contains("preserve visible coverage of that list"));
+    assert!(prompt.contains("without a grounded description"));
     assert!(prompt.contains("For multi-role questions"));
     assert!(prompt.contains("bind each role to the source entity or document"));
     assert!(prompt.contains("Question: What documents mention IronRAG?"));

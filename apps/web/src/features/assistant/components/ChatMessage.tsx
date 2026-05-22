@@ -96,7 +96,6 @@ function renderActivityIcon(event: AssistantAgentActivityEvent | undefined) {
 function collectAnswerSourceLinks(message: AssistantMessage): AnswerSourceLink[] {
   const seen = new Set<string>();
   const links: AnswerSourceLink[] = [];
-  const contentLower = message.content.toLocaleLowerCase();
 
   for (const ref of message.evidence?.segmentRefs ?? []) {
     const sourceAccess = ref.sourceAccess;
@@ -107,7 +106,6 @@ function collectAnswerSourceLinks(message: AssistantMessage): AnswerSourceLink[]
         ? fallbackSourceUri
         : null);
     if (!href || seen.has(href)) continue;
-    if (contentLower.includes(href.toLocaleLowerCase())) continue;
 
     const label = (ref.documentTitle || ref.documentName || href).trim();
     links.push({
@@ -120,56 +118,6 @@ function collectAnswerSourceLinks(message: AssistantMessage): AnswerSourceLink[]
   }
 
   return links;
-}
-
-function stripTrailingSourceEcho(content: string, sourceLinks: AnswerSourceLink[]): string {
-  if (sourceLinks.length === 0) return content;
-
-  const lines = content.trimEnd().split(/\r?\n/);
-  let separatorIndex = -1;
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (/^-{3,}$/.test(lines[index].trim())) {
-      separatorIndex = index;
-      break;
-    }
-  }
-  if (separatorIndex < 0) return content;
-
-  const tailLines = lines.slice(separatorIndex + 1).map((line) => line.trim()).filter(Boolean);
-  if (tailLines.length === 0) return content;
-
-  const tailText = tailLines.join(' ');
-  if (/\]\(|https?:\/\//i.test(tailText)) return content;
-
-  const sourceLabels = new Set(
-    sourceLinks.map((link) => link.label.trim().toLocaleLowerCase()).filter(Boolean),
-  );
-  let firstSourceLineIndex = -1;
-  const isSourceTitleLine = (line: string) => {
-    const bareLine = line.replace(/^[-*]\s+/, '').replace(/^\d+[.)]\s+/, '').trim();
-    return sourceLabels.has(bareLine.toLocaleLowerCase());
-  };
-
-  for (let index = 0; index < tailLines.length; index += 1) {
-    if (isSourceTitleLine(tailLines[index])) {
-      firstSourceLineIndex = index;
-      break;
-    }
-  }
-  if (firstSourceLineIndex < 0) return content;
-
-  const leadingHeaderLines = tailLines.slice(0, firstSourceLineIndex);
-  const hasOnlyCompactLeadingHeader =
-    leadingHeaderLines.length <= 1 &&
-    leadingHeaderLines.every((line) => {
-      const normalized = line.replace(/:$/, '').trim();
-      return normalized.length > 0 && normalized.length <= 40 && !/\s/.test(normalized);
-    });
-  const tailIsBareSourceList =
-    hasOnlyCompactLeadingHeader && tailLines.slice(firstSourceLineIndex).every(isSourceTitleLine);
-  if (!tailIsBareSourceList) return content;
-
-  return lines.slice(0, separatorIndex).join('\n').trimEnd();
 }
 
 function PendingAssistantActivity({
@@ -290,8 +238,6 @@ function ChatMessageImpl({ t, message }: ChatMessageProps) {
   const vcLabel = vcState && vcState !== 'not_run' ? verificationLabel(vcState, t) : null;
   const isPendingAssistant = !isUser && !message.content;
   const sourceLinks = !isUser && !isPendingAssistant ? collectAnswerSourceLinks(message) : [];
-  const renderedContent =
-    sourceLinks.length > 0 ? stripTrailingSourceEcho(message.content, sourceLinks) : message.content;
   const messageWidthClass = isUser
     ? 'max-w-[80%]'
     : isPendingAssistant
@@ -337,11 +283,11 @@ function ChatMessageImpl({ t, message }: ChatMessageProps) {
           {!isUser ? (
             <div className="prose prose-sm dark:prose-invert max-w-none">
               <ReactMarkdown components={markdownComponents}>
-                {renderedContent}
+                {message.content}
               </ReactMarkdown>
               {sourceLinks.length > 0 && (
-                <div className="not-prose mt-3 border-t border-border/70 pt-2">
-                  <div className="mb-1.5 text-[11px] font-semibold uppercase text-muted-foreground">
+                <div className="not-prose mt-3 rounded-lg border border-dashed border-primary/25 bg-primary/[0.03] px-3 py-2.5">
+                  <div className="mb-2 text-[11px] font-semibold uppercase text-muted-foreground">
                     {t('assistant.sources')}
                   </div>
                   <div className="flex flex-wrap gap-1.5">

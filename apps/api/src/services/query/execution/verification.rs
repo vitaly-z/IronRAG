@@ -9,6 +9,7 @@ use crate::{
     infra::arangodb::document_store::KnowledgeTechnicalFactRow,
     services::query::assistant_grounding::AssistantGroundingEvidence,
     services::query::planner::QueryIntentProfile,
+    shared::text_tokens::literal_wildcard_prefixes,
 };
 
 use super::types::{CanonicalAnswerEvidence, RuntimeAnswerVerification, RuntimeMatchedChunk};
@@ -16,7 +17,7 @@ use super::types::{CanonicalAnswerEvidence, RuntimeAnswerVerification, RuntimeMa
 const VERIFICATION_LITERAL_COLOCATION_MAX_NORMALIZED_SPAN: usize = 2_048;
 
 pub(crate) fn verify_answer_against_canonical_evidence(
-    _question: &str,
+    question: &str,
     answer: &str,
     intent_profile: &QueryIntentProfile,
     evidence: &CanonicalAnswerEvidence,
@@ -60,11 +61,15 @@ pub(crate) fn verify_answer_against_canonical_evidence(
     if !normalized_prompt_context.is_empty() {
         normalized_corpus.push(normalized_prompt_context);
     }
+    let question_wildcard_prefixes = literal_wildcard_prefixes(question, 2);
     let mut warnings = Vec::<QueryVerificationWarning>::new();
     let mut unsupported_literals = Vec::<String>::new();
     for literal in inline_literals.iter().chain(fenced_line_literals.iter()) {
         let normalized_literal = normalize_verification_literal(literal);
         if normalized_literal.is_empty() {
+            continue;
+        }
+        if literal_is_user_supplied_wildcard_scope(literal, &question_wildcard_prefixes) {
             continue;
         }
         if !literal_is_supported_by_canonical_corpus(
@@ -116,6 +121,20 @@ pub(crate) fn verify_answer_against_canonical_evidence(
     };
 
     RuntimeAnswerVerification { state, warnings, unsupported_literals }
+}
+
+fn literal_is_user_supplied_wildcard_scope(
+    literal: &str,
+    question_wildcard_prefixes: &[String],
+) -> bool {
+    if question_wildcard_prefixes.is_empty() {
+        return false;
+    }
+    let literal_prefixes = literal_wildcard_prefixes(literal, 2);
+    !literal_prefixes.is_empty()
+        && literal_prefixes
+            .iter()
+            .any(|prefix| question_wildcard_prefixes.iter().any(|candidate| candidate == prefix))
 }
 
 fn has_canonical_grounding_evidence(

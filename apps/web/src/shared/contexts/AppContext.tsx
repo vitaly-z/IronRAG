@@ -216,18 +216,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (ws) localStorage.setItem('ironrag_active_workspace', ws.id);
     else localStorage.removeItem('ironrag_active_workspace');
     setActiveLibrary(prev => {
-      const nextLibrary = prev && ws && prev.workspaceId === ws.id ? prev : null;
+      const nextLibrary = prev && ws && prev.workspaceId === ws.id
+        ? prev
+        : libraries.find((library) => library.workspaceId === ws?.id) ?? null;
       if (nextLibrary) localStorage.setItem('ironrag_active_library', nextLibrary.id);
       else localStorage.removeItem('ironrag_active_library');
       return nextLibrary;
     });
-  }, []);
+  }, [libraries]);
 
   const persistedSetActiveLibrary = useCallback((lib: Library | null) => {
     setActiveLibrary(lib);
     if (lib) localStorage.setItem('ironrag_active_library', lib.id);
     else localStorage.removeItem('ironrag_active_library');
   }, []);
+
+  const selectWorkspaceLibrary = useCallback((workspaceId: string, libraryId: string): boolean => {
+    const nextWorkspace = workspaces.find((workspace) => workspace.id === workspaceId) ?? null;
+    const nextLibrary = libraries.find(
+      (library) => library.workspaceId === workspaceId && library.id === libraryId,
+    ) ?? null;
+    if (!nextWorkspace || !nextLibrary) return false;
+
+    setActiveWorkspace(nextWorkspace);
+    setActiveLibrary(nextLibrary);
+    localStorage.setItem('ironrag_active_workspace', nextWorkspace.id);
+    localStorage.setItem('ironrag_active_library', nextLibrary.id);
+    return true;
+  }, [libraries, workspaces]);
 
   const value: AppContextValue = {
     user,
@@ -249,6 +265,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setLocale,
     setIsBootstrapMode,
     setIsBootstrapRequired,
+    selectWorkspaceLibrary,
     login,
     logout,
     bootstrapSetup,

@@ -33,15 +33,27 @@ impl GraphQualityGuardService {
 
     #[must_use]
     pub fn filter_projection(&self, projection: &GraphViewData) -> GraphViewData {
+        let retained_node_ids = projection
+            .nodes
+            .iter()
+            .filter(|node| self.allows_node(&node.node_type, &node.label))
+            .map(|node| node.node_id)
+            .collect::<HashSet<_>>();
         let node_key_index = projection
             .nodes
             .iter()
+            .filter(|node| retained_node_ids.contains(&node.node_id))
             .map(|node| (node.node_id, node.canonical_key.clone()))
             .collect::<HashMap<_, _>>();
         let edges = projection
             .edges
             .iter()
             .filter(|edge| {
+                if !retained_node_ids.contains(&edge.from_node_id)
+                    || !retained_node_ids.contains(&edge.to_node_id)
+                {
+                    return false;
+                }
                 let from_node_key =
                     node_key_index.get(&edge.from_node_id).map(String::as_str).unwrap_or_default();
                 let to_node_key =
@@ -58,11 +70,18 @@ impl GraphQualityGuardService {
             .nodes
             .iter()
             .filter(|node| {
-                node.node_type == "document" || connected_node_ids.contains(&node.node_id)
+                retained_node_ids.contains(&node.node_id)
+                    && (node.node_type == "document" || connected_node_ids.contains(&node.node_id))
             })
             .cloned()
             .collect::<Vec<_>>();
         GraphViewData { nodes, edges }
+    }
+
+    #[must_use]
+    pub fn allows_node(&self, node_type: &str, label: &str) -> bool {
+        node_type == "document"
+            || !crate::services::graph::identity::is_structural_literal_label(label)
     }
 
     #[must_use]
@@ -175,6 +194,7 @@ mod tests {
         let guard = GraphQualityGuardService::new(true, true);
         let document_id = Uuid::now_v7();
         let entity_id = Uuid::now_v7();
+        let literal_id = Uuid::now_v7();
         let orphan_id = Uuid::now_v7();
         let projection = GraphViewData {
             nodes: vec![
@@ -193,6 +213,16 @@ mod tests {
                     canonical_key: "entity:alpha".to_string(),
                     label: "Alpha".to_string(),
                     node_type: "entity".to_string(),
+                    support_count: 1,
+                    summary: None,
+                    aliases: Vec::new(),
+                    metadata_json: serde_json::json!({}),
+                },
+                GraphViewNodeWrite {
+                    node_id: literal_id,
+                    canonical_key: "attribute:false".to_string(),
+                    label: "false".to_string(),
+                    node_type: "attribute".to_string(),
                     support_count: 1,
                     summary: None,
                     aliases: Vec::new(),
@@ -223,6 +253,17 @@ mod tests {
                 },
                 GraphViewEdgeWrite {
                     edge_id: Uuid::now_v7(),
+                    from_node_id: document_id,
+                    to_node_id: literal_id,
+                    relation_type: "mentions".to_string(),
+                    canonical_key: "document:1--mentions--attribute:false".to_string(),
+                    support_count: 1,
+                    summary: None,
+                    weight: None,
+                    metadata_json: serde_json::json!({}),
+                },
+                GraphViewEdgeWrite {
+                    edge_id: Uuid::now_v7(),
                     from_node_id: orphan_id,
                     to_node_id: orphan_id,
                     relation_type: "mentions".to_string(),
@@ -240,5 +281,18 @@ mod tests {
         assert_eq!(filtered.edges.len(), 1);
         assert_eq!(filtered.nodes.len(), 2);
         assert!(filtered.nodes.iter().all(|node| node.node_id != orphan_id));
+        assert!(filtered.nodes.iter().all(|node| node.node_id != literal_id));
+    }
+
+    #[test]
+    fn keeps_non_literal_attribute_nodes() {
+        let guard = GraphQualityGuardService::new(true, true);
+
+        assert!(!guard.allows_node("attribute", "false"));
+        assert!(guard.allows_node("attribute", "False"));
+        assert!(guard.allows_node("attribute", "42"));
+        assert!(guard.allows_node("attribute", "3.12.4"));
+        assert!(guard.allows_node("attribute", "Alpha false mode"));
+        assert!(guard.allows_node("document", "false"));
     }
 }

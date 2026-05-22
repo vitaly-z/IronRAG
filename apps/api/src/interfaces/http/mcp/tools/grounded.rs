@@ -19,7 +19,9 @@
 use serde_json::{Value, json};
 
 use crate::{
-    domains::query::{DEFAULT_TOP_K, MAX_TOP_K, QueryTurnKind, resolve_top_k},
+    domains::query::{
+        DEFAULT_TOP_K, MAX_TOP_K, QueryTurnKind, resolve_contextual_grounded_answer_top_k,
+    },
     interfaces::http::{authorization::POLICY_QUERY_RUN, router_support::ApiError},
     services::{
         iam::audit::AppendQueryExecutionAuditCommand,
@@ -40,7 +42,7 @@ pub(crate) fn descriptor(name: &str) -> Option<McpToolDescriptor> {
     }
     Some(McpToolDescriptor {
         name: "grounded_answer",
-        description: "Ask a natural-language question against one library and get a grounded answer from IronRAG's canonical answer pipeline (query planning, hybrid retrieval, graph-aware context, answer generation, verifier). Prefer this over `search_documents` + `read_document` for ordinary one-step content questions where the user expects an answer, not a hit list. For composite questions that require comparing documents, correlating graph structure with source text, or validating several relationships, first split the task into focused probes with document and graph tools; then call `grounded_answer` only for a concise unresolved subquestion instead of forwarding the whole broad request unchanged. The tool text is the human-readable reply. Structured output includes `executionDetail` with chunk, prepared-segment, technical-fact, entity, relation, verifier, runtime, request, and response fields, plus top-level `runtimeExecutionId`, `executionId`, and `conversationId` shortcuts for trace lookups.",
+        description: "Ask a natural-language question against one library and get a grounded answer from IronRAG's canonical answer pipeline (query planning, hybrid retrieval, graph-aware context, answer generation, verifier). Prefer this over `search_documents` + `read_document` for ordinary one-step content questions where the user expects an answer, not a hit list. Also prefer it for inventories of identifiers, values, parameters, modules, packages, graph nodes, or other items mentioned inside document content; catalog listing tools only list library records, not content evidence. For composite questions that require comparing documents, correlating graph structure with source text, or validating several relationships, first split the task into focused probes with document and graph tools; then call `grounded_answer` only for a concise unresolved subquestion instead of forwarding the whole broad request unchanged. The tool text is the human-readable reply. Structured output includes `executionDetail` with chunk, prepared-segment, technical-fact, entity, relation, verifier, runtime, request, and response fields, plus top-level `runtimeExecutionId`, `executionId`, and `conversationId` shortcuts for trace lookups.",
         input_schema: json!({
             "type": "object",
             "required": ["library", "query"],
@@ -106,6 +108,8 @@ async fn grounded_answer(context: ToolCallContext<'_>, arguments: &Value) -> Mcp
             )));
         }
     };
+    let has_contextual_turns =
+        parsed.conversation_turns.as_ref().is_some_and(|turns| !turns.is_empty());
     let external_prior_turns = match normalize_external_prior_turns(parsed.conversation_turns) {
         Ok(turns) => turns,
         Err(error) => return tool_error_result(error),
@@ -165,7 +169,7 @@ async fn grounded_answer(context: ToolCallContext<'_>, arguments: &Value) -> Mcp
                 surface_kind: context.surface_kind,
                 content_text: parsed.query.clone(),
                 external_prior_turns,
-                top_k: resolve_grounded_answer_top_k(parsed.top_k),
+                top_k: resolve_grounded_answer_top_k(parsed.top_k, has_contextual_turns),
                 include_debug: parsed.include_debug.unwrap_or(false),
             },
         )
@@ -207,8 +211,11 @@ async fn grounded_answer(context: ToolCallContext<'_>, arguments: &Value) -> Mcp
     grounded_answer_tool_result(&answer_text, &execution_detail)
 }
 
-pub(crate) fn resolve_grounded_answer_top_k(requested_top_k: Option<usize>) -> usize {
-    resolve_top_k(requested_top_k)
+pub(crate) fn resolve_grounded_answer_top_k(
+    requested_top_k: Option<usize>,
+    has_contextual_turns: bool,
+) -> usize {
+    resolve_contextual_grounded_answer_top_k(requested_top_k, has_contextual_turns, MAX_TOP_K)
 }
 
 fn conversation_title(surface_kind: &str, query: &str) -> String {
@@ -289,7 +296,7 @@ mod tests {
         let library_ref = "alpha-workspace/adapter-library";
         let query = "Which endpoint does the demo adapter call for inventory sync?";
 
-        let mcp_top_k = resolve_grounded_answer_top_k(None);
+        let mcp_top_k = resolve_grounded_answer_top_k(None, false);
         let ui_top_k = crate::interfaces::http::query::resolve_query_turn_top_k(None);
 
         assert_eq!(mcp_top_k, ui_top_k, "top_k drift for library {library_ref} and query {query}");
@@ -300,13 +307,19 @@ mod tests {
     #[test]
     fn grounded_answer_explicit_top_k_matches_ui_query_turn() {
         assert_eq!(
-            resolve_grounded_answer_top_k(None),
+            resolve_grounded_answer_top_k(None, false),
             crate::interfaces::http::query::resolve_query_turn_top_k(None)
         );
         assert_eq!(
-            resolve_grounded_answer_top_k(Some(6)),
+            resolve_grounded_answer_top_k(Some(6), false),
             crate::interfaces::http::query::resolve_query_turn_top_k(Some(6))
         );
+    }
+
+    #[test]
+    fn grounded_answer_contextual_top_k_floor_matches_ui_agent_tool_default() {
+        assert_eq!(resolve_grounded_answer_top_k(Some(4), true), 8);
+        assert_eq!(resolve_grounded_answer_top_k(Some(4), false), 4);
     }
 
     #[test]

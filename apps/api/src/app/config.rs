@@ -195,7 +195,6 @@ pub struct Settings {
     pub runtime_policy_reject_target_kinds: Option<String>,
     pub query_intent_cache_ttl_hours: u64,
     pub query_intent_cache_max_entries_per_library: usize,
-    pub query_answer_source_links_enabled: bool,
     pub release_check_repository: String,
     pub release_check_interval_hours: u64,
     pub graph_gc_hours: u64,
@@ -533,7 +532,7 @@ fn settings_config_builder()
         .set_default("ui_default_locale", "ru")?
         .set_default("ui_session_ttl_hours", 720)?
         .set_default("upload_max_size_mb", 50)?
-        .set_default("recognition_default_raster_image_engine", "docling")?
+        .set_default("recognition_default_raster_image_engine", "vision")?
         .set_default("startup_authority_mode", "not_required")?
         .set_default("dependency_postgres_mode", "external")?
         .set_default("dependency_redis_mode", "external")?
@@ -570,7 +569,6 @@ fn settings_config_builder()
         )?
         .set_default("query_intent_cache_ttl_hours", 24)?
         .set_default("query_intent_cache_max_entries_per_library", 500)?
-        .set_default("query_answer_source_links_enabled", false)?
         .set_default("release_check_repository", "mlimarenko/IronRAG")?
         .set_default("release_check_interval_hours", 12)?
         .set_default("graph_gc_hours", 24)?

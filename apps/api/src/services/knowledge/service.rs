@@ -108,17 +108,6 @@ pub struct CreateKnowledgeChunkCommand {
     pub occurred_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct RefreshKnowledgeLibraryGenerationCommand {
-    pub generation_id: Uuid,
-    pub workspace_id: Uuid,
-    pub library_id: Uuid,
-    pub active_text_generation: i64,
-    pub active_vector_generation: i64,
-    pub active_graph_generation: i64,
-    pub degraded_state: String,
-}
-
 #[derive(Clone, Default)]
 pub struct KnowledgeService;
 
@@ -553,33 +542,6 @@ impl KnowledgeService {
             .await
             .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
         Ok(rows.into_iter().map(map_chunk_row).collect())
-    }
-
-    pub async fn refresh_library_generation(
-        &self,
-        state: &AppState,
-        command: RefreshKnowledgeLibraryGenerationCommand,
-    ) -> Result<KnowledgeLibraryGeneration, ApiError> {
-        let row = state
-            .arango_document_store
-            .upsert_library_generation(
-                &crate::infra::arangodb::document_store::KnowledgeLibraryGenerationRow {
-                    key: format!("{}:{}", command.library_id, command.generation_id),
-                    arango_id: None,
-                    arango_rev: None,
-                    generation_id: command.generation_id,
-                    workspace_id: command.workspace_id,
-                    library_id: command.library_id,
-                    active_text_generation: command.active_text_generation,
-                    active_vector_generation: command.active_vector_generation,
-                    active_graph_generation: command.active_graph_generation,
-                    degraded_state: command.degraded_state,
-                    updated_at: chrono::Utc::now(),
-                },
-            )
-            .await
-            .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
-        Ok(map_library_generation_row(row))
     }
 
     pub fn get_bundle(

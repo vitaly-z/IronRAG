@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::app::state::AppState;
 use crate::{
-    domains::query_ir::{EntityRole, QueryIR, QueryScope},
+    domains::query_ir::{EntityRole, QueryIR},
     services::query::{
         planner::extract_keywords,
         text_match::{near_token_overlap_count, normalized_alnum_tokens},
@@ -29,6 +29,7 @@ use crate::{
 
 use super::{RetrievalBundle, RuntimeMatchedChunk};
 use super::{
+    document_target::query_ir_allows_document_focus_scope,
     source_anchor_window,
     source_profile::{is_source_profile_chunk_row, is_source_profile_runtime_chunk},
 };
@@ -646,10 +647,7 @@ pub(crate) fn decide_focus(
     if top_k < 2 || bundle.chunks.is_empty() {
         return None;
     }
-    if matches!(
-        query_ir.scope,
-        QueryScope::LibraryMeta | QueryScope::MultiDocument | QueryScope::CrossLibrary
-    ) {
+    if !query_ir_allows_document_focus_scope(query_ir) {
         return None;
     }
     let aggregates = aggregate_by_document(&bundle.chunks, question);
@@ -666,9 +664,7 @@ pub(crate) fn decide_focus(
             explicit_focus_budget(top_k),
         ));
     }
-    if matches!(query_ir.scope, QueryScope::SingleDocument)
-        && let Some(winner) = winner_from_subject(query_ir, &bundle.chunks, &aggregates)
-    {
+    if let Some(winner) = winner_from_subject(query_ir, &bundle.chunks, &aggregates) {
         return Some((
             winner.clone(),
             FocusReason::SingleDocumentSubject,
@@ -1106,6 +1102,133 @@ mod tests {
         for chunk in &bundle.chunks {
             assert_eq!(chunk.document_id, hint_doc);
         }
+    }
+
+    #[test]
+    fn test_consolidation_document_focus_does_not_pack_enumerate_scope() {
+        let focus_doc = Uuid::now_v7();
+        let focus_rev = Uuid::now_v7();
+        let companion_doc = Uuid::now_v7();
+        let companion_rev = Uuid::now_v7();
+
+        let bundle = RetrievalBundle {
+            entities: Vec::new(),
+            relationships: Vec::new(),
+            chunks: vec![
+                sample_chunk(focus_doc, focus_rev, 0, "Alpha Suite overview", 0.91),
+                sample_chunk(companion_doc, companion_rev, 0, "Alpha Suite connector catalog", 0.9),
+            ],
+        };
+
+        let mut query_ir = ir(QueryScope::SingleDocument);
+        query_ir.act = QueryAct::Enumerate;
+        query_ir.document_focus = Some(DocumentHint { hint: "Alpha Suite".to_string() });
+        query_ir.target_entities = vec![EntityMention {
+            label: "connector options".to_string(),
+            role: EntityRole::Object,
+        }];
+
+        assert!(
+            decide_focus(&bundle, &query_ir, "Enumerate connector options.", 8).is_none(),
+            "enumeration must preserve companion documents unless IR explicitly targets a document"
+        );
+    }
+
+    #[test]
+    fn test_consolidation_document_focus_does_not_pack_compare_concept_scope() {
+        let focus_doc = Uuid::now_v7();
+        let focus_rev = Uuid::now_v7();
+        let companion_doc = Uuid::now_v7();
+        let companion_rev = Uuid::now_v7();
+
+        let bundle = RetrievalBundle {
+            entities: Vec::new(),
+            relationships: Vec::new(),
+            chunks: vec![
+                sample_chunk(focus_doc, focus_rev, 0, "Alpha Suite provider catalog", 0.91),
+                sample_chunk(companion_doc, companion_rev, 0, "Alpha Suite fallback guide", 0.9),
+            ],
+        };
+
+        let mut query_ir = ir(QueryScope::SingleDocument);
+        query_ir.act = QueryAct::Compare;
+        query_ir.target_types = vec!["concept".to_string()];
+        query_ir.document_focus = Some(DocumentHint { hint: "Alpha Suite".to_string() });
+        query_ir.target_entities = vec![
+            EntityMention { label: "provider catalog".to_string(), role: EntityRole::Object },
+            EntityMention { label: "fallback guide".to_string(), role: EntityRole::Object },
+        ];
+
+        assert!(
+            decide_focus(&bundle, &query_ir, "Compare provider and fallback options.", 8).is_none(),
+            "concept comparisons must not collapse multi-topic retrieval into one hinted document"
+        );
+    }
+
+    #[test]
+    fn test_consolidation_evidence_dominance_does_not_pack_enumerate_scope() {
+        let dominant_doc = Uuid::now_v7();
+        let dominant_rev = Uuid::now_v7();
+        let companion_doc = Uuid::now_v7();
+        let companion_rev = Uuid::now_v7();
+
+        let bundle = RetrievalBundle {
+            entities: Vec::new(),
+            relationships: Vec::new(),
+            chunks: vec![
+                sample_chunk(dominant_doc, dominant_rev, 0, "Alpha Suite overview", 0.9),
+                sample_chunk(dominant_doc, dominant_rev, 1, "Alpha Suite overview", 0.86),
+                sample_chunk(dominant_doc, dominant_rev, 2, "Alpha Suite overview", 0.82),
+                sample_chunk(dominant_doc, dominant_rev, 3, "Alpha Suite overview", 0.78),
+                sample_chunk(companion_doc, companion_rev, 0, "Alpha Suite connector catalog", 0.7),
+                sample_chunk(
+                    companion_doc,
+                    companion_rev,
+                    1,
+                    "Alpha Suite connector catalog",
+                    0.66,
+                ),
+            ],
+        };
+
+        let mut query_ir = ir(QueryScope::SingleDocument);
+        query_ir.act = QueryAct::Enumerate;
+        query_ir.document_focus = Some(DocumentHint { hint: "Alpha Suite".to_string() });
+
+        assert!(
+            decide_focus(&bundle, &query_ir, "Enumerate connector options.", 8).is_none(),
+            "evidence dominance must not override library-wide recall for broad enumerations"
+        );
+    }
+
+    #[test]
+    fn test_consolidation_document_focus_packs_enumerate_document_target() {
+        let focus_doc = Uuid::now_v7();
+        let focus_rev = Uuid::now_v7();
+        let companion_doc = Uuid::now_v7();
+        let companion_rev = Uuid::now_v7();
+
+        let mut bundle = RetrievalBundle {
+            entities: Vec::new(),
+            relationships: Vec::new(),
+            chunks: vec![
+                sample_chunk(focus_doc, focus_rev, 0, "Alpha Suite overview", 0.91),
+                sample_chunk(companion_doc, companion_rev, 0, "Alpha Suite connector catalog", 0.9),
+            ],
+        };
+
+        let mut query_ir = ir(QueryScope::SingleDocument);
+        query_ir.act = QueryAct::Enumerate;
+        query_ir.target_types = vec!["document".to_string()];
+        query_ir.document_focus = Some(DocumentHint { hint: "Alpha Suite overview".to_string() });
+
+        let revision_rows: Vec<_> = (0..4)
+            .map(|idx| chunk_row(focus_doc, focus_rev, idx, &format!("overview chunk {idx}")))
+            .collect();
+
+        let diag = run_apply(&mut bundle, &query_ir, 8, revision_rows);
+        assert_eq!(diag.focus_reason, FocusReason::DocumentFocusHint);
+        assert_eq!(diag.focused_document_id, Some(focus_doc));
     }
 
     #[test]

@@ -9,12 +9,9 @@ const TABLE_SOURCE_FORMATS = new Set(['csv', 'tsv', 'xls', 'xlsx', 'xlsb', 'ods'
 const PLAIN_TEXT_SOURCE_FORMATS = new Set([
   'txt',
   'text',
-  'md',
-  'markdown',
-  'mdown',
-  'mkd',
   'log',
 ]);
+const MARKDOWN_SOURCE_FORMATS = new Set(['md', 'markdown', 'mdown', 'mkd']);
 const CODE_SOURCE_FORMATS = new Set([
   'rs',
   'ts',
@@ -114,6 +111,11 @@ export function isCodeLikeSourceFormat(sourceFormat?: string): boolean {
 export function isPlainTextSourceFormat(sourceFormat?: string): boolean {
   const normalized = normalizeSourceFormat(sourceFormat);
   return normalized ? PLAIN_TEXT_SOURCE_FORMATS.has(normalized) : false;
+}
+
+export function isMarkdownSourceFormat(sourceFormat?: string): boolean {
+  const normalized = normalizeSourceFormat(sourceFormat);
+  return normalized ? MARKDOWN_SOURCE_FORMATS.has(normalized) : false;
 }
 
 export function isRasterImageSourceFormat(sourceFormat?: string): boolean {

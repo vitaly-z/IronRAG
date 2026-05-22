@@ -43,3 +43,53 @@ pub(crate) fn normalized_alnum_token_sequence_by(
     flush_token(&mut current, &mut tokens);
     tokens
 }
+
+pub(crate) fn literal_wildcard_prefixes(value: &str, min_alnum_chars: usize) -> Vec<String> {
+    let normalized = value.nfkc().flat_map(char::to_lowercase).collect::<String>();
+    let mut seen = BTreeSet::new();
+    let mut prefixes = Vec::new();
+
+    for fragment in normalized.split_whitespace() {
+        let Some(wildcard_index) = fragment.find('*') else {
+            continue;
+        };
+        let candidate = &fragment[..wildcard_index];
+        let prefix = candidate.trim_matches(|ch: char| {
+            !ch.is_alphanumeric() && !is_literal_wildcard_prefix_separator(ch)
+        });
+        if prefix.is_empty() {
+            continue;
+        }
+        let alnum_chars = prefix.chars().filter(|ch| ch.is_alphanumeric()).count();
+        if alnum_chars < min_alnum_chars {
+            continue;
+        }
+        if seen.insert(prefix.to_string()) {
+            prefixes.push(prefix.to_string());
+        }
+    }
+
+    prefixes
+}
+
+fn is_literal_wildcard_prefix_separator(ch: char) -> bool {
+    matches!(ch, '-' | '_' | '.' | '/' | ':' | '@')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::literal_wildcard_prefixes;
+
+    #[test]
+    fn wildcard_prefixes_keep_structural_prefixes_without_language_lists() {
+        assert_eq!(
+            literal_wildcard_prefixes("show `alpha-*` and beta_module* entries", 2),
+            vec!["alpha-".to_string(), "beta_module".to_string()]
+        );
+    }
+
+    #[test]
+    fn wildcard_prefixes_reject_unanchored_suffix_patterns() {
+        assert!(literal_wildcard_prefixes("show *.pdf and *", 2).is_empty());
+    }
+}

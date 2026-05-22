@@ -166,30 +166,6 @@ def _ocr_picture_items(document, script_hint="latin"):
     return snippets
 
 
-def _splice_picture_ocr(markdown, snippets):
-    """Replace each `<!-- image -->` placeholder with the placeholder
-    plus a fenced block carrying the OCR'd text from that picture, in
-    document order. Empty snippets keep the placeholder untouched."""
-    placeholder = "<!-- image -->"
-    out_parts = []
-    cursor = 0
-    snippet_idx = 0
-    while True:
-        hit = markdown.find(placeholder, cursor)
-        if hit == -1:
-            out_parts.append(markdown[cursor:])
-            break
-        end = hit + len(placeholder)
-        out_parts.append(markdown[cursor:end])
-        if snippet_idx < len(snippets):
-            text = snippets[snippet_idx].strip()
-            if text:
-                out_parts.append(f"\n\n> Image OCR: {text}\n")
-        snippet_idx += 1
-        cursor = end
-    return "".join(out_parts)
-
-
 def _collect_picture_bytes(document):
     """Return a list of `{index, contentBase64, sizePx}` for every
     PictureItem in `document` so the Rust caller can route each
@@ -292,14 +268,11 @@ def _convert_document(source, started_at, converter=None):
     pictures_payload = _collect_picture_bytes(document)
 
     markdown = document.export_to_markdown(image_placeholder="<!-- image -->")
-    if picture_ocr_text:
-        markdown = _splice_picture_ocr(markdown, picture_ocr_text)
-    if picture_ocr_text:
-        text = text + "\n\n" + "\n\n".join(picture_ocr_text)
 
     return {
         "markdown": markdown,
         "text": text,
+        "pictureOcrText": picture_ocr_text,
         "pageCount": _page_count(result),
         "status": _stringify_status(getattr(result, "status", None)),
         "inputFormat": _input_format(result),

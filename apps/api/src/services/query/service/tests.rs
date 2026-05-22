@@ -5,7 +5,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    domains::query::{PreparedSegmentReference, QueryTurnKind, QueryVerificationState},
+    domains::query::{QueryTurnKind, QueryVerificationState},
     infra::{
         arangodb::{
             context_store::{KnowledgeContextBundleReferenceSetRow, KnowledgeContextBundleRow},
@@ -20,18 +20,18 @@ use crate::{
 };
 
 use super::{
-    MAX_DETAIL_PREPARED_SEGMENT_REFERENCES, MAX_DETAIL_TECHNICAL_FACT_REFERENCES,
-    RankedBundleReference,
+    ExternalConversationTurn, MAX_DETAIL_PREPARED_SEGMENT_REFERENCES,
+    MAX_DETAIL_TECHNICAL_FACT_REFERENCES, RankedBundleReference,
     context::{
         derive_fact_rank_refs, seed_chunk_refs_from_answer_context,
         seed_entity_refs_from_answer_graph, seed_relation_endpoint_refs_from_answer_graph,
         seed_relation_refs_from_answer_graph, selected_fact_ids_for_detail,
     },
-    formatting::{
-        build_prepared_segment_references, parse_query_verification_state,
-        render_answer_source_links,
+    formatting::{build_prepared_segment_references, parse_query_verification_state},
+    session::{
+        build_conversation_runtime_context,
+        build_conversation_runtime_context_with_external_history,
     },
-    session::build_conversation_runtime_context,
 };
 
 #[test]
@@ -64,6 +64,7 @@ fn seed_entity_refs_from_answer_graph_uses_selected_graph_context() {
         node_id,
         label: "Alpha Gateway".to_string(),
         node_type: "component".to_string(),
+        summary: None,
         score: Some(0.82),
     }];
     let mut seeded = HashMap::new();
@@ -384,80 +385,6 @@ fn build_prepared_segment_references_prioritizes_query_matching_headings_and_lim
 }
 
 #[test]
-fn render_answer_source_links_deduplicates_hrefs_and_preserves_titles() {
-    let document_id = Uuid::now_v7();
-    let revision_id = Uuid::now_v7();
-    let stored_href =
-        format!("/v1/content/documents/{document_id}/source?revisionId={revision_id}");
-    let references = vec![
-        PreparedSegmentReference {
-            execution_id: Uuid::now_v7(),
-            segment_id: Uuid::now_v7(),
-            revision_id,
-            block_kind:
-                crate::shared::extraction::structured_document::StructuredBlockKind::Paragraph,
-            rank: 1,
-            score: 0.98,
-            heading_trail: vec!["Install".to_string()],
-            section_path: vec!["install".to_string()],
-            document_id: Some(document_id),
-            document_title: Some("runtime-upload-check.pdf".to_string()),
-            source_uri: Some("upload://runtime-upload-check.pdf".to_string()),
-            document_hint: Some("runtime-upload-check.pdf".to_string()),
-            source_access: Some(crate::domains::content::ContentSourceAccess {
-                kind: crate::domains::content::ContentSourceAccessKind::StoredDocument,
-                href: stored_href.clone(),
-            }),
-        },
-        PreparedSegmentReference {
-            execution_id: Uuid::now_v7(),
-            segment_id: Uuid::now_v7(),
-            revision_id,
-            block_kind:
-                crate::shared::extraction::structured_document::StructuredBlockKind::Paragraph,
-            rank: 2,
-            score: 0.88,
-            heading_trail: vec!["Install".to_string()],
-            section_path: vec!["install".to_string()],
-            document_id: Some(document_id),
-            document_title: Some("runtime-upload-check.pdf".to_string()),
-            source_uri: Some("upload://runtime-upload-check.pdf".to_string()),
-            document_hint: Some("runtime-upload-check.pdf".to_string()),
-            source_access: Some(crate::domains::content::ContentSourceAccess {
-                kind: crate::domains::content::ContentSourceAccessKind::StoredDocument,
-                href: stored_href,
-            }),
-        },
-        PreparedSegmentReference {
-            execution_id: Uuid::now_v7(),
-            segment_id: Uuid::now_v7(),
-            revision_id: Uuid::now_v7(),
-            block_kind:
-                crate::shared::extraction::structured_document::StructuredBlockKind::Paragraph,
-            rank: 3,
-            score: 0.74,
-            heading_trail: vec!["API".to_string()],
-            section_path: vec!["api".to_string()],
-            document_id: Some(Uuid::now_v7()),
-            document_title: Some("Docs".to_string()),
-            source_uri: Some("https://example.com/docs".to_string()),
-            document_hint: Some("https://example.com/docs".to_string()),
-            source_access: Some(crate::domains::content::ContentSourceAccess {
-                kind: crate::domains::content::ContentSourceAccessKind::ExternalUrl,
-                href: "https://example.com/docs".to_string(),
-            }),
-        },
-    ];
-
-    let rendered =
-        render_answer_source_links(&references).expect("answer source links should render");
-
-    assert!(rendered.starts_with("Sources\n"));
-    assert_eq!(rendered.lines().filter(|line| line.starts_with("- ")).count(), 1);
-    assert!(rendered.contains("https://example.com/docs"));
-}
-
-#[test]
 fn parse_query_verification_state_maps_canonical_values() {
     assert_eq!(parse_query_verification_state("verified"), QueryVerificationState::Verified);
     assert_eq!(
@@ -508,12 +435,18 @@ fn build_conversation_runtime_context_rewrites_short_follow_up_from_history() {
 
     assert!(context.effective_query_text.contains("tell me how to move items in the product"));
     assert!(!context.effective_query_text.contains("Sure, here are the product steps."));
+    assert!(context.effective_query_text.starts_with("scope: "));
+    assert!(context.effective_query_text.contains("\nquestion: continue"));
     assert!(context.effective_query_text.ends_with("continue"));
     assert_eq!(
         context.prompt_history_text.as_deref(),
         Some(
             "User: tell me how to move items in the product\nAssistant: Sure, here are the product steps."
         )
+    );
+    assert_eq!(
+        context.query_planning_history_text.as_deref(),
+        Some("User: tell me how to move items in the product")
     );
     assert_eq!(context.prompt_history_messages.len(), 2);
     assert_eq!(context.prompt_history_messages[0].role, "user");
@@ -566,9 +499,15 @@ Connector TargetName uses the [TargetName] section with `targetSecret` and merch
     assert!(context.effective_query_text.contains("Connector TargetName"));
     assert!(context.effective_query_text.contains("targetSecret"));
     assert!(!context.effective_query_text.contains("Connector Alpha"));
+    assert!(context.effective_query_text.starts_with("scope: "));
+    assert!(context.effective_query_text.contains("\nquestion: TargetNme how"));
     assert!(context.coreference_entities.contains(&"targetSecret".to_string()));
     assert!(!context.coreference_entities.contains(&"alphaSecret".to_string()));
     assert!(context.effective_query_text.ends_with("TargetNme how"));
+    assert_eq!(
+        context.query_planning_history_text.as_deref(),
+        Some("User: which connector variants exist")
+    );
     assert_eq!(context.prompt_history_messages.len(), 2);
 }
 
@@ -603,6 +542,202 @@ fn build_conversation_runtime_context_keeps_standalone_question_without_rewrite(
     assert_eq!(context.prompt_history_text.as_deref(), Some("User: how to fill in a transfer"));
     assert_eq!(context.prompt_history_messages.len(), 1);
     assert_eq!(context.prompt_history_messages[0].role, "user");
+}
+
+#[test]
+fn build_conversation_runtime_context_exports_bounded_typed_grounded_answer_tool_history() {
+    let conversation_id = Uuid::now_v7();
+    let first_user_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 1,
+        turn_kind: QueryTurnKind::User,
+        author_principal_id: None,
+        content_text: "which connector variants exist".to_string(),
+        execution_id: None,
+        created_at: Utc::now(),
+    };
+    let system_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 2,
+        turn_kind: QueryTurnKind::System,
+        author_principal_id: None,
+        content_text: "internal lifecycle note".to_string(),
+        execution_id: None,
+        created_at: Utc::now(),
+    };
+    let tool_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 3,
+        turn_kind: QueryTurnKind::Tool,
+        author_principal_id: None,
+        content_text: "tool observation".to_string(),
+        execution_id: Some(Uuid::now_v7()),
+        created_at: Utc::now(),
+    };
+    let assistant_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 4,
+        turn_kind: QueryTurnKind::Assistant,
+        author_principal_id: None,
+        content_text: "Connector Alpha uses `alphaSecret`.".to_string(),
+        execution_id: Some(Uuid::now_v7()),
+        created_at: Utc::now(),
+    };
+    let follow_up_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 5,
+        turn_kind: QueryTurnKind::User,
+        author_principal_id: None,
+        content_text: "and limitations?".to_string(),
+        execution_id: None,
+        created_at: Utc::now(),
+    };
+
+    let context = build_conversation_runtime_context(
+        &[first_user_turn, system_turn, tool_turn, assistant_turn, follow_up_turn.clone()],
+        follow_up_turn.id,
+    );
+
+    assert_eq!(context.grounded_answer_tool_history.len(), 2);
+    assert!(matches!(context.grounded_answer_tool_history[0].turn_kind, QueryTurnKind::User));
+    assert!(matches!(context.grounded_answer_tool_history[1].turn_kind, QueryTurnKind::Assistant));
+    assert!(context.grounded_answer_tool_history.iter().all(|turn| {
+        !turn.content_text.contains("System note")
+            && !turn.content_text.contains("Tool observation")
+            && !turn.content_text.contains("internal lifecycle note")
+            && !turn.content_text.contains("tool observation")
+    }));
+}
+
+#[test]
+fn build_conversation_runtime_context_preserves_dense_assistant_literals_in_tool_history() {
+    let conversation_id = Uuid::now_v7();
+    let first_user_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 1,
+        turn_kind: QueryTurnKind::User,
+        author_principal_id: None,
+        content_text: "which package-like modules exist".to_string(),
+        execution_id: None,
+        created_at: Utc::now(),
+    };
+    let assistant_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 2,
+        turn_kind: QueryTurnKind::Assistant,
+        author_principal_id: None,
+        content_text: format!(
+            "`pkg-alpha` `pkg-beta` `pkg-gamma` `pkg-delta` {} `pkg-epsilon` `pkg-zeta` `pkg-eta` `pkg-theta`",
+            "long filler ".repeat(260)
+        ),
+        execution_id: Some(Uuid::now_v7()),
+        created_at: Utc::now(),
+    };
+    let follow_up_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 3,
+        turn_kind: QueryTurnKind::User,
+        author_principal_id: None,
+        content_text: "describe each item".to_string(),
+        execution_id: None,
+        created_at: Utc::now(),
+    };
+
+    let context = build_conversation_runtime_context(
+        &[first_user_turn, assistant_turn, follow_up_turn.clone()],
+        follow_up_turn.id,
+    );
+
+    let assistant_history = context
+        .grounded_answer_tool_history
+        .iter()
+        .find(|turn| matches!(turn.turn_kind, QueryTurnKind::Assistant))
+        .expect("assistant history should be exported");
+    assert!(assistant_history.content_text.starts_with("literals: "));
+    assert!(assistant_history.content_text.contains("`pkg-alpha`"));
+    assert!(assistant_history.content_text.contains("`pkg-theta`"));
+}
+
+#[test]
+fn build_conversation_runtime_context_scopes_external_history_turn_even_when_current_text_is_long()
+{
+    let conversation_id = Uuid::now_v7();
+    let current_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 1,
+        turn_kind: QueryTurnKind::User,
+        author_principal_id: None,
+        content_text: "now enumerate the integration variants and missing limits".to_string(),
+        execution_id: None,
+        created_at: Utc::now(),
+    };
+    let external_prior_turns = vec![ExternalConversationTurn {
+        turn_kind: QueryTurnKind::User,
+        content_text: "what does the library say about payment setup".to_string(),
+    }];
+
+    let context = build_conversation_runtime_context_with_external_history(
+        &[current_turn.clone()],
+        current_turn.id,
+        &external_prior_turns,
+    );
+
+    assert_eq!(
+        context.query_planning_history_text.as_deref(),
+        Some("User: what does the library say about payment setup")
+    );
+    assert_eq!(
+        context.effective_query_text,
+        "scope: what does the library say about payment setup\nquestion: now enumerate the integration variants and missing limits"
+    );
+}
+
+#[test]
+fn build_conversation_runtime_context_preserves_prior_answer_literals_for_external_follow_up() {
+    let conversation_id = Uuid::now_v7();
+    let current_turn = query_repository::QueryTurnRow {
+        id: Uuid::now_v7(),
+        conversation_id,
+        turn_index: 1,
+        turn_kind: QueryTurnKind::User,
+        author_principal_id: None,
+        content_text: "describe each item".to_string(),
+        execution_id: None,
+        created_at: Utc::now(),
+    };
+    let external_prior_turns = vec![
+        ExternalConversationTurn {
+            turn_kind: QueryTurnKind::User,
+            content_text: "which package-like modules exist".to_string(),
+        },
+        ExternalConversationTurn {
+            turn_kind: QueryTurnKind::Assistant,
+            content_text: "`pkg-alpha`\n`pkg-beta`\n`pkg-gamma`\n`pkg-delta`\n`pkg-epsilon`\n`pkg-zeta`\n`pkg-eta`\n`pkg-theta`\n`pkg-iota`\n`pkg-kappa`\n`pkg-lambda`\n`pkg-mu`".to_string(),
+        },
+    ];
+
+    let context = build_conversation_runtime_context_with_external_history(
+        &[current_turn.clone()],
+        current_turn.id,
+        &external_prior_turns,
+    );
+
+    assert!(context.effective_query_text.starts_with("scope: "));
+    assert!(context.effective_query_text.contains("which package-like modules exist"));
+    assert!(context.effective_query_text.contains("entities: pkg-alpha"));
+    assert!(context.effective_query_text.contains("pkg-mu"));
+    assert!(context.effective_query_text.ends_with("describe each item"));
+    assert!(context.coreference_entities.contains(&"pkg-alpha".to_string()));
+    assert!(context.coreference_entities.contains(&"pkg-mu".to_string()));
 }
 
 #[test]
@@ -651,6 +786,10 @@ fn build_conversation_runtime_context_standalone_question_after_assistant_answer
         Some(
             "User: how do I configure connector alpha\nAssistant: Connector Alpha uses `alphaSecret` in section [Alpha]."
         )
+    );
+    assert_eq!(
+        context.query_planning_history_text.as_deref(),
+        Some("User: how do I configure connector alpha")
     );
     assert_eq!(context.prompt_history_messages.len(), 2);
     assert!(context.coreference_entities.is_empty());

@@ -4,6 +4,7 @@ import {
   codeLanguageForSourceFormat,
   isCodeLikeSourceFormat,
   isEditorEditableSourceFormat,
+  isMarkdownSourceFormat,
   isPlainTextSourceFormat,
   isRasterImageSourceFormat,
   isTableLikeSourceFormat,
@@ -24,9 +25,11 @@ describe('editorSurfaceMode', () => {
 
   it('recognizes plain text source formats for lossless editor loading', () => {
     expect(isPlainTextSourceFormat('txt')).toBe(true);
-    expect(isPlainTextSourceFormat('md')).toBe(true);
     expect(isPlainTextSourceFormat('log')).toBe(true);
     expect(isPlainTextSourceFormat('xlsx')).toBe(false);
+    expect(isMarkdownSourceFormat('md')).toBe(true);
+    expect(isMarkdownSourceFormat('text/markdown')).toBe(true);
+    expect(isPlainTextSourceFormat('md')).toBe(false);
   });
 
   it('falls back to markdown table heuristics', () => {

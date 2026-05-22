@@ -26,6 +26,7 @@ export interface AppContextValue extends AppState {
   setLocale: (l: Locale) => void;
   setIsBootstrapMode: (b: boolean) => void;
   setIsBootstrapRequired: (b: boolean) => void;
+  selectWorkspaceLibrary: (workspaceId: string, libraryId: string) => boolean;
   login: (login: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   bootstrapSetup: (data: BootstrapSetup) => Promise<void>;

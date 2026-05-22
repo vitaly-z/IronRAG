@@ -11,7 +11,7 @@ use crate::{
         ai::AiBindingPurpose,
         provider_profiles::EffectiveProviderProfile,
         query::RuntimeQueryMode,
-        query_ir::{QueryAct, QueryIR, QueryScope, TemporalConstraint},
+        query_ir::{EntityRole, QueryAct, QueryIR, QueryScope, TemporalConstraint},
     },
     infra::{
         arangodb::document_store::{
@@ -31,7 +31,8 @@ use crate::{
             },
             planner::RuntimeQueryPlan,
             text_match::{
-                normalized_alnum_token_sequence, normalized_alnum_tokens, token_sequence_contains,
+                common_prefix_char_count, normalized_alnum_token_sequence, normalized_alnum_tokens,
+                token_sequence_contains,
             },
             vector_dimensions::{
                 require_current_vector_index_dimensions, validate_embedding_vector_dimensions,
@@ -48,22 +49,29 @@ use super::types::*;
 use super::{
     GraphTargetEntityCoverageField, GraphTargetEntityCoverageFieldKind, GraphTargetEntityProfile,
     associative_edges_for_entities, graph_target_entity_coverage_score,
-    graph_target_entity_profiles, load_initial_table_rows_for_documents,
-    load_table_rows_for_documents, load_table_summary_chunks_for_documents,
-    merge_canonical_table_aggregation_chunks, query_relevant_entity_hits,
-    question_asks_table_aggregation, requested_initial_table_row_count,
-    resolve_scoped_target_document_ids,
+    load_initial_table_rows_for_documents, load_table_rows_for_documents,
+    load_table_summary_chunks_for_documents, merge_canonical_table_aggregation_chunks,
+    query_relevant_graph_evidence_target_hits, question_asks_table_aggregation,
+    requested_initial_table_row_count, resolve_scoped_target_document_ids,
 };
 
 const DIRECT_TABLE_AGGREGATION_SUMMARY_LIMIT: usize = 32;
 const DIRECT_TABLE_AGGREGATION_ROW_LIMIT: usize = 24;
 const DIRECT_TABLE_AGGREGATION_CHUNK_LIMIT: usize = 32;
 const DOCUMENT_IDENTITY_CHUNKS_PER_DOCUMENT: usize = 3;
+const DOCUMENT_IDENTITY_FOCUSED_CHUNKS_PER_DOCUMENT: usize = 4;
+const DOCUMENT_IDENTITY_FOCUS_PREFIX_CHARS: usize = 6;
+const LINKED_ANCHOR_CONTEXT_QUERY_CAP: usize = 4;
+const LINKED_ANCHOR_CONTEXT_CHUNKS_PER_QUERY: usize = 4;
+const LINKED_ANCHOR_CONTEXT_PREFIX_CHARS: usize = 6;
+const LINKED_ANCHOR_CONTEXT_QUERY_PREFIX_CHARS: usize = 7;
 const GRAPH_EVIDENCE_CONTEXT_FETCH_MULTIPLIER: usize = 3;
 const GRAPH_EVIDENCE_CONTEXT_SCORE_TOKEN_MIN_CHARS: usize = 4;
 const GRAPH_EVIDENCE_CONTEXT_EVIDENCE_FIELD_WEIGHT: usize = 4;
 const GRAPH_EVIDENCE_CONTEXT_TARGET_FIELD_WEIGHT: usize = 2;
 const GRAPH_EVIDENCE_CONTEXT_SOURCE_FIELD_WEIGHT: usize = 1;
+const GRAPH_EVIDENCE_CONTEXT_LINE_CHARS: usize = 1600;
+const GRAPH_EVIDENCE_SOURCE_DOCUMENT_PRIORITY_CAP: usize = 12;
 const MAX_GRAPH_EVIDENCE_DB_TEXT_QUERIES: usize = 5;
 
 pub(crate) async fn load_graph_index(
@@ -242,6 +250,7 @@ const GRAPH_EVIDENCE_CONTEXT_LINE_CAP: usize = 24;
 pub(crate) struct RuntimeGraphEvidenceRetrieval {
     pub(crate) chunks: Vec<RuntimeMatchedChunk>,
     pub(crate) context_lines: Vec<String>,
+    pub(crate) source_document_ids: Vec<Uuid>,
 }
 
 pub(crate) fn entity_bio_chunk_score(rank: usize) -> f32 {
@@ -448,6 +457,7 @@ pub(crate) async fn load_graph_evidence_chunks_for_bundle(
     relationships: &[RuntimeMatchedRelationship],
     plan: &RuntimeQueryPlan,
     query_ir: Option<&QueryIR>,
+    target_entity_profiles: &[GraphTargetEntityProfile],
     graph_index: &QueryGraphIndex,
     document_index: &HashMap<Uuid, KnowledgeDocumentRow>,
     targeted_document_ids: &BTreeSet<Uuid>,
@@ -461,13 +471,27 @@ pub(crate) async fn load_graph_evidence_chunks_for_bundle(
         relationships,
         plan,
         query_ir,
+        target_entity_profiles,
         graph_index,
         targeted_document_ids,
         graph_evidence_context_fetch_cap(),
     )
     .await
     .context("failed to load ranked graph evidence rows for chunk hydration")?;
-    let context_lines = graph_evidence_context_lines_from_rows(&ranked_evidence.rows, graph_index);
+    let query_ir_focus_queries = query_ir.map(query_ir_lexical_focus_queries).unwrap_or_default();
+    let text_queries =
+        build_graph_evidence_text_queries(question, plan, &query_ir_focus_queries, query_ir);
+    let context_focus_keywords =
+        graph_evidence_context_line_focus_keywords(question, &text_queries);
+    let context_lines = graph_evidence_context_lines_from_rows(
+        &ranked_evidence.rows,
+        graph_index,
+        &context_focus_keywords,
+    );
+    let source_document_ids = graph_evidence_source_document_ids_with_priority(
+        &ranked_evidence.target_source_document_ids,
+        &ranked_evidence.rows,
+    );
     let (hits, evidence_texts_by_chunk) =
         graph_evidence_chunk_hits_from_rows(&ranked_evidence.rows);
     if hits.is_empty() {
@@ -483,14 +507,23 @@ pub(crate) async fn load_graph_evidence_chunks_for_bundle(
             evidence_chunk_count = 0usize,
             "graph evidence rows loaded without hydratable chunks",
         );
-        return Ok(RuntimeGraphEvidenceRetrieval { chunks: Vec::new(), context_lines });
+        return Ok(RuntimeGraphEvidenceRetrieval {
+            chunks: Vec::new(),
+            context_lines,
+            source_document_ids,
+        });
     }
 
     let mut chunks =
         batch_hydrate_hits(state, hits, document_index, plan_keywords, targeted_document_ids)
             .await
             .context("failed to hydrate graph evidence chunks")?;
-    apply_graph_evidence_texts_to_chunks(&mut chunks, &evidence_texts_by_chunk, plan_keywords);
+    apply_graph_evidence_texts_to_chunks(
+        &mut chunks,
+        &evidence_texts_by_chunk,
+        plan_keywords,
+        &context_focus_keywords,
+    );
     for chunk in &mut chunks {
         chunk.score_kind = RuntimeChunkScoreKind::GraphEvidence;
     }
@@ -506,16 +539,41 @@ pub(crate) async fn load_graph_evidence_chunks_for_bundle(
         evidence_chunk_count = chunks.len(),
         "graph evidence chunks hydrated from ranked graph evidence rows",
     );
-    Ok(RuntimeGraphEvidenceRetrieval { chunks, context_lines })
+    Ok(RuntimeGraphEvidenceRetrieval { chunks, context_lines, source_document_ids })
+}
+
+pub(crate) fn graph_evidence_source_document_ids(
+    rows: &[repositories::RuntimeGraphEvidenceRow],
+) -> Vec<Uuid> {
+    let mut seen = HashSet::new();
+    rows.iter()
+        .filter_map(|row| row.document_id)
+        .filter(|document_id| seen.insert(*document_id))
+        .collect()
+}
+
+pub(crate) fn graph_evidence_source_document_ids_with_priority(
+    priority_document_ids: &[Uuid],
+    rows: &[repositories::RuntimeGraphEvidenceRow],
+) -> Vec<Uuid> {
+    let mut seen = HashSet::new();
+    let ranked_document_ids = graph_evidence_source_document_ids(rows);
+    priority_document_ids
+        .iter()
+        .copied()
+        .chain(ranked_document_ids)
+        .filter(|document_id| seen.insert(*document_id))
+        .collect()
 }
 
 fn graph_evidence_context_lines_from_rows(
     rows: &[repositories::RuntimeGraphEvidenceRow],
     graph_index: &QueryGraphIndex,
+    focus_keywords: &[String],
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(rows.len());
     for row in rows.iter().take(GRAPH_EVIDENCE_CONTEXT_LINE_CAP) {
-        let Some(line) = graph_evidence_context_line(row, graph_index) else {
+        let Some(line) = graph_evidence_context_line(row, graph_index, focus_keywords) else {
             continue;
         };
         lines.push(line);
@@ -526,11 +584,22 @@ fn graph_evidence_context_lines_from_rows(
 #[derive(Debug)]
 struct RankedGraphEvidenceRows {
     rows: Vec<repositories::RuntimeGraphEvidenceRow>,
+    target_source_document_ids: Vec<Uuid>,
     graph_target_count: usize,
     text_query_count: usize,
     text_query_executed_count: usize,
     text_evidence_count: usize,
     target_evidence_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GraphEvidenceSourceDocumentCandidate {
+    document_id: Uuid,
+    best_score: usize,
+    total_score: usize,
+    first_ordinal: usize,
+    best_confidence: f64,
+    latest_created_at: DateTime<Utc>,
 }
 
 type GraphEvidenceChunkHits = Vec<(Uuid, f32)>;
@@ -544,18 +613,29 @@ async fn load_ranked_graph_evidence_rows_for_query(
     relationships: &[RuntimeMatchedRelationship],
     plan: &RuntimeQueryPlan,
     query_ir: Option<&QueryIR>,
+    target_entity_profiles: &[GraphTargetEntityProfile],
     graph_index: &QueryGraphIndex,
     targeted_document_ids: &BTreeSet<Uuid>,
     limit: usize,
 ) -> anyhow::Result<RankedGraphEvidenceRows> {
-    let targets =
-        graph_evidence_targets_for_query(entities, relationships, plan, query_ir, graph_index);
-    let target_entity_profiles = graph_target_entity_profiles(query_ir, graph_index);
+    let started = std::time::Instant::now();
+    let targets = graph_evidence_targets_for_query(
+        entities,
+        relationships,
+        plan,
+        query_ir,
+        target_entity_profiles,
+        graph_index,
+    );
+    let target_build_elapsed_ms = started.elapsed().as_millis();
+    let query_build_started = std::time::Instant::now();
     let query_ir_focus_queries = query_ir.map(query_ir_lexical_focus_queries).unwrap_or_default();
     let text_queries =
         build_graph_evidence_text_queries(question, plan, &query_ir_focus_queries, query_ir);
     let db_text_queries = graph_evidence_db_text_queries(&text_queries);
+    let query_build_elapsed_ms = query_build_started.elapsed().as_millis();
 
+    let text_started = std::time::Instant::now();
     let text_evidence = repositories::search_runtime_graph_evidence_by_text(
         &state.persistence.postgres,
         library_id,
@@ -564,13 +644,17 @@ async fn load_ranked_graph_evidence_rows_for_query(
     )
     .await
     .context("failed to search graph evidence context by evidence text")?;
+    let text_search_elapsed_ms = text_started.elapsed().as_millis();
+    let text_filter_started = std::time::Instant::now();
     let text_evidence = if targeted_document_ids.is_empty() {
         text_evidence
     } else {
         filter_graph_evidence_rows_for_target_documents(state, text_evidence, targeted_document_ids)
             .await?
     };
+    let text_filter_elapsed_ms = text_filter_started.elapsed().as_millis();
 
+    let target_search_started = std::time::Instant::now();
     let target_evidence = if targets.is_empty() {
         Vec::new()
     } else {
@@ -583,6 +667,8 @@ async fn load_ranked_graph_evidence_rows_for_query(
         .await
         .context("failed to list graph evidence context for retrieved graph targets")?
     };
+    let target_search_elapsed_ms = target_search_started.elapsed().as_millis();
+    let target_filter_started = std::time::Instant::now();
     let target_evidence = if targeted_document_ids.is_empty() {
         target_evidence
     } else {
@@ -593,7 +679,16 @@ async fn load_ranked_graph_evidence_rows_for_query(
         )
         .await?
     };
+    let target_filter_elapsed_ms = target_filter_started.elapsed().as_millis();
 
+    let rank_started = std::time::Instant::now();
+    let target_source_document_ids = graph_evidence_source_document_ids_from_scored_targets(
+        &target_evidence,
+        question,
+        &text_queries,
+        graph_index,
+        &target_entity_profiles,
+    );
     let rows = rank_graph_evidence_context_rows(
         &text_evidence,
         &target_evidence,
@@ -603,15 +698,131 @@ async fn load_ranked_graph_evidence_rows_for_query(
         &target_entity_profiles,
         limit,
     );
+    let rank_elapsed_ms = rank_started.elapsed().as_millis();
+    tracing::info!(
+        stage = "retrieval.graph_evidence_breakdown",
+        graph_target_count = targets.len(),
+        text_query_count = text_queries.len(),
+        text_query_executed_count = db_text_queries.len(),
+        text_evidence_count = text_evidence.len(),
+        target_evidence_count = target_evidence.len(),
+        ranked_evidence_count = rows.len(),
+        target_build_elapsed_ms,
+        target_profile_count = target_entity_profiles.len(),
+        query_build_elapsed_ms,
+        text_search_elapsed_ms,
+        text_filter_elapsed_ms,
+        target_search_elapsed_ms,
+        target_filter_elapsed_ms,
+        rank_elapsed_ms,
+        total_elapsed_ms = started.elapsed().as_millis(),
+        "graph evidence retrieval substeps completed",
+    );
 
     Ok(RankedGraphEvidenceRows {
         rows,
+        target_source_document_ids,
         graph_target_count: targets.len(),
         text_query_count: text_queries.len(),
         text_query_executed_count: db_text_queries.len(),
         text_evidence_count: text_evidence.len(),
         target_evidence_count: target_evidence.len(),
     })
+}
+
+pub(crate) fn graph_evidence_source_document_ids_from_scored_targets(
+    target_evidence: &[repositories::RuntimeGraphEvidenceRow],
+    question: &str,
+    text_queries: &[String],
+    graph_index: &QueryGraphIndex,
+    target_entity_profiles: &[GraphTargetEntityProfile],
+) -> Vec<Uuid> {
+    let focus_texts = graph_evidence_context_focus_texts(question, text_queries);
+    let focus_tokens = graph_evidence_context_focus_tokens(&focus_texts);
+    if target_evidence.is_empty() || focus_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = target_evidence
+        .iter()
+        .enumerate()
+        .map(|(ordinal, row)| {
+            let fields = graph_evidence_context_candidate_fields(row, graph_index);
+            let tokens = fields
+                .iter()
+                .flat_map(|field| field.tokens.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            GraphEvidenceContextCandidate { row: row.clone(), ordinal, fields, tokens, score: 0 }
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut token_frequencies = HashMap::<String, usize>::new();
+    for candidate in &candidates {
+        for token in &candidate.tokens {
+            *token_frequencies.entry(token.clone()).or_default() += 1;
+        }
+    }
+    let candidate_count = candidates.len();
+    for candidate in &mut candidates {
+        candidate.score = graph_evidence_context_relevance_score(
+            &candidate.fields,
+            &focus_tokens,
+            &token_frequencies,
+            candidate_count,
+            target_entity_profiles,
+        );
+    }
+
+    let mut documents = HashMap::<Uuid, GraphEvidenceSourceDocumentCandidate>::new();
+    for candidate in candidates.into_iter().filter(|candidate| candidate.score > 0) {
+        let Some(document_id) = candidate.row.document_id else {
+            continue;
+        };
+        let confidence = candidate.row.confidence_score.unwrap_or(f64::NEG_INFINITY);
+        documents
+            .entry(document_id)
+            .and_modify(|document| {
+                document.best_score = document.best_score.max(candidate.score);
+                document.total_score = document.total_score.saturating_add(candidate.score);
+                document.first_ordinal = document.first_ordinal.min(candidate.ordinal);
+                document.best_confidence = document.best_confidence.max(confidence);
+                document.latest_created_at =
+                    document.latest_created_at.max(candidate.row.created_at);
+            })
+            .or_insert(GraphEvidenceSourceDocumentCandidate {
+                document_id,
+                best_score: candidate.score,
+                total_score: candidate.score,
+                first_ordinal: candidate.ordinal,
+                best_confidence: confidence,
+                latest_created_at: candidate.row.created_at,
+            });
+    }
+
+    let mut documents = documents.into_values().collect::<Vec<_>>();
+    documents.sort_by(|left, right| {
+        right
+            .best_score
+            .cmp(&left.best_score)
+            .then_with(|| right.total_score.cmp(&left.total_score))
+            .then_with(|| left.first_ordinal.cmp(&right.first_ordinal))
+            .then_with(|| {
+                right
+                    .best_confidence
+                    .partial_cmp(&left.best_confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| right.latest_created_at.cmp(&left.latest_created_at))
+            .then_with(|| right.document_id.cmp(&left.document_id))
+    });
+    documents
+        .into_iter()
+        .take(GRAPH_EVIDENCE_SOURCE_DOCUMENT_PRIORITY_CAP)
+        .map(|document| document.document_id)
+        .collect()
 }
 
 async fn filter_graph_evidence_rows_for_target_documents(
@@ -978,8 +1189,13 @@ fn graph_evidence_context_body_key(evidence_text: &str) -> String {
 pub(crate) fn graph_evidence_context_line(
     row: &repositories::RuntimeGraphEvidenceRow,
     graph_index: &QueryGraphIndex,
+    focus_keywords: &[String],
 ) -> Option<String> {
     let evidence_text = graph_evidence_text_for_context(&row.evidence_text);
+    if evidence_text.is_empty() {
+        return None;
+    }
+    let evidence_text = focused_graph_evidence_context_text(&evidence_text, focus_keywords);
     if evidence_text.is_empty() {
         return None;
     }
@@ -1010,6 +1226,38 @@ pub(crate) fn graph_evidence_context_line(
         format!("[graph-evidence {attr_text}]")
     };
     Some(format!("{header}\n{evidence_text}"))
+}
+
+fn graph_evidence_context_line_focus_keywords(
+    question: &str,
+    text_queries: &[String],
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut keywords = Vec::new();
+    for focus_text in graph_evidence_context_focus_texts(question, text_queries) {
+        for token in normalized_alnum_token_sequence(
+            &focus_text,
+            GRAPH_EVIDENCE_CONTEXT_SCORE_TOKEN_MIN_CHARS,
+        ) {
+            if seen.insert(token.clone()) {
+                keywords.push(token);
+            }
+        }
+    }
+    keywords
+}
+
+fn focused_graph_evidence_context_text(evidence_text: &str, focus_keywords: &[String]) -> String {
+    if evidence_text.chars().count() <= GRAPH_EVIDENCE_CONTEXT_LINE_CHARS {
+        return evidence_text.to_string();
+    }
+    let excerpt =
+        focused_excerpt_for(evidence_text, focus_keywords, GRAPH_EVIDENCE_CONTEXT_LINE_CHARS);
+    if excerpt.trim().is_empty() {
+        excerpt_for(evidence_text, GRAPH_EVIDENCE_CONTEXT_LINE_CHARS)
+    } else {
+        excerpt
+    }
 }
 
 fn graph_evidence_target_label(
@@ -1044,12 +1292,14 @@ pub(crate) fn apply_graph_evidence_texts_to_chunks(
     chunks: &mut [RuntimeMatchedChunk],
     evidence_texts_by_chunk: &HashMap<Uuid, Vec<String>>,
     plan_keywords: &[String],
+    focus_keywords: &[String],
 ) {
     for chunk in chunks {
         let Some(evidence_texts) = evidence_texts_by_chunk.get(&chunk.chunk_id) else {
             continue;
         };
-        let evidence_source_text = graph_evidence_source_text(&chunk.source_text, evidence_texts);
+        let evidence_source_text =
+            graph_evidence_source_text(&chunk.source_text, evidence_texts, focus_keywords);
         if evidence_source_text.trim().is_empty() {
             continue;
         }
@@ -1058,7 +1308,11 @@ pub(crate) fn apply_graph_evidence_texts_to_chunks(
     }
 }
 
-fn graph_evidence_source_text(chunk_source_text: &str, evidence_texts: &[String]) -> String {
+fn graph_evidence_source_text(
+    chunk_source_text: &str,
+    evidence_texts: &[String],
+    focus_keywords: &[String],
+) -> String {
     let mut parts = Vec::new();
     let mut seen = BTreeSet::new();
     for text in evidence_texts {
@@ -1066,7 +1320,7 @@ fn graph_evidence_source_text(chunk_source_text: &str, evidence_texts: &[String]
         if normalized.is_empty() || !seen.insert(normalized.to_lowercase()) {
             continue;
         }
-        parts.push(normalized);
+        parts.push(focused_graph_evidence_context_text(&normalized, focus_keywords));
     }
     if parts.is_empty() {
         return chunk_source_text.trim().to_string();
@@ -1123,10 +1377,20 @@ pub(crate) fn graph_evidence_targets_for_query(
     relationships: &[RuntimeMatchedRelationship],
     plan: &RuntimeQueryPlan,
     query_ir: Option<&QueryIR>,
+    target_entity_profiles: &[GraphTargetEntityProfile],
     graph_index: &QueryGraphIndex,
 ) -> Vec<(String, Uuid)> {
-    let query_entities =
-        query_relevant_entity_hits(plan, query_ir, graph_index, GRAPH_EVIDENCE_TARGET_CAP / 2);
+    let mut seen = HashSet::<(String, Uuid)>::new();
+    let mut targets = Vec::new();
+    let retrieved_targets = graph_evidence_targets(entities, relationships);
+
+    let query_entities = query_relevant_graph_evidence_target_hits(
+        plan,
+        query_ir,
+        target_entity_profiles,
+        graph_index,
+        GRAPH_EVIDENCE_TARGET_CAP / 2,
+    );
     let query_relationships = associative_edges_for_entities(
         &query_entities,
         graph_index,
@@ -1134,21 +1398,31 @@ pub(crate) fn graph_evidence_targets_for_query(
         query_ir,
         GRAPH_EVIDENCE_TARGET_CAP / 2,
     );
+    let query_targets = graph_evidence_targets(&query_entities, &query_relationships);
 
-    let mut seen = HashSet::<(String, Uuid)>::new();
-    let mut targets = Vec::new();
-    for target in graph_evidence_targets(entities, relationships)
-        .into_iter()
-        .chain(graph_evidence_targets(&query_entities, &query_relationships))
-    {
+    if !target_entity_profiles.is_empty() {
+        append_graph_evidence_targets(&mut targets, &mut seen, query_targets);
+        append_graph_evidence_targets(&mut targets, &mut seen, retrieved_targets);
+    } else {
+        append_graph_evidence_targets(&mut targets, &mut seen, retrieved_targets);
+        append_graph_evidence_targets(&mut targets, &mut seen, query_targets);
+    }
+    targets
+}
+
+fn append_graph_evidence_targets(
+    targets: &mut Vec<(String, Uuid)>,
+    seen: &mut HashSet<(String, Uuid)>,
+    candidates: Vec<(String, Uuid)>,
+) {
+    for target in candidates {
         if targets.len() >= GRAPH_EVIDENCE_TARGET_CAP {
-            break;
+            return;
         }
         if seen.insert(target.clone()) {
             targets.push(target);
         }
     }
-    targets
 }
 
 async fn load_query_ir_focus_chunks(
@@ -1203,6 +1477,74 @@ async fn load_query_ir_focus_chunks(
         "query-IR focus chunks loaded for rare exact retrieval signals",
     );
     Ok(chunks)
+}
+
+async fn load_linked_anchor_context_chunks(
+    state: &AppState,
+    library_id: Uuid,
+    question: &str,
+    query_ir: Option<&QueryIR>,
+    chunks: &[RuntimeMatchedChunk],
+    document_index: &HashMap<Uuid, KnowledgeDocumentRow>,
+    plan_keywords: &[String],
+    temporal_start: Option<DateTime<Utc>>,
+    temporal_end: Option<DateTime<Utc>>,
+) -> anyhow::Result<Vec<RuntimeMatchedChunk>> {
+    let anchor_queries = linked_anchor_focus_queries(question, query_ir, plan_keywords, chunks);
+    if anchor_queries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let per_query_futures = anchor_queries.iter().cloned().map(|anchor_query| async move {
+        state
+            .arango_search_store
+            .search_chunks(
+                library_id,
+                &anchor_query,
+                LINKED_ANCHOR_CONTEXT_CHUNKS_PER_QUERY,
+                temporal_start,
+                temporal_end,
+            )
+            .await
+            .map(|rows| {
+                rows.into_iter().map(|row| (row.chunk_id, row.score as f32)).collect::<Vec<_>>()
+            })
+            .with_context(|| format!("failed to run linked-anchor chunk search: {anchor_query}"))
+    });
+    let per_query_results: Vec<Result<Vec<_>, anyhow::Error>> = join_all(per_query_futures).await;
+    let hits = combine_query_ir_focus_search_results(per_query_results, anchor_queries.len())?;
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Linked anchors are explicit cross-document affordances in the retrieved source text.
+    // Hydrate them library-wide instead of applying the current scoped-document filter;
+    // otherwise a focused source document can link to the exact answer document and we
+    // would pay the search cost only to discard that linked evidence.
+    let linked_anchor_target_filter = linked_anchor_hydration_target_filter();
+    let mut chunks = batch_hydrate_hits(
+        state,
+        hits,
+        document_index,
+        plan_keywords,
+        &linked_anchor_target_filter,
+    )
+    .await
+    .context("failed to hydrate linked-anchor chunks")?;
+    for chunk in &mut chunks {
+        chunk.score_kind = RuntimeChunkScoreKind::SourceContext;
+    }
+    tracing::info!(
+        stage = "retrieval.linked_anchor_context",
+        anchor_query_count = anchor_queries.len(),
+        anchor_chunk_count = chunks.len(),
+        "linked anchor context chunks loaded from retrieved source links",
+    );
+    Ok(chunks)
+}
+
+pub(crate) fn linked_anchor_hydration_target_filter() -> BTreeSet<Uuid> {
+    BTreeSet::new()
 }
 
 pub(crate) async fn retrieve_document_chunks(
@@ -1358,15 +1700,18 @@ pub(crate) async fn retrieve_document_chunks(
         document_index,
         &targeted_document_ids,
         plan_keywords,
+        query_ir,
     )
     .await?;
     if !document_identity_chunks.is_empty() {
+        let identity_budget_per_document =
+            DOCUMENT_IDENTITY_CHUNKS_PER_DOCUMENT + DOCUMENT_IDENTITY_FOCUSED_CHUNKS_PER_DOCUMENT;
         chunks = merge_chunks(
             chunks,
             document_identity_chunks,
-            limit.max(initial_table_row_count.unwrap_or(0)).saturating_add(
-                targeted_document_ids.len() * DOCUMENT_IDENTITY_CHUNKS_PER_DOCUMENT,
-            ),
+            limit
+                .max(initial_table_row_count.unwrap_or(0))
+                .saturating_add(targeted_document_ids.len() * identity_budget_per_document),
         );
     }
     let latest_version_chunks =
@@ -1425,6 +1770,40 @@ pub(crate) async fn retrieve_document_chunks(
                 failed_source = "query_ir_focus",
                 retained_chunk_count = chunks.len(),
                 "query-IR focus retrieval failed; continuing with primary retrieved chunks"
+            );
+        }
+        Err(error) => return Err(error),
+    }
+    let linked_anchor_context_chunks_result = load_linked_anchor_context_chunks(
+        state,
+        library_id,
+        question,
+        query_ir,
+        &chunks,
+        document_index,
+        plan_keywords,
+        temporal_start,
+        temporal_end,
+    )
+    .await;
+    match linked_anchor_context_chunks_result {
+        Ok(linked_anchor_context_chunks) if !linked_anchor_context_chunks.is_empty() => {
+            chunks = merge_query_ir_focus_chunks(
+                chunks,
+                linked_anchor_context_chunks,
+                query_ir_focus_context_top_k(limit),
+            );
+        }
+        Ok(_) => {}
+        Err(error) if !chunks.is_empty() => {
+            let summary = format!("{error:#}");
+            tracing::warn!(
+                stage = "retrieval.linked_anchor_context_failed",
+                error = %summary,
+                retrieval_degraded = true,
+                failed_source = "linked_anchor_context",
+                retained_chunk_count = chunks.len(),
+                "linked anchor context retrieval failed; continuing with primary retrieved chunks"
             );
         }
         Err(error) => return Err(error),
@@ -1704,11 +2083,13 @@ async fn load_document_identity_chunks_for_targets(
     document_index: &HashMap<Uuid, KnowledgeDocumentRow>,
     targeted_document_ids: &BTreeSet<Uuid>,
     plan_keywords: &[String],
+    query_ir: Option<&QueryIR>,
 ) -> anyhow::Result<Vec<RuntimeMatchedChunk>> {
     if targeted_document_ids.is_empty() {
         return Ok(Vec::new());
     }
 
+    let focus_terms = document_identity_focus_terms(plan_keywords, query_ir);
     let mut chunks = Vec::new();
     for (document_rank, document_id) in targeted_document_ids.iter().enumerate() {
         let Some(document) = document_index.get(document_id) else {
@@ -1739,12 +2120,83 @@ async fn load_document_identity_chunks_for_targets(
                 chunks.push(chunk);
             }
         }
+        let focused_rows = state
+            .arango_document_store
+            .list_chunks_by_revision_matching_terms(
+                revision_id,
+                &focus_terms,
+                DOCUMENT_IDENTITY_FOCUSED_CHUNKS_PER_DOCUMENT,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load document-identity focus chunks for document {} revision {}",
+                    document_id, revision_id
+                )
+            })?;
+        for (chunk_rank, row) in focused_rows.into_iter().enumerate() {
+            let score = document_identity_chunk_score(
+                document_rank,
+                DOCUMENT_IDENTITY_CHUNKS_PER_DOCUMENT.saturating_add(chunk_rank),
+            );
+            if let Some(mut chunk) = map_chunk_hit(row, score, document_index, &focus_terms) {
+                chunk.score = Some(score);
+                chunk.score_kind = RuntimeChunkScoreKind::DocumentIdentity;
+                chunks.push(chunk);
+            }
+        }
     }
     Ok(chunks)
 }
 
 fn document_identity_chunk_score(document_rank: usize, chunk_rank: usize) -> f32 {
     DOCUMENT_IDENTITY_SCORE_FLOOR + 10_000.0 - document_rank as f32 * 100.0 - chunk_rank as f32
+}
+
+fn document_identity_focus_terms(
+    plan_keywords: &[String],
+    query_ir: Option<&QueryIR>,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut terms = Vec::new();
+    let mut push_term = |value: &str, terms: &mut Vec<String>| {
+        let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            return;
+        }
+        if seen.insert(normalized.to_lowercase()) {
+            terms.push(normalized.clone());
+        }
+        for token in normalized_alnum_tokens(&normalized, 3) {
+            if seen.insert(token.clone()) {
+                terms.push(token.clone());
+            }
+            let token_len = token.chars().count();
+            if token_len > DOCUMENT_IDENTITY_FOCUS_PREFIX_CHARS {
+                let prefix =
+                    token.chars().take(DOCUMENT_IDENTITY_FOCUS_PREFIX_CHARS).collect::<String>();
+                if seen.insert(prefix.clone()) {
+                    terms.push(prefix);
+                }
+            }
+        }
+    };
+
+    for keyword in plan_keywords {
+        push_term(keyword, &mut terms);
+    }
+    if let Some(query_ir) = query_ir {
+        if let Some(document_focus) = query_ir.document_focus.as_ref() {
+            push_term(&document_focus.hint, &mut terms);
+        }
+        for entity in &query_ir.target_entities {
+            push_term(&entity.label, &mut terms);
+        }
+        for literal in &query_ir.literal_constraints {
+            push_term(&literal.text, &mut terms);
+        }
+    }
+    terms
 }
 
 async fn load_latest_version_document_chunks(
@@ -2189,15 +2641,31 @@ pub(crate) fn query_ir_lexical_focus_queries(query_ir: &QueryIR) -> Vec<String> 
         queries.push(bounded);
     };
 
+    let (mut primary_focus_values, mut modifier_focus_values) =
+        query_ir_focus_value_groups(query_ir);
+    sort_query_ir_focus_values_by_specificity(&mut primary_focus_values);
+    sort_query_ir_focus_values_by_specificity(&mut modifier_focus_values);
+    if query_ir_document_focus_should_anchor_focus_queries(query_ir)
+        && let Some(document_focus) = &query_ir.document_focus
+    {
+        let mut anchored_compounds =
+            document_focus_anchored_focus_compounds(&document_focus.hint, &primary_focus_values);
+        sort_query_ir_focus_values_by_specificity(&mut anchored_compounds);
+        for compound in &anchored_compounds {
+            push_focus(compound, &mut queries);
+        }
+        push_focus(&document_focus.hint, &mut queries);
+    }
     let compound_values = query_ir_compound_focus_values(query_ir);
     let mut compounds = adjacent_query_ir_focus_compounds(&compound_values);
     sort_query_ir_focus_values_by_specificity(&mut compounds);
     for compound in &compounds {
         push_focus(&compound, &mut queries);
     }
-    let mut focus_values = query_ir_focus_values(query_ir);
-    sort_query_ir_focus_values_by_specificity(&mut focus_values);
-    for focus in &focus_values {
+    for focus in &primary_focus_values {
+        push_focus(focus, &mut queries);
+    }
+    for focus in &modifier_focus_values {
         push_focus(focus, &mut queries);
     }
     if queries.is_empty()
@@ -2206,6 +2674,38 @@ pub(crate) fn query_ir_lexical_focus_queries(query_ir: &QueryIR) -> Vec<String> 
         push_focus(&document_focus.hint, &mut queries);
     }
     queries
+}
+
+fn query_ir_document_focus_should_anchor_focus_queries(query_ir: &QueryIR) -> bool {
+    query_ir.document_focus.is_some()
+        && matches!(query_ir.scope, QueryScope::SingleDocument)
+        && matches!(query_ir.act, QueryAct::Compare | QueryAct::ConfigureHow)
+}
+
+fn document_focus_anchored_focus_compounds(
+    document_focus: &str,
+    primary_focus_values: &[String],
+) -> Vec<String> {
+    let normalized_focus = document_focus.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !is_usable_query_ir_focus(&normalized_focus) {
+        return Vec::new();
+    }
+    let focus_key = normalized_focus.to_lowercase();
+    let mut seen = BTreeSet::new();
+    let mut compounds = Vec::new();
+    for primary in primary_focus_values {
+        let normalized_primary = primary.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !is_usable_query_ir_focus(&normalized_primary)
+            || normalized_primary.to_lowercase() == focus_key
+        {
+            continue;
+        }
+        let compound = format!("{normalized_focus} {normalized_primary}");
+        if seen.insert(compound.to_lowercase()) {
+            compounds.push(compound);
+        }
+    }
+    compounds
 }
 
 fn query_ir_compound_focus_values(query_ir: &QueryIR) -> Vec<String> {
@@ -2222,23 +2722,42 @@ fn query_ir_compound_focus_values(query_ir: &QueryIR) -> Vec<String> {
     let focus_uses_target_entities = query_ir_has_focused_document_answer_intent(query_ir)
         && !query_ir.target_entities.is_empty();
     if focus_uses_target_entities {
-        for entity in &query_ir.target_entities {
-            push_value(&entity.label, &mut values);
+        let (primary_entity_values, _) = query_ir_entity_focus_value_groups(query_ir);
+        for entity_value in primary_entity_values {
+            push_value(&entity_value, &mut values);
         }
     } else {
         for literal in &query_ir.literal_constraints {
             push_value(&literal.text, &mut values);
         }
-        for entity in &query_ir.target_entities {
-            push_value(&entity.label, &mut values);
+        let (primary_entity_values, _) = query_ir_entity_focus_value_groups(query_ir);
+        for entity_value in primary_entity_values {
+            push_value(&entity_value, &mut values);
         }
     }
     values
 }
 
-fn query_ir_focus_values(query_ir: &QueryIR) -> Vec<String> {
+fn query_ir_entity_focus_value_groups(query_ir: &QueryIR) -> (Vec<String>, Vec<String>) {
+    let mut primary_values = Vec::new();
+    let mut modifier_values = Vec::new();
+    for entity in &query_ir.target_entities {
+        match entity.role {
+            EntityRole::Subject | EntityRole::Object => {
+                primary_values.push(entity.label.clone());
+            }
+            EntityRole::Modifier => {
+                modifier_values.push(entity.label.clone());
+            }
+        }
+    }
+    (primary_values, modifier_values)
+}
+
+fn query_ir_focus_value_groups(query_ir: &QueryIR) -> (Vec<String>, Vec<String>) {
     let mut seen = BTreeSet::new();
-    let mut values = Vec::new();
+    let mut primary_values = Vec::new();
+    let mut modifier_values = Vec::new();
     let mut push_value = |value: &str, values: &mut Vec<String>| {
         let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
         if !is_usable_query_ir_focus(&normalized) || !seen.insert(normalized.to_lowercase()) {
@@ -2251,22 +2770,32 @@ fn query_ir_focus_values(query_ir: &QueryIR) -> Vec<String> {
         && !query_ir.target_entities.is_empty();
     for temporal in &query_ir.temporal_constraints {
         for focus in temporal_constraint_focus_values(temporal) {
-            push_value(&focus, &mut values);
+            push_value(&focus, &mut primary_values);
         }
     }
     if focus_uses_target_entities {
-        for entity in &query_ir.target_entities {
-            push_value(&entity.label, &mut values);
+        let (primary_entity_values, modifier_entity_values) =
+            query_ir_entity_focus_value_groups(query_ir);
+        for entity_value in primary_entity_values {
+            push_value(&entity_value, &mut primary_values);
+        }
+        for entity_value in modifier_entity_values {
+            push_value(&entity_value, &mut modifier_values);
         }
     } else {
         for literal in &query_ir.literal_constraints {
-            push_value(&literal.text, &mut values);
+            push_value(&literal.text, &mut primary_values);
         }
-        for entity in &query_ir.target_entities {
-            push_value(&entity.label, &mut values);
+        let (primary_entity_values, modifier_entity_values) =
+            query_ir_entity_focus_value_groups(query_ir);
+        for entity_value in primary_entity_values {
+            push_value(&entity_value, &mut primary_values);
+        }
+        for entity_value in modifier_entity_values {
+            push_value(&entity_value, &mut modifier_values);
         }
     }
-    values
+    (primary_values, modifier_values)
 }
 
 fn adjacent_query_ir_focus_compounds(focus_values: &[String]) -> Vec<String> {
@@ -2433,6 +2962,164 @@ pub(crate) fn query_ir_focus_search_queries(
     }
 
     queries
+}
+
+pub(crate) fn linked_anchor_focus_queries(
+    question: &str,
+    query_ir: Option<&QueryIR>,
+    plan_keywords: &[String],
+    chunks: &[RuntimeMatchedChunk],
+) -> Vec<String> {
+    let focus_tokens = linked_anchor_focus_tokens(question, query_ir, plan_keywords);
+    if focus_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored_labels = Vec::<(usize, String)>::new();
+    let mut seen = BTreeSet::new();
+    for chunk in chunks {
+        for label in markdown_link_labels(&chunk.source_text)
+            .into_iter()
+            .chain(markdown_link_labels(&chunk.excerpt))
+        {
+            let normalized = label.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !is_usable_query_ir_focus(&normalized)
+                || normalized.chars().count() > 120
+                || !seen.insert(normalized.to_lowercase())
+            {
+                continue;
+            }
+            let overlap = linked_anchor_token_overlap(&normalized, &focus_tokens);
+            if overlap > 0 {
+                scored_labels.push((overlap, normalized));
+            }
+        }
+    }
+    scored_labels.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut queries = Vec::new();
+    let mut seen_queries = BTreeSet::new();
+    for (_, label) in scored_labels {
+        for query in linked_anchor_query_variants(&label) {
+            if seen_queries.insert(query.to_lowercase()) {
+                queries.push(query);
+            }
+            if queries.len() >= LINKED_ANCHOR_CONTEXT_QUERY_CAP {
+                return queries;
+            }
+        }
+    }
+    queries
+}
+
+fn linked_anchor_query_variants(label: &str) -> Vec<String> {
+    let normalized = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut variants = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut push_variant = |value: String, variants: &mut Vec<String>| {
+        let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !normalized.is_empty() && seen.insert(normalized.to_lowercase()) {
+            variants.push(normalized);
+        }
+    };
+
+    push_variant(normalized.clone(), &mut variants);
+
+    let lexical_tokens = normalized_alnum_token_sequence(&normalized, 2)
+        .into_iter()
+        .filter(|token| token.chars().any(|ch| ch.is_alphabetic()))
+        .collect::<Vec<_>>();
+    if lexical_tokens.is_empty() {
+        return variants;
+    }
+
+    push_variant(lexical_tokens.join(" "), &mut variants);
+    for (index, token) in lexical_tokens.iter().enumerate() {
+        if token.chars().count() <= LINKED_ANCHOR_CONTEXT_QUERY_PREFIX_CHARS {
+            continue;
+        }
+        let mut prefix_tokens = lexical_tokens.clone();
+        prefix_tokens[index] =
+            token.chars().take(LINKED_ANCHOR_CONTEXT_QUERY_PREFIX_CHARS).collect();
+        push_variant(prefix_tokens.join(" "), &mut variants);
+    }
+
+    variants
+}
+
+fn linked_anchor_focus_tokens(
+    question: &str,
+    query_ir: Option<&QueryIR>,
+    plan_keywords: &[String],
+) -> BTreeSet<String> {
+    let mut tokens = normalized_alnum_tokens(question, 3);
+    for keyword in plan_keywords {
+        tokens.extend(normalized_alnum_tokens(keyword, 3));
+    }
+    if let Some(query_ir) = query_ir {
+        if let Some(document_focus) = query_ir.document_focus.as_ref() {
+            tokens.extend(normalized_alnum_tokens(&document_focus.hint, 3));
+        }
+        for entity in &query_ir.target_entities {
+            tokens.extend(normalized_alnum_tokens(&entity.label, 3));
+        }
+        for literal in &query_ir.literal_constraints {
+            tokens.extend(normalized_alnum_tokens(&literal.text, 3));
+        }
+    }
+    tokens
+}
+
+fn markdown_link_labels(value: &str) -> Vec<&str> {
+    let mut labels = Vec::new();
+    let mut search_from = 0;
+    while let Some(open_rel) = value[search_from..].find('[') {
+        let open = search_from + open_rel;
+        let label_start = open + '['.len_utf8();
+        let Some(close_rel) = value[label_start..].find(']') else {
+            break;
+        };
+        let close = label_start + close_rel;
+        let after_close = close + ']'.len_utf8();
+        if value[after_close..].starts_with('(') {
+            let label = value[label_start..close].trim();
+            if !label.is_empty() {
+                labels.push(label);
+            }
+        }
+        search_from = after_close;
+    }
+    labels
+}
+
+fn linked_anchor_token_overlap(label: &str, focus_tokens: &BTreeSet<String>) -> usize {
+    let label_tokens = normalized_alnum_tokens(label, 3);
+    label_tokens
+        .iter()
+        .filter(|label_token| {
+            focus_tokens
+                .iter()
+                .any(|focus_token| linked_anchor_token_match(label_token, focus_token))
+        })
+        .count()
+}
+
+fn linked_anchor_token_match(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    let min_len = left_len.min(right_len);
+    if min_len < 4 {
+        return false;
+    }
+    left.contains(right)
+        || right.contains(left)
+        || common_prefix_char_count(left, right) >= LINKED_ANCHOR_CONTEXT_PREFIX_CHARS
 }
 
 fn is_usable_query_ir_focus(value: &str) -> bool {
@@ -2751,9 +3438,21 @@ pub(crate) fn truncate_bundle(
     top_k: usize,
     query_ir: Option<&QueryIR>,
 ) {
-    bundle.entities.truncate(top_k);
+    bundle.entities.truncate(entity_context_top_k(top_k, query_ir));
     bundle.relationships.truncate(top_k);
     truncate_chunks_for_context(&mut bundle.chunks, top_k, query_ir);
+}
+
+fn entity_context_top_k(top_k: usize, query_ir: Option<&QueryIR>) -> usize {
+    let Some(query_ir) = query_ir else {
+        return top_k;
+    };
+    if matches!(query_ir.act, QueryAct::Enumerate | QueryAct::Meta)
+        && (query_ir.scope == QueryScope::LibraryMeta || !query_ir.target_entities.is_empty())
+    {
+        return top_k.saturating_mul(3).clamp(top_k, 96);
+    }
+    top_k
 }
 
 fn truncate_chunks_for_context(

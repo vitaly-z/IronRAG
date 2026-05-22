@@ -9,6 +9,10 @@ use crate::{
         self, RuntimeGraphDocumentLinkRow, RuntimeGraphEdgeRow, RuntimeGraphNodeRow,
     },
     interfaces::http::router_support::ApiError,
+    services::graph::canonical_projection::{
+        canonicalize_runtime_graph_document_links, canonicalize_runtime_graph_nodes,
+        canonicalize_runtime_graph_projection,
+    },
 };
 
 const DEFAULT_GRAPH_ENTITY_LIMIT: usize = 200;
@@ -184,9 +188,15 @@ pub async fn get_graph_topology(
     .await
     .map_err(|error| ApiError::internal_with_log(error, "internal"))?;
 
-    let ranked = select_ranked_subgraph(entity_rows, edge_rows, entity_limit);
+    let canonical_projection = canonicalize_runtime_graph_projection(entity_rows, edge_rows);
+    let ranked = select_ranked_subgraph(
+        canonical_projection.nodes,
+        canonical_projection.edges,
+        entity_limit,
+    );
     let mut visible_target_ids: Vec<Uuid> = ranked.entities.iter().map(|row| row.id).collect();
     visible_target_ids.extend(ranked.relations.iter().map(|row| row.id));
+    visible_target_ids.extend(canonical_projection.node_id_remap.keys().copied());
     let document_link_rows = repositories::list_runtime_graph_document_links_by_target_ids(
         &state.persistence.postgres,
         library_id,
@@ -195,6 +205,11 @@ pub async fn get_graph_topology(
     )
     .await
     .map_err(|error| ApiError::internal_with_log(error, "internal"))?;
+    let document_link_rows = canonicalize_runtime_graph_document_links(
+        document_link_rows,
+        &ranked.entities,
+        &canonical_projection.node_id_remap,
+    );
     let selected = select_graph_topology_slice(
         ranked.entities,
         ranked.relations,
@@ -291,7 +306,10 @@ pub async fn search_entities(
     .await
     .map_err(|error| ApiError::internal_with_log(error, "internal"))?;
 
-    Ok(rows
+    let canonical_nodes = canonicalize_runtime_graph_nodes(rows);
+
+    Ok(canonical_nodes
+        .nodes
         .into_iter()
         .map(|row| {
             json!({
@@ -348,10 +366,12 @@ pub async fn list_relations(
     )
     .await
     .map_err(|error| ApiError::internal_with_log(error, "internal"))?;
+    let canonical_projection = canonicalize_runtime_graph_projection(node_rows, relation_rows);
     let node_labels: HashMap<Uuid, &str> =
-        node_rows.iter().map(|row| (row.id, row.label.as_str())).collect();
+        canonical_projection.nodes.iter().map(|row| (row.id, row.label.as_str())).collect();
 
-    Ok(relation_rows
+    Ok(canonical_projection
+        .edges
         .iter()
         .map(|row| {
             let source_label = node_labels.get(&row.from_node_id).copied().unwrap_or("unknown");

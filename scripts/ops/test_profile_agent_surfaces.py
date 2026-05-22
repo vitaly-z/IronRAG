@@ -47,6 +47,44 @@ class AgentSurfaceProfileTests(unittest.TestCase):
         self.assertTrue(arguments["includeReferences"])
         self.assertNotIn("libraryIds", arguments)
 
+    def test_library_catalog_context_uses_direct_library_lookup(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def request_json(self, method, uri, **kwargs):
+                self.calls.append((method, uri, kwargs))
+                if uri == "/v1/catalog/libraries/lib-1":
+                    return MODULE.CurlSample(
+                        status_code=200,
+                        time_total_s=0.01,
+                        size_download_bytes=2,
+                        payload={
+                            "id": "lib-1",
+                            "workspaceId": "workspace-1",
+                            "slug": "library",
+                        },
+                    )
+                if uri == "/v1/catalog/workspaces/workspace-1":
+                    return MODULE.CurlSample(
+                        status_code=200,
+                        time_total_s=0.01,
+                        size_download_bytes=2,
+                        payload={"id": "workspace-1", "slug": "workspace"},
+                    )
+                raise AssertionError(f"unexpected request {method} {uri}")
+
+        session = FakeSession()
+
+        context = MODULE.discover_library_catalog_context(session, "lib-1")
+
+        self.assertEqual(context.workspace_id, "workspace-1")
+        self.assertEqual(context.catalog_ref, "workspace/library")
+        self.assertEqual(
+            [call[1] for call in session.calls],
+            ["/v1/catalog/libraries/lib-1", "/v1/catalog/workspaces/workspace-1"],
+        )
+
     def test_probe_mcp_tool_can_target_answer_surface_explicitly(self) -> None:
         class FakeSession:
             def __init__(self) -> None:
@@ -72,6 +110,31 @@ class AgentSurfaceProfileTests(unittest.TestCase):
         )
 
         self.assertEqual(session.calls[0][1], MODULE.MCP_ANSWER_ROUTE)
+
+    def test_quality_tokenization_is_unicode_agnostic(self) -> None:
+        self.assertEqual(
+            MODULE.tokenize_quality_text("Alpha/Бета-42"),
+            ("alpha", "бета", "42"),
+        )
+        self.assertEqual(
+            MODULE.normalize_quality_text("Checkout.Endpoint / 支払い"),
+            "checkout endpoint 支払い",
+        )
+
+    def test_answer_overlap_detects_unrelated_verified_text(self) -> None:
+        related = MODULE.answer_token_overlap_ratio(
+            "Alpha Gateway connects to the checkout endpoint.",
+            "The checkout endpoint is served by Alpha Gateway.",
+        )
+        unrelated = MODULE.answer_token_overlap_ratio(
+            "Alpha Gateway connects to the checkout endpoint.",
+            "No supported evidence is available for this request.",
+        )
+
+        self.assertIsNotNone(related)
+        self.assertIsNotNone(unrelated)
+        self.assertGreater(related, 0.5)
+        self.assertLess(unrelated, 0.16)
 
     def test_summarize_graph_quality_detects_document_coverage_and_duplicates(self) -> None:
         summary = MODULE.summarize_graph_quality(
@@ -297,6 +360,7 @@ class AgentSurfaceProfileTests(unittest.TestCase):
                 duplicate_entity_label_count=1,
                 duplicate_relation_signature_count=0,
                 top_entity_label="Orion",
+                probe_entity_label=None,
                 visible_entity_labels_normalized=("orion",),
             ),
             relation_list_summary=MODULE.RelationListSummary(
@@ -381,6 +445,7 @@ class AgentSurfaceProfileTests(unittest.TestCase):
                 duplicate_entity_label_count=0,
                 duplicate_relation_signature_count=0,
                 top_entity_label="HTTP",
+                probe_entity_label=None,
                 visible_entity_labels_normalized=("http", "checkout server", "system information endpoint"),
             ),
             relation_list_summary=MODULE.RelationListSummary(
@@ -460,6 +525,7 @@ class AgentSurfaceProfileTests(unittest.TestCase):
                 duplicate_entity_label_count=0,
                 duplicate_relation_signature_count=0,
                 top_entity_label="Orion",
+                probe_entity_label=None,
                 visible_entity_labels_normalized=("orion",),
             ),
             relation_list_summary=MODULE.RelationListSummary(
@@ -572,6 +638,7 @@ class AgentSurfaceProfileTests(unittest.TestCase):
                 duplicate_entity_label_count=0,
                 duplicate_relation_signature_count=0,
                 top_entity_label="Orion",
+                probe_entity_label=None,
                 visible_entity_labels_normalized=("orion",),
             ),
             relation_list_summary=MODULE.RelationListSummary(
@@ -720,6 +787,7 @@ class AgentSurfaceProfileTests(unittest.TestCase):
                 duplicate_entity_label_count=0,
                 duplicate_relation_signature_count=0,
                 top_entity_label="Orion",
+                probe_entity_label=None,
                 visible_entity_labels_normalized=("orion",),
             ),
             relation_list_summary=MODULE.RelationListSummary(

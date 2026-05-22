@@ -190,6 +190,33 @@ fn build_focused_document_answer_extracts_report_name_from_pdf_single_line_text(
 }
 
 #[test]
+fn build_focused_document_answer_abstains_for_procedural_config_ir() {
+    let document_id = Uuid::now_v7();
+    let answer = build_focused_document_answer(
+        "Where should the connector config be written and which parameters are required?",
+        &query_ir_with_act_scope_and_target_types(
+            QueryAct::ConfigureHow,
+            QueryScope::SingleDocument,
+            ["secondary_heading", "config_key"],
+        ),
+        &[RuntimeMatchedChunk {
+            chunk_id: Uuid::now_v7(),
+            revision_id: Uuid::now_v7(),
+            chunk_index: 0,
+            chunk_kind: None,
+            document_id,
+            document_label: "payment_connector_setup.md".to_string(),
+            excerpt: "Payment Connector\n\n[Main]".to_string(),
+            score_kind: crate::services::query::execution::RuntimeChunkScoreKind::Relevance,
+            score: Some(1.0),
+            source_text: "Payment Connector\n\n[Main]\nendpoint = https://example.invalid/api\nprintReceipt = true\n\n[Check]\nprintReceiptSlip = false".to_string(),
+        }],
+    );
+
+    assert!(answer.is_none());
+}
+
+#[test]
 fn build_focused_document_answer_extracts_formats_under_test() {
     let document_id = Uuid::now_v7();
     let answer = build_focused_document_answer(

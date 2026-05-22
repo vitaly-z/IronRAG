@@ -62,6 +62,7 @@ describe('AssistantPage integration', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    window.localStorage.clear();
     container = document.createElement('div');
     document.body.appendChild(container);
     root = null;
@@ -119,6 +120,7 @@ describe('AssistantPage integration', () => {
         root?.unmount();
       });
     }
+    window.localStorage.clear();
     container.remove();
   });
 
@@ -253,6 +255,7 @@ describe('AssistantPage integration', () => {
     expect(queryApiMock.createTurnStream).toHaveBeenCalledWith(
       'session-new',
       'Where is the docs page?',
+      0,
       expect.any(Function),
     );
     expect(container.textContent).toContain('Hello world');
@@ -367,7 +370,7 @@ describe('AssistantPage integration', () => {
                 segmentId: 'seg-1',
                 documentTitle: 'Pagination Design',
                 sourceUri: null,
-                sourceAccess: null,
+                sourceAccess: { kind: 'stored_document', href: '/documents/doc-1' },
                 headingTrail: ['Pagination', 'Design'],
                 sectionPath: [],
                 blockKind: 'heading',
@@ -399,6 +402,66 @@ describe('AssistantPage integration', () => {
 
     expect(queryApiMock.getSession).toHaveBeenCalledWith('session-1');
     expect(container.textContent).toContain('We moved to keyset pagination');
+    expect(
+      window.localStorage.getItem(
+        'ironrag_assistant_active_session:ws-1:library-1',
+      ),
+    ).toBe(JSON.stringify('session-1'));
+  });
+
+  it('restores the active session after a page reload', async () => {
+    window.localStorage.setItem(
+      'ironrag_assistant_active_session:ws-1:library-1',
+      JSON.stringify('session-1'),
+    );
+    queryApiMock.getSession.mockResolvedValue({
+      session: {
+        id: 'session-1',
+        libraryId: 'library-1',
+        title: 'Deployment notes',
+        updatedAt: '2026-04-10T10:00:00Z',
+        turnCount: 2,
+      },
+      messages: [
+        {
+          id: 'msg-assistant',
+          role: 'assistant',
+          content: 'We moved to keyset pagination.',
+          timestamp: '2026-04-10T10:00:02Z',
+          executionId: 'exec-prev',
+          evidence: {
+            preparedSegmentReferences: [
+              {
+                documentId: 'doc-1',
+                segmentId: 'seg-1',
+                documentTitle: 'Pagination Design',
+                sourceUri: null,
+                sourceAccess: { kind: 'stored_document', href: '/documents/doc-1' },
+                headingTrail: ['Pagination', 'Design'],
+                sectionPath: [],
+                blockKind: 'heading',
+                rank: 1,
+                score: 0.91,
+              },
+            ],
+            technicalFactReferences: [],
+            entityReferences: [],
+            relationReferences: [],
+            verificationState: 'verified',
+            verificationWarnings: [],
+            runtimeStageSummaries: [{ stageKind: 'retrieve', stageLabel: 'Retrieve' }],
+          },
+        },
+      ],
+    });
+
+    await renderPage();
+
+    await waitFor(() => {
+      expect(queryApiMock.getSession).toHaveBeenCalledWith('session-1');
+    });
+    expect(container.textContent).toContain('We moved to keyset pagination');
+    expect(container.textContent).toContain('Sources');
   });
 
   it('keeps the active thread fixed while a turn is pending', async () => {
@@ -460,6 +523,7 @@ describe('AssistantPage integration', () => {
       expect(queryApiMock.createTurnStream).toHaveBeenCalledWith(
         'session-1',
         'What is pending?',
+        0,
         expect.any(Function),
       );
     });
@@ -602,11 +666,13 @@ describe('AssistantPage integration', () => {
     expect(queryApiMock.createTurnStream).toHaveBeenCalledWith(
       'session-new-library-2',
       'What changed?',
+      0,
       expect.any(Function),
     );
     expect(queryApiMock.createTurnStream).not.toHaveBeenCalledWith(
       'session-1',
       expect.any(String),
+      expect.any(Number),
       expect.any(Function),
     );
     await waitFor(() => {

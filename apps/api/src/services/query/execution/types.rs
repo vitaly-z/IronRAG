@@ -25,6 +25,8 @@ pub(crate) struct RuntimeMatchedEntity {
     pub node_id: Uuid,
     pub label: String,
     pub node_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     pub score: Option<f32>,
 }
 
@@ -459,6 +461,7 @@ pub(crate) struct StructuredQueryRetrievalStage {
     pub(crate) planning: StructuredQueryPlanningStage,
     pub(crate) bundle: RetrievalBundle,
     pub(crate) graph_evidence_context_lines: Vec<String>,
+    pub(crate) graph_evidence_source_document_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -471,6 +474,7 @@ pub(crate) struct StructuredQueryRerankStage {
 pub(crate) struct StructuredQueryAssemblyStage {
     pub(crate) rerank: StructuredQueryRerankStage,
     pub(crate) context_text: String,
+    pub(crate) graph_evidence_context_lines: Vec<String>,
     pub(crate) technical_literals_text: Option<String>,
     pub(crate) technical_literal_chunks: Vec<RuntimeMatchedChunk>,
     pub(crate) retrieved_documents: Vec<RuntimeRetrievedDocumentBrief>,

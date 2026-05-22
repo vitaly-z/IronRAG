@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::domains::query_ir::{QueryIR, QueryScope};
+use crate::services::query::text_match::related_prefix_token_match;
 
 use super::retrieve::score_value;
 use super::types::RuntimeMatchedChunk;
@@ -66,6 +67,7 @@ fn technical_keyword_stem(keyword: &str) -> Option<String> {
 pub(super) fn technical_keyword_present(lowered_text: &str, keyword: &str) -> bool {
     lowered_text.contains(keyword)
         || technical_keyword_stem(keyword).is_some_and(|stem| lowered_text.contains(stem.as_str()))
+        || technical_keyword_related_prefix_present(lowered_text, keyword)
 }
 
 pub(super) fn technical_keyword_weight(lowered_text: &str, keyword: &str) -> usize {
@@ -75,7 +77,19 @@ pub(super) fn technical_keyword_weight(lowered_text: &str, keyword: &str) -> usi
     if technical_keyword_stem(keyword).is_some_and(|stem| lowered_text.contains(stem.as_str())) {
         return 4;
     }
+    if technical_keyword_related_prefix_present(lowered_text, keyword) {
+        return 3;
+    }
     0
+}
+
+fn technical_keyword_related_prefix_present(lowered_text: &str, keyword: &str) -> bool {
+    keyword.chars().count() >= 5
+        && lowered_text
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '/')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .any(|token| related_prefix_token_match(keyword, token))
 }
 
 pub(super) fn technical_literal_focus_keyword_segments(
@@ -194,20 +208,23 @@ pub(super) fn select_document_balanced_chunks<'a>(
 
     for document_chunks in per_document_chunks.values_mut() {
         let local_keywords = document_local_focus_keywords(question, ir, document_chunks, keywords);
+        let score_by_chunk_id = document_chunks
+            .iter()
+            .map(|chunk| {
+                let match_score = technical_chunk_selection_score(
+                    &format!("{} {}", chunk.excerpt, chunk.source_text),
+                    &local_keywords,
+                    pagination_requested,
+                );
+                (chunk.chunk_id, (match_score, score_value(chunk.score)))
+            })
+            .collect::<HashMap<_, _>>();
         document_chunks.sort_by(|left, right| {
-            let left_match = technical_chunk_selection_score(
-                &format!("{} {}", left.excerpt, left.source_text),
-                &local_keywords,
-                pagination_requested,
-            );
-            let right_match = technical_chunk_selection_score(
-                &format!("{} {}", right.excerpt, right.source_text),
-                &local_keywords,
-                pagination_requested,
-            );
-            right_match
-                .cmp(&left_match)
-                .then_with(|| score_value(right.score).total_cmp(&score_value(left.score)))
+            let (left_match, left_score) =
+                score_by_chunk_id.get(&left.chunk_id).copied().unwrap_or_default();
+            let (right_match, right_score) =
+                score_by_chunk_id.get(&right.chunk_id).copied().unwrap_or_default();
+            right_match.cmp(&left_match).then_with(|| right_score.total_cmp(&left_score))
         });
     }
 
@@ -227,4 +244,19 @@ pub(super) fn select_document_balanced_chunks<'a>(
     }
 
     selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn technical_keyword_weight_accepts_longer_related_prefix_token() {
+        assert_eq!(technical_keyword_weight("acmealpha payment configuration", "acmew"), 3);
+    }
+
+    #[test]
+    fn technical_keyword_weight_rejects_short_prefix_target_tokens() {
+        assert_eq!(technical_keyword_weight("acmealpha payment configuration", "acmr"), 0);
+    }
 }

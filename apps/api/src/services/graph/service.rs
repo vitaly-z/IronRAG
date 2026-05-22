@@ -193,9 +193,6 @@ impl GraphService {
             .build_and_refresh_arango_graph_from_candidates(state, revision.library_id, None)
             .await?;
         outcome.target = Some(ArangoGraphRebuildTarget::Graph);
-        self.recalculate_arango_library_generations(state, revision.library_id)
-            .await
-            .context("failed to refresh arango generation state after graph merge")?;
         Ok(outcome)
     }
 
@@ -277,9 +274,6 @@ impl GraphService {
             self.reconcile_arango_library_candidates(state, revision.library_id, None).await?;
         outcome.stale_evidence_marked += marked_stale;
         outcome.target = Some(ArangoGraphRebuildTarget::Evidence);
-        self.recalculate_arango_library_generations(state, revision.library_id)
-            .await
-            .context("failed to refresh arango generation state after graph invalidation")?;
         Ok(outcome)
     }
 
@@ -370,9 +364,6 @@ impl GraphService {
                 .build_and_refresh_arango_graph_from_candidates(state, library_id, None)
                 .await?;
             outcome.target = Some(ArangoGraphRebuildTarget::Graph);
-            self.recalculate_arango_library_generations(state, library_id)
-                .await
-                .context("failed to refresh arango generation state after graph reconcile")?;
             Ok(outcome)
         })
         .await
@@ -389,9 +380,6 @@ impl GraphService {
             let mut outcome =
                 self.reconcile_arango_library_candidates(state, library_id, None).await?;
             outcome.target = Some(ArangoGraphRebuildTarget::Evidence);
-            self.recalculate_arango_library_generations(state, library_id)
-                .await
-                .context("failed to refresh arango generation state after evidence rebuild")?;
             Ok(outcome)
         })
         .await
@@ -431,9 +419,6 @@ impl GraphService {
             outcome.upserted_evidence_support_relation_edges =
                 graph.upserted_evidence_support_relation_edges;
             outcome.stale_evidence_marked = graph.stale_evidence_marked;
-            self.recalculate_arango_library_generations(state, library_id)
-                .await
-                .context("failed to refresh arango generation state after library rebuild")?;
             Ok(outcome)
         })
         .await

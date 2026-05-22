@@ -52,6 +52,32 @@ fn route_target_types_do_not_expand_endpoint_literal_intent() {
 }
 
 #[test]
+fn module_package_and_config_targets_request_exact_literal_context() {
+    let module_intent = detect_technical_literal_intent_from_query_ir(
+        "Which module should be installed for Provider Alpha?",
+        &query_ir_with_scope_and_target_types(
+            QueryScope::SingleDocument,
+            ["software_module", "package"],
+        ),
+    );
+
+    assert!(module_intent.wants_parameters);
+    assert!(!module_intent.wants_paths);
+
+    let config_intent = detect_technical_literal_intent_from_query_ir(
+        "Which configuration file and keys configure Provider Alpha?",
+        &query_ir_with_scope_and_target_types(
+            QueryScope::SingleDocument,
+            ["configuration_file", "filesystem_path", "config_key"],
+        ),
+    );
+
+    assert!(config_intent.wants_paths);
+    assert!(config_intent.wants_parameters);
+    assert!(!config_intent.wants_methods);
+}
+
+#[test]
 fn detect_technical_literal_intent_falls_back_to_parameters_for_exact_literal_queries_without_known_tags()
  {
     let mut ir =
@@ -64,6 +90,32 @@ fn detect_technical_literal_intent_falls_back_to_parameters_for_exact_literal_qu
         "What is the inventory route_map value?",
         &ir,
     );
+
+    assert!(intent.wants_parameters);
+}
+
+#[test]
+fn plain_alphabetic_identifier_literal_does_not_request_parameters() {
+    let mut ir =
+        query_ir_with_scope_and_target_types(QueryScope::SingleDocument, ["route_map_inventory"]);
+    ir.act = QueryAct::RetrieveValue;
+    ir.literal_constraints =
+        vec![LiteralSpan { text: "alpha".to_string(), kind: LiteralKind::Identifier }];
+
+    let intent = detect_technical_literal_intent_from_query_ir("What mentions alpha?", &ir);
+
+    assert!(!intent.wants_parameters);
+}
+
+#[test]
+fn structural_identifier_literal_requests_parameters() {
+    let mut ir =
+        query_ir_with_scope_and_target_types(QueryScope::SingleDocument, ["route_map_inventory"]);
+    ir.act = QueryAct::RetrieveValue;
+    ir.literal_constraints =
+        vec![LiteralSpan { text: "callbackUrl".to_string(), kind: LiteralKind::Identifier }];
+
+    let intent = detect_technical_literal_intent_from_query_ir("What is callbackUrl?", &ir);
 
     assert!(intent.wants_parameters);
 }
@@ -769,6 +821,7 @@ fn select_technical_literal_chunks_focuses_single_source_parameter_question_on_b
         TechnicalLiteralIntent { wants_parameters: true, ..TechnicalLiteralIntent::default() },
         8,
         &technical_literal_focus_keywords(question, Some(&ir)),
+        &[],
         false,
     );
 
@@ -826,6 +879,7 @@ fn select_technical_literal_chunks_prefers_matching_wsdl_document_for_single_sou
         },
         8,
         &technical_literal_focus_keywords(question, Some(&ir)),
+        &[],
         false,
     );
 

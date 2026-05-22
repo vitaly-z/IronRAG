@@ -261,6 +261,7 @@ fn select_technical_literal_chunks_focuses_single_source_parameter_question_on_b
         TechnicalLiteralIntent { wants_parameters: true, ..TechnicalLiteralIntent::default() },
         8,
         &technical_literal_focus_keywords(question, Some(&ir)),
+        &[],
         false,
     );
 
@@ -318,11 +319,131 @@ fn select_technical_literal_chunks_prefers_matching_wsdl_document_for_single_sou
         },
         8,
         &technical_literal_focus_keywords(question, Some(&ir)),
+        &[],
         false,
     );
 
     assert!(!selected.is_empty());
     assert!(selected.iter().all(|chunk| chunk.document_id == inventory_document_id));
+}
+
+#[test]
+fn select_technical_literal_chunks_prefers_graph_supported_single_source_document() {
+    let question = "How do I configure AcmePay: file, sections, parameters, and an ini example?";
+    let generic_document_id = Uuid::now_v7();
+    let target_document_id = Uuid::now_v7();
+    let mut ir = query_ir_with_act_scope_literals_and_target_types(
+        QueryAct::ConfigureHow,
+        QueryScope::SingleDocument,
+        ["AcmePay"],
+        ["configuration", "parameter"],
+    );
+    ir.target_entities
+        .push(EntityMention { label: "AcmePay".to_string(), role: EntityRole::Subject });
+    let selected = select_technical_literal_chunks(
+        question,
+        &ir,
+        &[
+            RuntimeMatchedChunk {
+                chunk_id: Uuid::now_v7(),
+                revision_id: Uuid::now_v7(),
+                chunk_index: 0,
+                chunk_kind: None,
+                document_id: generic_document_id,
+                document_label: "general_configuration_guide.md".to_string(),
+                excerpt: "General configuration guide.".to_string(),
+                score_kind: crate::services::query::execution::RuntimeChunkScoreKind::Relevance,
+                score: Some(0.99),
+                source_text: "General configuration file sections parameters examples configuration file sections parameters examples.".to_string(),
+            },
+            RuntimeMatchedChunk {
+                chunk_id: Uuid::now_v7(),
+                revision_id: Uuid::now_v7(),
+                chunk_index: 7,
+                chunk_kind: None,
+                document_id: target_document_id,
+                document_label: "acmepay_processing_guide.md".to_string(),
+                excerpt: "AcmePay processor settings.".to_string(),
+                score_kind: crate::services::query::execution::RuntimeChunkScoreKind::GraphEvidence,
+                score: Some(0.72),
+                source_text:
+                    "AcmePay configuration file /opt/acme/acmepay.ini section [Main] paymentEnabled = true section [Receipt] printSlip = false."
+                        .to_string(),
+            },
+        ],
+        TechnicalLiteralIntent {
+            wants_paths: true,
+            wants_parameters: true,
+            ..TechnicalLiteralIntent::default()
+        },
+        8,
+        &technical_literal_focus_keywords(question, Some(&ir)),
+        &[target_document_id],
+        false,
+    );
+
+    assert!(!selected.is_empty());
+    assert!(selected.iter().all(|chunk| chunk.document_id == target_document_id));
+    assert!(selected.iter().any(|chunk| chunk.source_text.contains("/opt/acme/acmepay.ini")));
+}
+
+#[test]
+fn select_technical_literal_chunks_does_not_let_label_overlap_beat_stronger_chunks() {
+    let question = "How do I configure AcmePay: file, sections, parameters, and an ini example?";
+    let strong_document_id = Uuid::now_v7();
+    let weak_label_document_id = Uuid::now_v7();
+    let mut ir = query_ir_with_act_scope_literals_and_target_types(
+        QueryAct::ConfigureHow,
+        QueryScope::SingleDocument,
+        ["AcmePay"],
+        ["configuration", "parameter"],
+    );
+    ir.target_entities
+        .push(EntityMention { label: "AcmePay".to_string(), role: EntityRole::Subject });
+    let selected = select_technical_literal_chunks(
+        question,
+        &ir,
+        &[
+            RuntimeMatchedChunk {
+                chunk_id: Uuid::now_v7(),
+                revision_id: Uuid::now_v7(),
+                chunk_index: 0,
+                chunk_kind: None,
+                document_id: strong_document_id,
+                document_label: "payment_processing_configuration.md".to_string(),
+                excerpt: "Configuration file /opt/acme/payments.ini uses [Main].".to_string(),
+                score_kind: crate::services::query::execution::RuntimeChunkScoreKind::Relevance,
+                score: Some(0.94),
+                source_text:
+                    "Configure file /opt/acme/payments.ini sections [Main] and [Receipt]. Parameters paymentEnabled = true and printSlip = false. Example ini block included."
+                        .to_string(),
+            },
+            RuntimeMatchedChunk {
+                chunk_id: Uuid::now_v7(),
+                revision_id: Uuid::now_v7(),
+                chunk_index: 0,
+                chunk_kind: None,
+                document_id: weak_label_document_id,
+                document_label: "acmepay_overview.md".to_string(),
+                excerpt: "AcmePay overview.".to_string(),
+                score_kind: crate::services::query::execution::RuntimeChunkScoreKind::Relevance,
+                score: Some(0.99),
+                source_text: "AcmePay overview and commercial background.".to_string(),
+            },
+        ],
+        TechnicalLiteralIntent {
+            wants_paths: true,
+            wants_parameters: true,
+            ..TechnicalLiteralIntent::default()
+        },
+        8,
+        &technical_literal_focus_keywords(question, Some(&ir)),
+        &[],
+        false,
+    );
+
+    assert!(!selected.is_empty());
+    assert!(selected.iter().all(|chunk| chunk.document_id == strong_document_id));
 }
 
 #[test]

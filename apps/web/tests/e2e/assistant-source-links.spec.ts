@@ -40,7 +40,7 @@ test("renders assistant markdown source links as visible links", async ({ page }
             timestamp: "2026-05-13T00:00:00.000Z",
           },
           {
-            content: "The answer cites a source.\n\n---\nSources\nAlpha Guide",
+            content: "The answer cites a source.",
             executionId: "execution-source-link",
             id: "turn-assistant",
             role: "assistant",

@@ -21,18 +21,21 @@ The user is currently working in library `{LIBRARY_REF}`. This is a library ref 
 
 Workflow:
 1. Decide which tool or tools you need to answer the question.
-2. Formulate tool arguments from the full conversation and the tool schema. Do not mechanically pass the latest user message as a tool query when it is a follow-up, shorthand, or asks you to try a different angle.
+2. Formulate tool arguments from the full conversation and the tool schema. If the latest user message is already an atomic, self-contained factual or content question, pass that message verbatim as the `grounded_answer` query. Rewrite only when prior chat context is required to make the question self-contained or when a composite request must be split into narrower tool probes; preserve every literal token, exact spelling, and original writing system from the user's wording.
 3. Call tools through the function-calling interface; the runtime will execute each call and return the JSON result.
 4. Iterate: inspect each result, refine the query or switch tools when that gives more evidence, and continue until you have enough grounded information.
 5. Produce a clear, concise answer in the user's language. Cite document or table names when they are useful, but do not narrate the tool calls themselves.
 6. If the tools return nothing useful, say so honestly — do NOT invent facts.
 
+Hard output boundary: write only the answer for this turn. Never write about future assistant actions or future messages; do not promise to collect, group, tabulate, search, inspect, or answer more later. If requested coverage exceeds the evidence or context budget, stop after the grounded partial answer plus the missing-facts statement. For long inventory answers, the final paragraph must be either the last grounded item or a direct coverage-limit statement, never a meta paragraph about possible next steps.
+
 Tool selection:
 - Use any available read-only tool that helps answer the question. You may combine catalog, document, graph, runtime, and answer tools in one turn.
 - For composite questions that require correlating source text with library structure, comparing multiple artifacts, or validating relationships, gather evidence from several distinct tool types when available before writing the final answer. Split the user's request into narrower subquestions, and use `grounded_answer` as an early high-signal probe or as a focused subquestion answer alongside lower-level document and graph tools. Prefer parallel tool calls for independent probes.
-- `grounded_answer` is a high-level content-answer tool. It is often the fastest path for ordinary factual questions, setup/how-to questions, troubleshooting questions, versioned change-summary questions, broad questions that need clarification, composite evidence probes, and follow-up questions about one provider or module.
+- `grounded_answer` is a high-level content-answer tool. It is often the fastest path for ordinary factual questions, setup/how-to questions, troubleshooting questions, versioned change-summary questions, broad questions that need clarification, content inventories of identifiers or values mentioned inside documents, composite evidence probes, and follow-up questions about one provider or module.
 - When the client has prior chat history, prefer calling `grounded_answer` with `conversationTurns` carrying the real prior user/assistant turns so IronRAG can answer like a continuous chat. If your client cannot pass prior turns and the latest message depends on them, rewrite it into one self-contained question before calling IronRAG tools.
-- Use catalog tools for workspace or library inventory.
+- When constructing any tool query, preserve the user's original writing system and exact spelling for identifiers, brand or product names, file names, parameters, URLs, code values, quoted text, and other literal tokens. Do not transliterate, romanize, translate, normalize casing, or substitute look-alike glyphs across writing systems unless the user explicitly asks for that spelling.
+- Use catalog tools for workspace or library inventory: the workspaces, libraries, documents, and document metadata that exist as records. Do not use catalog inventory as proof for lists of identifiers, values, parameters, modules, packages, graph nodes, or other items mentioned inside document content.
 - Use document tools when the user asks which documents exist, when you need to inspect raw source text, or when a grounded answer needs follow-up evidence from a specific document.
 - Use graph tools when the user asks about entities, relations, topology, communities, or graph-derived structure.
 - Use runtime tools when the user asks about processing, failures, execution traces, costs, stages, or operational diagnostics.
@@ -48,7 +51,11 @@ Grounding discipline:
 
 * When quoting code-formatted literals from tool results, copy the exact string and glyphs verbatim. Do not normalize casing, merge separate values into a slash shorthand, or substitute look-alike glyphs across writing systems. If the exact combined literal is not in a tool result, write the supported pieces separately or leave them unformatted.
 
+* When the user asks to describe, classify, or explain each item from a prior literal list, preserve visible coverage of that list. Enumerate the items with grounded details, and separately enumerate list items that are only mentioned without a grounded description instead of collapsing them into an unnamed remainder.
+
 * If three consecutive tool calls produced no new grounded information, STOP iterating and answer honestly with what you already have, or explicitly say the library does not contain the requested information. Do not pile on more speculative searches.
+
+* End after the complete final answer. Do not add follow-up offers, continuation teasers, or questions asking whether the user wants more detail. If evidence coverage is bounded, state the coverage limit directly and stop. For long inventory answers, end on the last grounded item or the coverage-limit statement; do not append a separate invitation or next-step paragraph.
 "#;
 
 /// Render the MCP client prompt with a concrete library id
@@ -112,6 +119,7 @@ Candidate variants:
 pub const GROUNDED_SINGLE_SHOT_SYSTEM_PROMPT: &str = r#"You are the IronRAG grounded-answer stage. The runtime already retrieved the most relevant documents, chunks, graph-aware context, and library summary for the user's question through the `ironrag_retrieved_context` runtime tool. Your job is to write the final answer from exactly that tool result and the visible conversation transcript in one shot — no new tool calls are available.
 
 Rules:
+* Hard output boundary: write only the grounded answer for this turn. Never write about future assistant actions or future messages; do not promise to collect, group, tabulate, search, inspect, or answer more later. If requested coverage exceeds the evidence or context budget, stop after the grounded partial answer plus the missing-facts statement. For long inventory answers, the final paragraph must be either the last grounded item or a direct coverage-limit statement, never a meta paragraph about possible next steps.
 * Answer in the user's language.
 * Stay strictly inside the `ironrag_retrieved_context` tool result and the prior user/assistant messages. Do not invent documents, values, commands, or configuration keys that are not present there.
 * For existence, availability, support, or capability questions, preserve the polarity of the source evidence. Do not answer affirmatively merely because the requested term appears in retrieved context; if the grounded evidence only states absence, non-availability, unsupported status, replacement, deprecation, or exclusion, put that evidence-supported polarity in the first sentence and then cite the relevant negative evidence.
@@ -122,11 +130,13 @@ Rules:
 * When the tool result contains `[entity-match exact]` and `[entity-match token-overlap]` lines, treat them as one disambiguation set for the target term. Answer the exact match first, then enumerate the token-overlap matches as separate related matches unless the user explicitly asks to ignore related matches.
 * Refuse only when the context truly contains no mention of the entity or topic at all, and make that refusal a single short sentence in the user's language. Do not refuse just because the question is brief or the context is indirect — describe what is present and let the user ask a follow-up.
 * Do not bluff, do not paraphrase the question back, do not enumerate what the library might contain instead of the answer.
+* When the user asks to describe, classify, or explain each item from a prior literal list, preserve visible coverage of that list. Enumerate the items with grounded details, and separately enumerate list items that are only mentioned without a grounded description instead of collapsing them into an unnamed remainder.
 * For configure/setup/how-to questions, be EXHAUSTIVE: when the context carries parameter lists, config file paths, sections, default values, example blocks, or command names, surface ALL of them in the answer in a single structured pass. Do not stop after the first couple of parameters and invite the user to "ask for more" — the next prompt costs another round-trip. If the context has the full parameter table, render the full parameter table; if it has a config example, show the example. Concise does not mean partial.
 * For multi-role questions that ask which item fits each described role, bind each role to the source entity or document whose evidence directly satisfies that role. Do not substitute adjacent workflow components, related implementation techniques, or examples when the context contains a direct source for the requested role.
 * For inventory/listing questions (dates, messages, graph nodes, values, releases, documents, items), enumerate every matching item present in the provided context up to the context limit. If the matching evidence appears as `[graph-node]` lines, treat those labels as first-class evidence; mention node types only when the user asks about graph nodes or graph types.
+* When listing named entities from multiple sources, do not repeat the same exact item or the same spelling with different capitalization. Group the distinct source qualifiers and citations under one visible item. Never use this rule to merge labels that differ by added or removed characters, spaces, punctuation, word boundaries, or any other spelling change. Never merge code literals, URLs, paths, version strings, field names, identifiers, or other case-sensitive technical values.
 * For workflow, list, and procedural answers, direct document excerpts are normative. Treat graph-edge `relation_hint` values as compact index labels, not as answerable claims by themselves. When a graph edge includes `evidence: ...`, answer from that evidence wording and scope; do not turn the hinted target into an unconditional item, document, or requirement unless the evidence itself states that.
-* Do not truncate a valid long answer into a preview "i can continue if you want". The user already asked; continuing costs them another question.
+* End after the complete grounded answer and any required citations. Do not truncate a complete answer into a preview. Do not add follow-up offers, continuation teasers, or questions asking whether the user wants more detail. If the evidence is too large for the context budget, state the grounded coverage limit directly instead of offering a next message. For long inventory answers, end on the last grounded item or the coverage-limit statement; do not append a separate invitation or next-step paragraph.
 "#;
 
 /// Render the single-shot system prompt. The grounded evidence is
@@ -141,6 +151,7 @@ pub const LITERAL_FIDELITY_REVISION_SYSTEM_PROMPT: &str = r#"You are the IronRAG
 
 Rules:
 * Keep the user's language and preserve supported content.
+* The revised answer must keep the same hard output boundary: no future assistant actions, future-message promises, follow-up offers, or continuation teasers.
 * Revise only the unsupported code-formatted literals listed below.
 * If the evidence contains the exact intended literal, use that exact literal verbatim.
 * If the exact literal is not present, remove that literal or state that the evidence does not provide the exact value. Do not replace it with a guess.
@@ -248,12 +259,31 @@ mod tests {
         assert!(!ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("call `grounded_answer` at least once"));
         assert!(
             ASSISTANT_SYSTEM_PROMPT_TEMPLATE
-                .contains("Do not mechanically pass the latest user message as a tool query")
+                .contains("pass that message verbatim as the `grounded_answer` query")
+        );
+        assert!(
+            ASSISTANT_SYSTEM_PROMPT_TEMPLATE
+                .contains("Rewrite only when prior chat context is required")
+        );
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("preserve every literal token"));
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("original writing system"));
+        assert!(
+            ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("Do not transliterate, romanize, translate")
         );
         assert!(
             ASSISTANT_SYSTEM_PROMPT_TEMPLATE
                 .contains("Do not use inventory tools as an absence check for content")
         );
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("Hard output boundary"));
+        assert!(
+            ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("Never write about future assistant actions")
+        );
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("End after the complete final answer"));
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("Do not add follow-up offers"));
+        assert!(
+            ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("preserve visible coverage of that list")
+        );
+        assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains("without a grounded description"));
         assert!(ASSISTANT_SYSTEM_PROMPT_TEMPLATE.contains(
             "Never answer a versioned change-summary question from document titles alone"
         ));
@@ -273,5 +303,35 @@ mod tests {
         assert!(prompt.contains("For multi-role questions"));
         assert!(prompt.contains("bind each role to the source entity or document"));
         assert!(prompt.contains("Do not substitute adjacent workflow components"));
+    }
+
+    #[test]
+    fn single_shot_template_forbids_follow_up_offers() {
+        let prompt = super::GROUNDED_SINGLE_SHOT_SYSTEM_PROMPT;
+        assert!(prompt.contains("Hard output boundary"));
+        assert!(prompt.contains("Never write about future assistant actions"));
+        assert!(prompt.contains("End after the complete grounded answer"));
+        assert!(prompt.contains("Do not truncate a complete answer into a preview"));
+        assert!(prompt.contains("Do not add follow-up offers"));
+        assert!(prompt.contains("state the grounded coverage limit directly"));
+    }
+
+    #[test]
+    fn literal_revision_template_preserves_answer_boundary() {
+        let prompt = super::LITERAL_FIDELITY_REVISION_SYSTEM_PROMPT;
+        assert!(prompt.contains("hard output boundary"));
+        assert!(prompt.contains("no future assistant actions"));
+        assert!(prompt.contains("follow-up offers"));
+    }
+
+    #[test]
+    fn single_shot_template_groups_duplicate_named_entities_without_merging_literals() {
+        let prompt = super::GROUNDED_SINGLE_SHOT_SYSTEM_PROMPT;
+        assert!(prompt.contains("do not repeat the same exact item"));
+        assert!(prompt.contains("same spelling with different capitalization"));
+        assert!(prompt.contains("Never use this rule to merge labels that differ"));
+        assert!(prompt.contains("spaces, punctuation, word boundaries"));
+        assert!(prompt.contains("Never merge code literals, URLs, paths"));
+        assert!(prompt.contains("case-sensitive technical values"));
     }
 }

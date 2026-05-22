@@ -27,16 +27,15 @@ use super::technical_literals::{
 };
 use super::tuning::{
     CLARIFY_DOMINANCE_RATIO, CLARIFY_MAX_VARIANTS, CLARIFY_MIN_DISTINCT_DOCUMENTS,
-    MAX_APPENDED_SOURCES, SINGLE_SHOT_CONFIDENT_ANSWER_CHARS, SINGLE_SHOT_MIN_ANSWER_CHARS,
+    SINGLE_SHOT_CONFIDENT_ANSWER_CHARS, SINGLE_SHOT_MIN_ANSWER_CHARS,
     SINGLE_SHOT_RETRIEVAL_ESCALATION_MIN_DOCUMENTS,
 };
 use super::{
     AnswerGenerationStage, AnswerVerificationStage, FocusReason, PreparedAnswerQueryResult,
     QueryChunkReferenceSnapshot, QueryCompileUsage, RuntimeAnswerQueryResult, RuntimeMatchedChunk,
-    RuntimeRetrievedDocumentBrief, apply_query_execution_library_summary,
-    apply_query_execution_warning, assemble_answer_context, load_query_execution_library_context,
-    render_targeted_evidence_chunk_section, should_prioritize_retrieved_context_for_query,
-    verify_answer_against_canonical_evidence,
+    apply_query_execution_library_summary, apply_query_execution_warning, assemble_answer_context,
+    load_query_execution_library_context, render_targeted_evidence_chunk_section,
+    should_prioritize_retrieved_context_for_query, verify_answer_against_canonical_evidence,
 };
 
 const COMPARE_OPERAND_PROBE_LIMIT: usize = 8;
@@ -149,6 +148,7 @@ pub(crate) async fn prepare_answer_query(
         Some(&query_ir),
         &document_index,
         &plan_keywords,
+        &rerank_stage.retrieval.graph_evidence_source_document_ids,
         &mut rerank_stage.retrieval.bundle.chunks,
     )
     .await?;
@@ -459,6 +459,10 @@ pub(crate) async fn generate_answer_query(
         }
     };
 
+    let answer_question = effective_question.trim();
+    let answer_question = if answer_question.is_empty() { user_question } else { answer_question };
+    let generation_question = answer_generation_question(effective_question, user_question);
+
     if let Some(answer) = super::build_ordered_source_units_answer(
         &prepared.query_ir,
         &prepared.structured.ordered_source_units,
@@ -550,7 +554,7 @@ pub(crate) async fn generate_answer_query(
     // no hardcoded domain vocabulary is involved.
     if should_try_single_shot {
         if let AnswerDisposition::Clarify { variants } =
-            classify_answer_disposition(&prepared, user_question)
+            classify_answer_disposition(&prepared, answer_question)
         {
             let clarify_start = std::time::Instant::now();
             tracing::info!(
@@ -565,7 +569,7 @@ pub(crate) async fn generate_answer_query(
             let clarify_result = crate::services::query::agent_loop::run_clarify_turn(
                 state,
                 library_id,
-                user_question,
+                generation_question,
                 conversation_history_messages,
                 &variants,
             )
@@ -638,7 +642,7 @@ pub(crate) async fn generate_answer_query(
         let single_shot_result = crate::services::query::agent_loop::run_single_shot_turn(
             state,
             library_id,
-            user_question,
+            generation_question,
             conversation_history_messages,
             &prepared.answer_context,
         )
@@ -722,7 +726,7 @@ pub(crate) async fn generate_answer_query(
                     match crate::services::query::agent_loop::run_literal_fidelity_revision_turn(
                         state,
                         library_id,
-                        user_question,
+                        generation_question,
                         conversation_history_messages,
                         &verification_stage.generation.answer,
                         &verification_stage.verification.unsupported_literals,
@@ -735,33 +739,46 @@ pub(crate) async fn generate_answer_query(
                                 verification_stage.generation.usage_json.clone(),
                                 &revision.usage_json,
                             );
-                            let revised_stage = verify_generated_answer(
-                                state,
-                                execution_id,
-                                effective_question,
-                                AnswerGenerationStage {
-                                    intent_profile: prepared.structured.intent_profile.clone(),
-                                    canonical_answer_chunks: fast_path_chunks.clone(),
-                                    canonical_evidence: super::CanonicalAnswerEvidence {
-                                        bundle: None,
-                                        chunk_rows: Vec::new(),
-                                        structured_blocks: Vec::new(),
-                                        technical_facts: Vec::new(),
-                                    },
-                                    assistant_grounding: selected_runtime_grounding_evidence(
-                                        &prepared,
-                                        revision.assistant_grounding,
-                                    ),
-                                    answer: revision.answer.clone(),
-                                    provider: revision.provider.clone(),
-                                    usage_json,
-                                    prompt_context: prepared.answer_context.clone(),
-                                    query_ir: prepared.query_ir.clone(),
-                                },
-                            )
-                            .await?;
                             single_debug.extend(revision.debug_iterations);
-                            verification_stage = revised_stage;
+                            if literal_revision_can_replace_answer(
+                                &verification_stage.generation.answer,
+                                &revision.answer,
+                            ) {
+                                let revised_stage = verify_generated_answer(
+                                    state,
+                                    execution_id,
+                                    effective_question,
+                                    AnswerGenerationStage {
+                                        intent_profile: prepared.structured.intent_profile.clone(),
+                                        canonical_answer_chunks: fast_path_chunks.clone(),
+                                        canonical_evidence: super::CanonicalAnswerEvidence {
+                                            bundle: None,
+                                            chunk_rows: Vec::new(),
+                                            structured_blocks: Vec::new(),
+                                            technical_facts: Vec::new(),
+                                        },
+                                        assistant_grounding: selected_runtime_grounding_evidence(
+                                            &prepared,
+                                            revision.assistant_grounding,
+                                        ),
+                                        answer: revision.answer.clone(),
+                                        provider: revision.provider.clone(),
+                                        usage_json,
+                                        prompt_context: prepared.answer_context.clone(),
+                                        query_ir: prepared.query_ir.clone(),
+                                    },
+                                )
+                                .await?;
+                                verification_stage = revised_stage;
+                            } else {
+                                tracing::warn!(
+                                    stage = "answer.single_shot_literal_revision_rejected",
+                                    %execution_id,
+                                    draft_chars = verification_stage.generation.answer.chars().count(),
+                                    revision_chars = revision.answer.chars().count(),
+                                    "literal-fidelity revision did not preserve the answer shape"
+                                );
+                            }
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -807,13 +824,8 @@ pub(crate) async fn generate_answer_query(
                         },
                     )
                     .await?;
-                    let answer_with_sources = append_source_section(
-                        verification_stage.generation.answer,
-                        &prepared.structured.retrieved_documents,
-                        prepared.query_ir.language,
-                    );
                     return Ok(RuntimeAnswerQueryResult {
-                        answer: answer_with_sources,
+                        answer: verification_stage.generation.answer,
                         provider: verification_stage.generation.provider,
                         usage_json: verification_stage.generation.usage_json,
                     });
@@ -919,13 +931,8 @@ pub(crate) async fn generate_answer_query(
             },
         )
         .await?;
-        let answer_with_sources = append_source_section(
-            verification_stage.generation.answer,
-            &prepared.structured.retrieved_documents,
-            prepared.query_ir.language,
-        );
         return Ok(RuntimeAnswerQueryResult {
-            answer: answer_with_sources,
+            answer: verification_stage.generation.answer,
             provider: verification_stage.generation.provider,
             usage_json: verification_stage.generation.usage_json,
         });
@@ -960,7 +967,7 @@ pub(crate) async fn generate_answer_query(
         match crate::services::query::agent_loop::run_single_shot_turn(
             state,
             library_id,
-            user_question,
+            generation_question,
             conversation_history_messages,
             &preflight.prompt_context,
         )
@@ -1008,7 +1015,7 @@ pub(crate) async fn generate_answer_query(
                     match crate::services::query::agent_loop::run_literal_fidelity_revision_turn(
                         state,
                         library_id,
-                        user_question,
+                        generation_question,
                         conversation_history_messages,
                         &verification_stage.generation.answer,
                         &verification_stage.verification.unsupported_literals,
@@ -1021,27 +1028,40 @@ pub(crate) async fn generate_answer_query(
                                 verification_stage.generation.usage_json.clone(),
                                 &revision.usage_json,
                             );
-                            let revised_stage = verify_generated_answer(
-                                state,
-                                execution_id,
-                                effective_question,
-                                AnswerGenerationStage {
-                                    intent_profile: prepared.structured.intent_profile.clone(),
-                                    canonical_answer_chunks:
-                                        preflight.canonical_answer_chunks.clone(),
-                                    canonical_evidence: preflight.canonical_evidence.clone(),
-                                    assistant_grounding:
-                                        crate::services::query::assistant_grounding::AssistantGroundingEvidence::default(),
-                                    answer: revision.answer.clone(),
-                                    provider: revision.provider.clone(),
-                                    usage_json,
-                                    prompt_context: preflight.prompt_context.clone(),
-                                    query_ir: prepared.query_ir.clone(),
-                                },
-                            )
-                            .await?;
                             preflight_debug.extend(revision.debug_iterations);
-                            verification_stage = revised_stage;
+                            if literal_revision_can_replace_answer(
+                                &verification_stage.generation.answer,
+                                &revision.answer,
+                            ) {
+                                let revised_stage = verify_generated_answer(
+                                    state,
+                                    execution_id,
+                                    effective_question,
+                                    AnswerGenerationStage {
+                                        intent_profile: prepared.structured.intent_profile.clone(),
+                                        canonical_answer_chunks:
+                                            preflight.canonical_answer_chunks.clone(),
+                                        canonical_evidence: preflight.canonical_evidence.clone(),
+                                        assistant_grounding:
+                                            crate::services::query::assistant_grounding::AssistantGroundingEvidence::default(),
+                                        answer: revision.answer.clone(),
+                                        provider: revision.provider.clone(),
+                                        usage_json,
+                                        prompt_context: preflight.prompt_context.clone(),
+                                        query_ir: prepared.query_ir.clone(),
+                                    },
+                                )
+                                .await?;
+                                verification_stage = revised_stage;
+                            } else {
+                                tracing::warn!(
+                                    stage = "answer.preflight_single_shot_literal_revision_rejected",
+                                    %execution_id,
+                                    draft_chars = verification_stage.generation.answer.chars().count(),
+                                    revision_chars = revision.answer.chars().count(),
+                                    "literal-fidelity revision did not preserve the answer shape"
+                                );
+                            }
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -1085,13 +1105,8 @@ pub(crate) async fn generate_answer_query(
                         },
                     )
                     .await?;
-                    let answer_with_sources = append_source_section(
-                        verification_stage.generation.answer,
-                        &prepared.structured.retrieved_documents,
-                        prepared.query_ir.language,
-                    );
                     return Ok(RuntimeAnswerQueryResult {
-                        answer: answer_with_sources,
+                        answer: verification_stage.generation.answer,
                         provider: verification_stage.generation.provider,
                         usage_json: verification_stage.generation.usage_json,
                     });
@@ -1192,104 +1207,11 @@ pub(crate) async fn generate_answer_query(
         },
     )
     .await?;
-    let answer_with_sources = append_source_section(
-        candidate.verification_stage.generation.answer,
-        &prepared.structured.retrieved_documents,
-        prepared.query_ir.language,
-    );
     Ok(RuntimeAnswerQueryResult {
-        answer: answer_with_sources,
+        answer: candidate.verification_stage.generation.answer,
         provider: candidate.verification_stage.generation.provider,
         usage_json: candidate.verification_stage.generation.usage_json,
     })
-}
-
-/// Append a deterministic "Sources" section to a final answer when
-/// the retrieval bundle carries resolved document hints that are safe
-/// HTTP(S) URLs. The single-shot prompt already tells the model to cite
-/// document hints inline, but models frequently drop them when
-/// summarising long context, so the runtime guarantees clickable web
-/// citations downstream regardless.
-///
-/// Library-agnostic: we filter to entries whose `document_hint` looks
-/// like an actual URL (`http://` or `https://`) and keep at most
-/// `MAX_APPENDED_SOURCES` unique ones in retrieval order. Non-URL
-/// source pointers (e.g. `upload://…`, `file://…`) are NOT
-/// appended — they're not clickable and only add noise for the
-/// user. The header is picked from the query language so the
-/// surrounding answer stays consistent.
-fn append_source_section(
-    answer: String,
-    retrieved_documents: &[RuntimeRetrievedDocumentBrief],
-    query_language: crate::domains::query_ir::QueryLanguage,
-) -> String {
-    use std::collections::HashSet;
-    if answer.trim().is_empty() {
-        return answer;
-    }
-    // Skip if the model already rendered markdown HTTP(S) citations
-    // inline. Do not treat arbitrary config literals like
-    // `https://<host>/api` as citations; those still need a source
-    // footer.
-    let answer_lower = answer.to_lowercase();
-    if answer_lower.contains("](http://") || answer_lower.contains("](https://") {
-        return answer;
-    }
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut urls: Vec<(String, String)> = Vec::new();
-    for document in retrieved_documents {
-        let Some(source) = document.document_hint.as_deref() else {
-            continue;
-        };
-        let trimmed = source.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_lowercase();
-        // Only treat real HTTP(S) URLs as clickable sources. Upload
-        // placeholders / file: URIs stay out of the appended block.
-        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-            continue;
-        }
-        if answer_lower.contains(&lower) {
-            // Model already cited this URL — don't duplicate.
-            continue;
-        }
-        if !seen.insert(lower) {
-            continue;
-        }
-        let title = document.title.trim().to_string();
-        urls.push((title, trimmed.to_string()));
-        if urls.len() >= MAX_APPENDED_SOURCES {
-            break;
-        }
-    }
-    tracing::info!(
-        stage = "answer.sources_append",
-        candidate_count = retrieved_documents.len(),
-        appended_count = urls.len(),
-        "append_source_section ran"
-    );
-    if urls.is_empty() {
-        return answer;
-    }
-
-    let _ = query_language;
-    let header = "Sources";
-
-    let mut rendered = String::from(&answer);
-    rendered.push_str("\n\n---\n");
-    rendered.push_str(header);
-    rendered.push_str(":\n");
-    for (title, url) in urls {
-        if title.is_empty() {
-            rendered.push_str(&format!("- {url}\n"));
-        } else {
-            rendered.push_str(&format!("- [{title}]({url})\n"));
-        }
-    }
-    rendered
 }
 
 /// Post-retrieval routing decision: should the runtime answer the
@@ -2205,7 +2127,7 @@ fn query_requires_single_shot_focus_support(query_ir: &QueryIR) -> bool {
         return false;
     }
     let intent = detect_technical_literal_intent_from_query_ir("", query_ir);
-    intent.any() || query_ir.document_focus.is_some() || !query_ir.literal_constraints.is_empty()
+    intent.any() || query_ir.document_focus.is_some() || query_ir.has_exact_technical_literal()
 }
 
 fn query_focus_support_segments(query_ir: &QueryIR) -> Vec<BTreeSet<String>> {
@@ -2294,6 +2216,44 @@ fn answer_needs_literal_revision(verification: &AnswerVerificationStage) -> bool
     verification.verification.warnings.iter().any(|warning| {
         warning.code == "unsupported_literal" || warning.code == "unsupported_canonical_claim"
     })
+}
+
+fn answer_generation_question<'a>(effective_question: &'a str, user_question: &'a str) -> &'a str {
+    let user_question = user_question.trim();
+    if !user_question.is_empty() {
+        return user_question;
+    }
+    effective_question.trim()
+}
+
+fn literal_revision_can_replace_answer(draft_answer: &str, revision_answer: &str) -> bool {
+    let draft_chars = draft_answer.trim().chars().count();
+    let revision = revision_answer.trim();
+    let revision_chars = revision.chars().count();
+    if revision_chars == 0 {
+        return false;
+    }
+    if looks_like_internal_effective_query_block(revision) {
+        return false;
+    }
+    if draft_chars >= 600 && revision_chars.saturating_mul(3) < draft_chars {
+        return false;
+    }
+    true
+}
+
+fn looks_like_internal_effective_query_block(value: &str) -> bool {
+    let mut has_scope = false;
+    let mut has_question = false;
+    let mut has_entities = false;
+    let mut line_count = 0usize;
+    for line in value.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        line_count += 1;
+        has_scope |= line.starts_with("scope:");
+        has_question |= line.starts_with("question:");
+        has_entities |= line.starts_with("entities:");
+    }
+    has_scope && has_question && (has_entities || line_count <= 4)
 }
 
 fn selected_runtime_answer_chunks(
@@ -2466,10 +2426,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AnswerDisposition, append_source_section, classify_answer_disposition,
+        AnswerDisposition, answer_generation_question, classify_answer_disposition,
         classify_answer_disposition_from_evidence, classify_answer_disposition_from_groups,
-        selected_runtime_answer_chunks, selected_runtime_grounding_evidence,
-        verify_answer_against_canonical_evidence,
+        literal_revision_can_replace_answer, selected_runtime_answer_chunks,
+        selected_runtime_grounding_evidence, verify_answer_against_canonical_evidence,
     };
     use crate::domains::query::{GroupedReference, GroupedReferenceKind, QueryVerificationState};
     use crate::domains::query_ir::{
@@ -2477,6 +2437,7 @@ mod tests {
         EntityRole, QueryAct, QueryIR, QueryLanguage, QueryScope, UnresolvedRef,
     };
     use crate::services::query::assistant_grounding::AssistantGroundingEvidence;
+    use crate::services::query::execution::RuntimeRetrievedDocumentBrief;
     use crate::services::query::execution::{ConsolidationDiagnostics, FocusReason};
 
     fn sample_ir(confidence: f32, needs_clarification: Option<ClarificationReason>) -> QueryIR {
@@ -2562,8 +2523,33 @@ mod tests {
         ]
     }
 
-    fn retrieved_doc(title: &str, document_hint: &str) -> super::RuntimeRetrievedDocumentBrief {
-        super::RuntimeRetrievedDocumentBrief {
+    #[test]
+    fn answer_generation_question_prefers_original_user_text() {
+        assert_eq!(
+            answer_generation_question(
+                "scope: prior answer\nentities: alpha-one, alpha-two\nquestion: describe each",
+                "describe each",
+            ),
+            "describe each"
+        );
+        assert_eq!(answer_generation_question("compiled focus", "  "), "compiled focus");
+    }
+
+    #[test]
+    fn literal_revision_rejects_internal_query_block_replacement() {
+        let draft = "- `alpha-one` — supported item.\n- `alpha-two` — supported item.";
+        let revision =
+            "scope: prior answer\nentities: alpha-one, alpha-two\nquestion: describe each";
+
+        assert!(!literal_revision_can_replace_answer(draft, revision));
+        assert!(literal_revision_can_replace_answer(
+            draft,
+            "- `alpha-one` — supported item.\n- `alpha-two` — supported item."
+        ));
+    }
+
+    fn retrieved_doc(title: &str, document_hint: &str) -> RuntimeRetrievedDocumentBrief {
+        RuntimeRetrievedDocumentBrief {
             title: title.to_string(),
             preview_excerpt: String::new(),
             document_hint: Some(document_hint.to_string()),
@@ -2620,7 +2606,7 @@ mod tests {
                     warning_kind: None,
                     library_summary: None,
                 },
-                retrieved_documents: vec![super::RuntimeRetrievedDocumentBrief {
+                retrieved_documents: vec![RuntimeRetrievedDocumentBrief {
                     title: "document-a".to_string(),
                     preview_excerpt: "context-fragment-a".to_string(),
                     document_hint: None,
@@ -2871,6 +2857,46 @@ mod tests {
     }
 
     #[test]
+    fn plain_literal_does_not_require_single_shot_focus_support() {
+        let mut ir = sample_ir_with_act(QueryAct::RetrieveValue, 0.8, None);
+        ir.target_types = vec!["concept".to_string()];
+        ir.target_entities = Vec::new();
+        ir.literal_constraints = vec![crate::domains::query_ir::LiteralSpan {
+            text: "alpha".to_string(),
+            kind: crate::domains::query_ir::LiteralKind::Identifier,
+        }];
+
+        assert!(!super::query_requires_single_shot_focus_support(&ir));
+
+        ir.literal_constraints = vec![crate::domains::query_ir::LiteralSpan {
+            text: "callbackUrl".to_string(),
+            kind: crate::domains::query_ir::LiteralKind::Identifier,
+        }];
+
+        assert!(super::query_requires_single_shot_focus_support(&ir));
+    }
+
+    #[test]
+    fn configure_how_exact_literal_requires_single_shot_focus_support() {
+        let mut ir = sample_ir_with_act(QueryAct::ConfigureHow, 0.8, None);
+        ir.target_types = vec!["concept".to_string()];
+        ir.target_entities = Vec::new();
+        ir.literal_constraints = vec![crate::domains::query_ir::LiteralSpan {
+            text: "alpha".to_string(),
+            kind: crate::domains::query_ir::LiteralKind::Other,
+        }];
+
+        assert!(!super::query_requires_single_shot_focus_support(&ir));
+
+        ir.literal_constraints = vec![crate::domains::query_ir::LiteralSpan {
+            text: "2.4.1".to_string(),
+            kind: crate::domains::query_ir::LiteralKind::Version,
+        }];
+
+        assert!(super::query_requires_single_shot_focus_support(&ir));
+    }
+
+    #[test]
     fn compare_without_structural_operands_skips_initial_fast_path() {
         let prepared = prepared_for_single_shot(sample_ir_with_act(QueryAct::Compare, 0.8, None));
 
@@ -2956,42 +2982,6 @@ mod tests {
             matches!(coverage, super::EvidenceCoverage::Insufficient("compare_evidence_empty")),
             "internal coverage markers must not become synthetic evidence"
         );
-    }
-
-    #[test]
-    fn append_source_section_skips_when_answer_already_has_http_citations() {
-        let answer = "See [relevant doc](https://example.test/relevant) for setup.".to_string();
-        let rendered = append_source_section(
-            answer.clone(),
-            &[retrieved_doc("Unrelated tail", "https://example.test/unrelated")],
-            QueryLanguage::Ru,
-        );
-
-        assert_eq!(rendered, answer);
-    }
-
-    #[test]
-    fn append_source_section_adds_source_when_answer_has_no_links() {
-        let rendered = append_source_section(
-            "Configure the module via the configuration file.".to_string(),
-            &[retrieved_doc("Config guide", "https://example.test/config")],
-            QueryLanguage::Ru,
-        );
-
-        assert!(rendered.contains("Sources:"));
-        assert!(rendered.contains("https://example.test/config"));
-    }
-
-    #[test]
-    fn append_source_section_does_not_treat_config_url_literal_as_citation() {
-        let rendered = append_source_section(
-            "The url parameter is set as `https://<localhost>/api`.".to_string(),
-            &[retrieved_doc("Config guide", "https://example.test/config")],
-            QueryLanguage::Ru,
-        );
-
-        assert!(rendered.contains("Sources:"));
-        assert!(rendered.contains("https://example.test/config"));
     }
 
     #[test]

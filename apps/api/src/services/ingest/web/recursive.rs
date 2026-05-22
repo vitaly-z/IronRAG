@@ -427,6 +427,55 @@ pub(super) async fn discover_recursive_scope(
                 continue;
             }
 
+            if is_direct_image_web_resource(&resource.final_url, resource.content_type.as_deref()) {
+                let candidate_row = ingest_repository::update_web_discovered_page(
+                    &state.persistence.postgres,
+                    candidate.id,
+                    &crate::infra::repositories::ingest_repository::UpdateWebDiscoveredPage {
+                        final_url: Some(resource.final_url.as_str()),
+                        canonical_url: Some(resource_canonical_url.as_str()),
+                        host_classification: Some(host_classification_label),
+                        candidate_state: WebCandidateState::Excluded.as_str(),
+                        classification_reason: Some(
+                            WebClassificationReason::UnsupportedContent.as_str(),
+                        ),
+                        classification_detail: Some("embedded_web_resource:image"),
+                        content_type: resource.content_type.as_deref(),
+                        http_status: Some(resource.http_status),
+                        snapshot_storage_key: None,
+                        updated_at: Some(Utc::now()),
+                        document_id: None,
+                        result_revision_id: None,
+                        mutation_item_id: None,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    error!(
+                        run_id = %run.id,
+                        candidate_id = %candidate.id,
+                        normalized_url = %candidate.normalized_url,
+                        final_url = %resource.final_url,
+                        content_type = ?resource.content_type,
+                        db_error = %error,
+                        "web ingest failed to persist direct image resource exclusion"
+                    );
+                    ApiError::Internal
+                })?
+                .ok_or_else(|| ApiError::resource_not_found("web_discovered_page", candidate.id))?;
+                telemetry::web_candidate_event(
+                    "candidate_excluded_embedded_resource",
+                    run.id,
+                    candidate_row.id,
+                    WebCandidateState::Excluded.as_str(),
+                    &candidate_row.normalized_url,
+                    candidate_row.depth,
+                    Some(WebClassificationReason::UnsupportedContent.as_str()),
+                    Some("embedded_web_resource:image"),
+                );
+                continue;
+            }
+
             let snapshot_storage_key = service
                 .persist_resource_snapshot(state, run, &resource)
                 .await
@@ -1105,18 +1154,18 @@ pub(super) async fn discover_outbound_links(
         )
         .await
         .map_err(|e| ApiError::internal_with_log(e, "internal"))?;
-    Ok(extraction_plan
-        .source_map
-        .get("outboundLinks")
-        .and_then(serde_json::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default())
+    let mut discovered = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    for key in ["outboundLinks", "outboundResources"] {
+        if let Some(values) =
+            extraction_plan.source_map.get(key).and_then(serde_json::Value::as_array)
+        {
+            for value in values.iter().filter_map(serde_json::Value::as_str).map(str::trim) {
+                if !value.is_empty() && seen.insert(value.to_string()) {
+                    discovered.push(value.to_string());
+                }
+            }
+        }
+    }
+    Ok(discovered)
 }

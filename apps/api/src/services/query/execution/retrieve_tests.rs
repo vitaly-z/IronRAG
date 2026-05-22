@@ -5,20 +5,24 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::super::{
-    is_table_analytics_chunk, merge_canonical_table_aggregation_chunks,
-    requested_initial_table_row_count,
+    graph_target_entity_profiles, is_table_analytics_chunk,
+    merge_canonical_table_aggregation_chunks, requested_initial_table_row_count,
+    source_slice_context_top_k,
 };
 use super::{
     DOCUMENT_IDENTITY_SCORE_FLOOR, RuntimeChunkScoreKind, apply_graph_evidence_texts_to_chunks,
     canonical_document_revision_id, chunk_answer_source_text, combine_chunk_retrieval_lanes,
     combine_lexical_query_results, combine_query_ir_focus_search_results,
-    document_identity_chunk_score, entity_bio_chunk_score, graph_evidence_chunk_hits_from_rows,
-    graph_evidence_chunk_score, graph_evidence_context_line, graph_evidence_targets,
-    graph_evidence_targets_for_query, graph_target_entity_profiles, latest_version_documents,
-    map_chunk_hit, merge_chunks, merge_entity_bio_chunks, merge_graph_evidence_chunks,
-    merge_query_ir_focus_chunks, query_ir_focus_chunk_score, query_ir_focus_search_queries,
-    query_ir_lexical_focus_queries, rank_graph_evidence_context_rows,
-    retain_canonical_document_head_chunks, retain_entity_bio_candidates, truncate_bundle,
+    document_identity_chunk_score, document_identity_focus_terms, entity_bio_chunk_score,
+    graph_evidence_chunk_hits_from_rows, graph_evidence_chunk_score, graph_evidence_context_line,
+    graph_evidence_source_document_ids, graph_evidence_source_document_ids_from_scored_targets,
+    graph_evidence_source_document_ids_with_priority, graph_evidence_targets,
+    graph_evidence_targets_for_query, latest_version_documents, linked_anchor_focus_queries,
+    linked_anchor_hydration_target_filter, map_chunk_hit, merge_chunks, merge_entity_bio_chunks,
+    merge_graph_evidence_chunks, merge_query_ir_focus_chunks, query_ir_focus_chunk_score,
+    query_ir_focus_search_queries, query_ir_lexical_focus_queries,
+    rank_graph_evidence_context_rows, retain_canonical_document_head_chunks,
+    retain_entity_bio_candidates, truncate_bundle,
 };
 use crate::domains::query_ir::{
     ComparisonSpec, DocumentHint, EntityMention, EntityRole, LiteralKind, LiteralSpan, QueryAct,
@@ -70,6 +74,19 @@ fn release_query_ir(count: Option<&str>, entity: Option<&str>) -> QueryIR {
     }
 }
 
+fn release_query_ir_with_source_slice_count(count: Option<u16>) -> QueryIR {
+    release_query_ir_with_source_slice(SourceSliceDirection::Tail, count)
+}
+
+fn release_query_ir_with_source_slice(
+    direction: SourceSliceDirection,
+    count: Option<u16>,
+) -> QueryIR {
+    let mut ir = release_query_ir(None, None);
+    ir.source_slice = Some(SourceSliceSpec { direction, count });
+    ir
+}
+
 fn target_entities_query_ir(target_labels: &[&str]) -> QueryIR {
     QueryIR {
         act: QueryAct::RetrieveValue,
@@ -89,6 +106,86 @@ fn target_entities_query_ir(target_labels: &[&str]) -> QueryIR {
         source_slice: None,
         confidence: 1.0,
     }
+}
+
+#[test]
+fn document_identity_focus_terms_include_structural_prefixes() {
+    let mut query_ir = target_entities_query_ir(&["integrated connector", "connection variants"]);
+    query_ir.document_focus = Some(DocumentHint { hint: "Alpha Suite setup".to_string() });
+
+    let terms = document_identity_focus_terms(&["setup".to_string()], Some(&query_ir));
+
+    assert!(terms.contains(&"Alpha Suite setup".to_string()));
+    assert!(terms.contains(&"integrated connector".to_string()));
+    assert!(terms.contains(&"integr".to_string()));
+    assert!(terms.contains(&"connec".to_string()));
+}
+
+#[test]
+fn linked_anchor_focus_queries_follow_relevant_source_links() {
+    let source_chunk = RuntimeMatchedChunk {
+        chunk_id: Uuid::now_v7(),
+        document_id: Uuid::now_v7(),
+        revision_id: Uuid::now_v7(),
+        chunk_index: 0,
+        chunk_kind: Some("paragraph".to_string()),
+        document_label: "Alpha Suite overview".to_string(),
+        excerpt: "See [Integrated connector catalog](/connectors) for details.".to_string(),
+        score_kind: RuntimeChunkScoreKind::Relevance,
+        score: Some(1.0),
+        source_text:
+            "See [Integrated connector catalog](/connectors) for details. Also [Support](/support)."
+                .to_string(),
+    };
+    let queries = linked_anchor_focus_queries(
+        "Which integration connectors are available?",
+        None,
+        &[],
+        &[source_chunk],
+    );
+
+    assert_eq!(
+        queries,
+        vec![
+            "Integrated connector catalog".to_string(),
+            "integra connector catalog".to_string(),
+            "integrated connect catalog".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn linked_anchor_focus_queries_add_numeric_free_prefix_variants() {
+    let source_chunk = RuntimeMatchedChunk {
+        chunk_id: Uuid::now_v7(),
+        document_id: Uuid::now_v7(),
+        revision_id: Uuid::now_v7(),
+        chunk_index: 0,
+        chunk_kind: Some("paragraph".to_string()),
+        document_label: "Alpha Suite overview".to_string(),
+        excerpt: "See [15 integrated connectors](/connectors) for details.".to_string(),
+        score_kind: RuntimeChunkScoreKind::Relevance,
+        score: Some(1.0),
+        source_text: "See [15 integrated connectors](/connectors) for details.".to_string(),
+    };
+    let queries = linked_anchor_focus_queries(
+        "Which integration connectors are available?",
+        None,
+        &[],
+        &[source_chunk],
+    );
+
+    assert!(queries.contains(&"15 integrated connectors".to_string()));
+    assert!(queries.contains(&"integrated connectors".to_string()));
+    assert!(queries.contains(&"integra connectors".to_string()));
+}
+
+#[test]
+fn linked_anchor_hydration_is_cross_document() {
+    assert!(
+        linked_anchor_hydration_target_filter().is_empty(),
+        "linked markdown anchors point at related documents, so hydration must not inherit the source document scope filter"
+    );
 }
 
 #[test]
@@ -250,6 +347,15 @@ fn requested_initial_table_row_count_uses_typed_source_slice() {
 #[test]
 fn latest_version_question_detection_uses_query_ir() {
     assert!(query_requests_latest_versions(&release_query_ir(Some("5"), None)));
+    assert!(query_requests_latest_versions(&release_query_ir_with_source_slice_count(Some(5))));
+    assert!(!query_requests_latest_versions(&release_query_ir_with_source_slice(
+        SourceSliceDirection::Head,
+        Some(5)
+    )));
+    assert!(!query_requests_latest_versions(&release_query_ir_with_source_slice(
+        SourceSliceDirection::All,
+        Some(5)
+    )));
     let mut ir = release_query_ir(None, None);
     ir.target_types.clear();
     assert!(!query_requests_latest_versions(&ir));
@@ -261,11 +367,40 @@ fn requested_latest_version_count_defaults_and_caps() {
     assert_eq!(requested_latest_version_count(&release_query_ir(Some("3"), None)), 3);
     assert_eq!(requested_latest_version_count(&release_query_ir(Some("100"), None)), 10);
     assert_eq!(requested_latest_version_count(&release_query_ir(Some("2024"), None)), 5);
+    assert_eq!(
+        requested_latest_version_count(&release_query_ir_with_source_slice_count(Some(10))),
+        10
+    );
+    assert_eq!(
+        requested_latest_version_count(&release_query_ir_with_source_slice_count(Some(42))),
+        10
+    );
+    assert_eq!(
+        requested_latest_version_count(&release_query_ir_with_source_slice_count(Some(0))),
+        1
+    );
+    assert_eq!(requested_latest_version_count(&release_query_ir_with_source_slice_count(None)), 5);
+
+    let mut source_slice_ir = release_query_ir(Some("3"), None);
+    source_slice_ir.source_slice =
+        Some(SourceSliceSpec { direction: SourceSliceDirection::Tail, count: Some(8) });
+    assert_eq!(requested_latest_version_count(&source_slice_ir), 8);
 }
 
 #[test]
 fn latest_version_chunk_merge_limit_preserves_requested_document_coverage() {
     assert_eq!(latest_version_context_top_k(&release_query_ir(Some("10"), None), 8), 40);
+    assert_eq!(
+        latest_version_context_top_k(&release_query_ir_with_source_slice_count(Some(10)), 8),
+        40
+    );
+    assert_eq!(
+        latest_version_context_top_k(
+            &release_query_ir_with_source_slice(SourceSliceDirection::Head, Some(10)),
+            8
+        ),
+        8
+    );
     assert_eq!(latest_version_context_top_k(&release_query_ir(Some("3"), None), 20), 20);
 }
 
@@ -573,6 +708,32 @@ fn runtime_chunk(label: &str, score: f32) -> RuntimeMatchedChunk {
     }
 }
 
+fn latest_version_identity_chunk(
+    document_id: Uuid,
+    requested_count: usize,
+    document_rank: usize,
+    chunk_rank: usize,
+) -> RuntimeMatchedChunk {
+    let score = latest_version_chunk_score(
+        DOCUMENT_IDENTITY_SCORE_FLOOR,
+        requested_count,
+        document_rank,
+        chunk_rank,
+    );
+    RuntimeMatchedChunk {
+        chunk_id: Uuid::now_v7(),
+        revision_id: Uuid::now_v7(),
+        chunk_index: chunk_rank as i32,
+        chunk_kind: Some("paragraph".to_string()),
+        document_id,
+        document_label: format!("Release {document_rank}"),
+        excerpt: format!("release {document_rank} chunk {chunk_rank}"),
+        score_kind: RuntimeChunkScoreKind::DocumentIdentity,
+        score: Some(score),
+        source_text: format!("release {document_rank} chunk {chunk_rank}"),
+    }
+}
+
 #[test]
 fn merge_chunks_preserves_identity_scale_scores() {
     let ordinary = runtime_chunk("ordinary", 10.0);
@@ -625,6 +786,56 @@ fn truncate_bundle_preserves_runtime_evidence_lanes() {
 
     assert!(bundle.chunks.iter().any(|chunk| chunk.chunk_id == graph_evidence.chunk_id));
     assert_eq!(bundle.chunks[0].chunk_id, graph_evidence.chunk_id);
+}
+
+#[test]
+fn truncate_bundle_expands_entity_budget_for_inventory_queries() {
+    let entities = (0..12)
+        .map(|index| RuntimeMatchedEntity {
+            node_id: Uuid::now_v7(),
+            label: format!("Package {index:02}"),
+            node_type: "artifact".to_string(),
+            summary: None,
+            score: Some(1.0),
+        })
+        .collect::<Vec<_>>();
+    let chunks =
+        (0..12).map(|index| runtime_chunk(&format!("chunk-{index:02}"), 1.0)).collect::<Vec<_>>();
+    let mut bundle = RetrievalBundle { entities, relationships: Vec::new(), chunks };
+    let query_ir = release_query_ir(None, Some("package-*"));
+
+    truncate_bundle(&mut bundle, 4, Some(&query_ir));
+
+    assert_eq!(bundle.entities.len(), 12);
+    assert_eq!(bundle.chunks.len(), 4);
+}
+
+#[test]
+fn truncate_bundle_keeps_requested_latest_version_document_coverage() {
+    let requested_count = 10;
+    let document_ids = (0..requested_count).map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    for chunk_rank in 0..2 {
+        for (document_rank, document_id) in document_ids.iter().copied().enumerate() {
+            chunks.push(latest_version_identity_chunk(
+                document_id,
+                requested_count,
+                document_rank,
+                chunk_rank,
+            ));
+        }
+    }
+    let mut query_ir = release_query_ir_with_source_slice_count(Some(requested_count as u16));
+    query_ir.scope = QueryScope::SingleDocument;
+    let effective_top_k = source_slice_context_top_k(&query_ir, 8);
+    let mut bundle = RetrievalBundle { entities: Vec::new(), relationships: Vec::new(), chunks };
+
+    truncate_bundle(&mut bundle, effective_top_k, Some(&query_ir));
+
+    let retained_documents =
+        bundle.chunks.iter().map(|chunk| chunk.document_id).collect::<HashSet<_>>();
+    assert_eq!(effective_top_k, 11);
+    assert_eq!(retained_documents.len(), requested_count);
 }
 
 #[test]
@@ -778,12 +989,14 @@ fn graph_evidence_targets_preserve_graph_order_and_dedupe() {
             node_id,
             label: "Archive".to_string(),
             node_type: "artifact".to_string(),
+            summary: None,
             score: Some(1.0),
         },
         RuntimeMatchedEntity {
             node_id,
             label: "Archive".to_string(),
             node_type: "artifact".to_string(),
+            summary: None,
             score: Some(0.5),
         },
     ];
@@ -819,7 +1032,7 @@ fn graph_evidence_targets_for_query_include_lexical_node_outside_visible_bundle(
         ..build_query_plan("Which endpoint does the needle setup use?", None, Some(8), None)
     };
 
-    let targets = graph_evidence_targets_for_query(&[], &[], &plan, None, &graph_index);
+    let targets = graph_evidence_targets_for_query(&[], &[], &plan, None, &[], &graph_index);
 
     assert!(targets.contains(&("node".to_string(), needle.id)));
 }
@@ -842,13 +1055,130 @@ fn graph_evidence_targets_for_query_keep_retrieved_bundle_targets_first() {
         node_id: bundle_node.id,
         label: bundle_node.label.clone(),
         node_type: bundle_node.node_type.clone(),
+        summary: None,
         score: Some(0.1),
     }];
 
-    let targets = graph_evidence_targets_for_query(&entities, &[], &plan, None, &graph_index);
+    let targets = graph_evidence_targets_for_query(&entities, &[], &plan, None, &[], &graph_index);
 
     assert_eq!(targets.first(), Some(&("node".to_string(), bundle_node.id)));
     assert!(targets.contains(&("node".to_string(), query_node.id)));
+}
+
+#[test]
+fn graph_evidence_targets_for_query_return_full_bundle_without_supplemental_targets() {
+    let bundle_nodes = (0..48)
+        .map(|index| runtime_graph_node(&format!("Bundle target {index:02}"), "artifact", None))
+        .collect::<Vec<_>>();
+    let query_node = runtime_graph_node(
+        "Needle Endpoint",
+        "artifact",
+        Some("Contains the rare configuration endpoint"),
+    );
+    let mut graph_nodes = bundle_nodes.clone();
+    graph_nodes.push(query_node.clone());
+    let graph_index = graph_index_with_nodes(graph_nodes);
+    let plan = RuntimeQueryPlan {
+        keywords: vec!["needle".to_string(), "endpoint".to_string()],
+        entity_keywords: vec!["needle".to_string(), "endpoint".to_string()],
+        ..build_query_plan("Which endpoint does the needle setup use?", None, Some(8), None)
+    };
+    let entities = bundle_nodes
+        .iter()
+        .map(|node| RuntimeMatchedEntity {
+            node_id: node.id,
+            label: node.label.clone(),
+            node_type: node.node_type.clone(),
+            summary: None,
+            score: Some(0.1),
+        })
+        .collect::<Vec<_>>();
+
+    let targets = graph_evidence_targets_for_query(&entities, &[], &plan, None, &[], &graph_index);
+
+    assert_eq!(targets.len(), 48);
+    assert!(!targets.contains(&("node".to_string(), query_node.id)));
+}
+
+#[test]
+fn graph_evidence_targets_for_query_prioritize_explicit_targets_under_cap_pressure() {
+    let bundle_nodes = (0..48)
+        .map(|index| runtime_graph_node(&format!("Bundle target {index:02}"), "artifact", None))
+        .collect::<Vec<_>>();
+    let query_node = runtime_graph_node(
+        "Needle Endpoint",
+        "artifact",
+        Some("Contains the rare configuration endpoint"),
+    );
+    let mut graph_nodes = bundle_nodes.clone();
+    graph_nodes.push(query_node.clone());
+    let graph_index = graph_index_with_nodes(graph_nodes);
+    let plan = RuntimeQueryPlan {
+        keywords: vec!["needle".to_string(), "endpoint".to_string()],
+        entity_keywords: vec!["needle".to_string(), "endpoint".to_string()],
+        ..build_query_plan("Which endpoint does the needle setup use?", None, Some(8), None)
+    };
+    let entities = bundle_nodes
+        .iter()
+        .map(|node| RuntimeMatchedEntity {
+            node_id: node.id,
+            label: node.label.clone(),
+            node_type: node.node_type.clone(),
+            summary: None,
+            score: Some(0.1),
+        })
+        .collect::<Vec<_>>();
+    let ir = target_entities_query_ir(&["Needle"]);
+    let target_entity_profiles = graph_target_entity_profiles(Some(&ir), &graph_index);
+
+    let targets = graph_evidence_targets_for_query(
+        &entities,
+        &[],
+        &plan,
+        Some(&ir),
+        &target_entity_profiles,
+        &graph_index,
+    );
+
+    assert_eq!(targets.len(), 48);
+    assert_eq!(targets.first(), Some(&("node".to_string(), query_node.id)));
+    assert!(targets.contains(&("node".to_string(), bundle_nodes[0].id)));
+}
+
+#[test]
+fn graph_evidence_targets_for_query_can_use_document_nodes_as_source_anchors() {
+    let bundle_nodes = (0..48)
+        .map(|index| runtime_graph_node(&format!("Bundle target {index:02}"), "artifact", None))
+        .collect::<Vec<_>>();
+    let target_document =
+        runtime_graph_node("Acmealpha setup guide", "document", Some("Focused configuration"));
+    let mut graph_nodes = bundle_nodes.clone();
+    graph_nodes.push(target_document.clone());
+    let graph_index = graph_index_with_nodes(graph_nodes);
+    let plan = build_query_plan("show the acmew configuration steps", None, Some(8), None);
+    let entities = bundle_nodes
+        .iter()
+        .map(|node| RuntimeMatchedEntity {
+            node_id: node.id,
+            label: node.label.clone(),
+            node_type: node.node_type.clone(),
+            summary: None,
+            score: Some(0.1),
+        })
+        .collect::<Vec<_>>();
+    let ir = target_entities_query_ir(&["Acmew"]);
+    let target_entity_profiles = graph_target_entity_profiles(Some(&ir), &graph_index);
+
+    let targets = graph_evidence_targets_for_query(
+        &entities,
+        &[],
+        &plan,
+        Some(&ir),
+        &target_entity_profiles,
+        &graph_index,
+    );
+
+    assert_eq!(targets.first(), Some(&("node".to_string(), target_document.id)));
 }
 
 #[test]
@@ -864,7 +1194,15 @@ fn graph_evidence_targets_for_query_keep_multi_anchor_node_under_target_cap_pres
     let plan = build_query_plan("find Beacon near Harbor Delta", None, Some(8), None);
     let ir = target_entities_query_ir(&["Beacon", "Harbor Delta"]);
 
-    let targets = graph_evidence_targets_for_query(&[], &[], &plan, Some(&ir), &graph_index);
+    let target_entity_profiles = graph_target_entity_profiles(Some(&ir), &graph_index);
+    let targets = graph_evidence_targets_for_query(
+        &[],
+        &[],
+        &plan,
+        Some(&ir),
+        &target_entity_profiles,
+        &graph_index,
+    );
 
     assert!(
         targets.contains(&("node".to_string(), composite.id)),
@@ -886,11 +1224,40 @@ fn graph_evidence_text_replaces_weak_support_chunk_text() {
         std::slice::from_mut(&mut chunk),
         &evidence_texts_by_chunk,
         &["alpha".to_string(), "9407".to_string()],
+        &["alpha".to_string(), "9407".to_string()],
     );
 
     assert!(chunk.source_text.starts_with("Needle setting: alpha.path"));
     assert!(chunk.source_text.contains("Source chunk:"));
     assert!(chunk.excerpt.contains("alpha.path"));
+}
+
+#[test]
+fn graph_evidence_text_overlay_focuses_long_mixed_rows() {
+    let mut chunk = runtime_chunk("generic support chunk", 1.0);
+    let chunk_id = chunk.chunk_id;
+    let filler = (0..80)
+        .map(|index| format!("Generic section {index}: profile forms and archive notes."))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut evidence_texts_by_chunk = HashMap::new();
+    evidence_texts_by_chunk.insert(
+        chunk_id,
+        vec![format!(
+            "{filler} | Checkout connectors: Provider One, Provider Two, custom gateway | More unrelated CRM material."
+        )],
+    );
+
+    apply_graph_evidence_texts_to_chunks(
+        std::slice::from_mut(&mut chunk),
+        &evidence_texts_by_chunk,
+        &["checkout".to_string(), "connectors".to_string()],
+        &["checkout".to_string(), "connectors".to_string(), "gateway".to_string()],
+    );
+
+    assert!(chunk.source_text.contains("Checkout connectors"));
+    assert!(chunk.source_text.contains("custom gateway"));
+    assert!(!chunk.source_text.contains("Generic section 0"));
 }
 
 #[test]
@@ -913,6 +1280,46 @@ fn graph_evidence_chunk_hits_use_ranked_text_rows_as_chunk_candidates() {
 }
 
 #[test]
+fn graph_evidence_source_document_ids_preserve_rank_order_without_duplicates() {
+    let target_id = Uuid::now_v7();
+    let first_document_id = Uuid::now_v7();
+    let second_document_id = Uuid::now_v7();
+    let mut first = runtime_graph_evidence_row(target_id, "Alpha setup overview");
+    first.document_id = Some(first_document_id);
+    first.chunk_id = None;
+    let mut duplicate = runtime_graph_evidence_row(target_id, "Alpha setup detail");
+    duplicate.document_id = Some(first_document_id);
+    duplicate.chunk_id = Some(Uuid::now_v7());
+    let mut second = runtime_graph_evidence_row(target_id, "Beta setup overview");
+    second.document_id = Some(second_document_id);
+    second.chunk_id = None;
+    let mut orphan = runtime_graph_evidence_row(target_id, "Detached summary");
+    orphan.document_id = None;
+
+    let document_ids = graph_evidence_source_document_ids(&[first, duplicate, orphan, second]);
+
+    assert_eq!(document_ids, vec![first_document_id, second_document_id]);
+}
+
+#[test]
+fn graph_evidence_source_document_ids_with_priority_prepend_target_documents() {
+    let target_id = Uuid::now_v7();
+    let ranked_first_document_id = Uuid::now_v7();
+    let target_document_id = Uuid::now_v7();
+    let mut ranked_first = runtime_graph_evidence_row(target_id, "Broad setup overview");
+    ranked_first.document_id = Some(ranked_first_document_id);
+    let mut ranked_target = runtime_graph_evidence_row(target_id, "Focused setup detail");
+    ranked_target.document_id = Some(target_document_id);
+
+    let document_ids = graph_evidence_source_document_ids_with_priority(
+        &[target_document_id],
+        &[ranked_first, ranked_target],
+    );
+
+    assert_eq!(document_ids, vec![target_document_id, ranked_first_document_id]);
+}
+
+#[test]
 fn graph_evidence_context_line_formats_delimited_row_fields() {
     let graph_index = graph_index_with_nodes(Vec::new());
     let row = RuntimeGraphEvidenceRow {
@@ -929,11 +1336,89 @@ fn graph_evidence_context_line_formats_delimited_row_fields() {
         created_at: Utc::now(),
     };
 
-    let line = graph_evidence_context_line(&row, &graph_index).expect("graph evidence line");
+    let line = graph_evidence_context_line(&row, &graph_index, &[]).expect("graph evidence line");
 
     assert!(line.contains("[graph-evidence source=\"alpha-source\"]"));
     assert!(line.contains("- Column Alpha: keep A"));
     assert!(line.contains("- Column Beta: keep B"));
+}
+
+#[test]
+fn graph_evidence_context_line_focuses_long_mixed_rows() {
+    let target = runtime_graph_node("Alpha Suite", "artifact", None);
+    let graph_index = graph_index_with_nodes(vec![target.clone()]);
+    let filler = (0..80)
+        .map(|index| format!("Generic section {index}: customer forms and archive notes."))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let row = runtime_graph_evidence_row(
+        target.id,
+        &format!(
+            "{filler} | Checkout connectors: Provider One, Provider Two, custom gateway | More unrelated CRM material after the focused sentence."
+        ),
+    );
+
+    let line = graph_evidence_context_line(
+        &row,
+        &graph_index,
+        &["checkout".to_string(), "connectors".to_string(), "gateway".to_string()],
+    )
+    .expect("graph evidence line");
+
+    assert!(line.contains("Checkout connectors"));
+    assert!(line.contains("custom gateway"));
+    assert!(!line.contains("Generic section 0"));
+}
+
+#[test]
+fn graph_evidence_source_document_ids_from_scored_targets_promote_structural_target_document() {
+    let broad_target = runtime_graph_node("General configuration", "concept", None);
+    let focused_target = runtime_graph_node("Needle gateway", "artifact", None);
+    let graph_index = graph_index_with_nodes(vec![broad_target.clone(), focused_target.clone()]);
+    let target_entity_profiles =
+        graph_target_entity_profiles(Some(&target_entities_query_ir(&["Needle"])), &graph_index);
+    let broad_document_id = Uuid::now_v7();
+    let focused_document_id = Uuid::now_v7();
+    let mut broad = runtime_graph_evidence_row(
+        broad_target.id,
+        "Configuration appendix | file: /srv/common.ini | option: enabled",
+    );
+    broad.document_id = Some(broad_document_id);
+    broad.source_file_name = Some("general configuration".to_string());
+    let mut focused = runtime_graph_evidence_row(
+        focused_target.id,
+        "Gateway setup | file: /srv/needle.ini | option: enabled",
+    );
+    focused.document_id = Some(focused_document_id);
+    focused.source_file_name = Some("needle gateway setup".to_string());
+
+    let document_ids = graph_evidence_source_document_ids_from_scored_targets(
+        &[broad, focused],
+        "Where is the Needle gateway configuration file?",
+        &["Needle gateway configuration".to_string()],
+        &graph_index,
+        &target_entity_profiles,
+    );
+
+    assert_eq!(document_ids.first(), Some(&focused_document_id));
+}
+
+#[test]
+fn graph_evidence_source_document_ids_from_scored_targets_skip_zero_signal_documents() {
+    let target = runtime_graph_node("Archive index", "concept", None);
+    let graph_index = graph_index_with_nodes(vec![target.clone()]);
+    let mut row = runtime_graph_evidence_row(target.id, "Archive index | owner: operations");
+    row.document_id = Some(Uuid::now_v7());
+
+    let document_ids = graph_evidence_source_document_ids_from_scored_targets(
+        &[row],
+        "Where is the Needle gateway configuration file?",
+        &["Needle gateway configuration".to_string()],
+        &graph_index,
+        &[],
+    );
+
+    assert!(document_ids.is_empty());
 }
 
 #[test]

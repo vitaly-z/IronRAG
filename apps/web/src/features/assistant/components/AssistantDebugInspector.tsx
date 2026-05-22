@@ -21,7 +21,6 @@ import {
   Loader2,
   MessageSquare,
   ScrollText,
-  Sparkles,
   Wrench,
   X,
 } from 'lucide-react';
@@ -32,7 +31,33 @@ import type { EvidenceBundle } from '@/shared/types';
 const DEBUG_PANEL_MIN_WIDTH = 420;
 const DEBUG_PANEL_MAX_WIDTH = 960;
 
-type InspectorView = 'timeline' | 'tools' | 'context' | 'raw';
+type InspectorView = 'timeline' | 'context' | 'raw';
+
+type ContextToolCallPreview = {
+  id: string;
+  name: string;
+  argumentsJson: string;
+  isError: boolean;
+};
+
+type ContextTranscriptPhase = 'request' | 'model' | 'tool' | 'final';
+
+type ContextTranscriptEntry = {
+  key: string;
+  role: string;
+  phase: ContextTranscriptPhase;
+  content?: string | null;
+  toolCallId?: string | null;
+  toolName?: string | null;
+  toolCalls?: ContextToolCallPreview[];
+  resultJson?: unknown;
+  isError?: boolean;
+};
+
+type ContextTranscriptSection = {
+  iteration: number;
+  entries: ContextTranscriptEntry[];
+};
 
 type AssistantDebugInspectorProps = {
   t: TFunction;
@@ -184,27 +209,77 @@ export function AssistantDebugInspector({
     (sum, iter) => sum + iter.responseToolCalls.length,
     0,
   );
-  const toolCalls = iterations.flatMap((iter) =>
-    iter.responseToolCalls.map((toolCall, index) => ({
-      ...toolCall,
-      displayIndex: index + 1,
-      iteration: iter.iteration,
-      iterationDisplayIndex: iter.displayIndex,
-      modelName: iter.modelName,
-      providerKind: iter.providerKind,
-    })),
-  );
-  const messageCount = iterations.reduce((sum, iter) => sum + iter.requestMessages.length, 0);
   const summary = evidence?.runtimeSummary;
   const finalAnswer = snapshot?.finalAnswer ?? null;
   const lastIterationResponse = iterations[iterations.length - 1]?.responseText ?? null;
-  const showFinalAnswer = Boolean(
-    finalAnswer && finalAnswer.trim() && finalAnswer.trim() !== (lastIterationResponse ?? '').trim(),
+  const latestIteration = iterations[iterations.length - 1] ?? null;
+  const contextSections: ContextTranscriptSection[] = latestIteration ? (() => {
+    const entries: ContextTranscriptEntry[] = latestIteration.requestMessages.map((message, index) => ({
+      key: `request-${latestIteration.iteration}-${index}`,
+      role: message.role,
+      phase: 'request',
+      content: message.content,
+      toolCallId: message.tool_call_id,
+      toolName: message.name,
+      toolCalls: message.tool_calls?.map(toolCall => ({
+        id: toolCall.id,
+        name: toolCall.name,
+        argumentsJson: toolCall.arguments_json,
+        isError: false,
+      })),
+    }));
+
+    if (latestIteration.responseToolCalls.length > 0) {
+      entries.push({
+        key: `assistant-response-${latestIteration.iteration}`,
+        role: 'assistant',
+        phase: 'model',
+        content: latestIteration.responseText,
+        toolCalls: latestIteration.responseToolCalls.map(toolCall => ({
+          id: toolCall.id,
+          name: toolCall.name,
+          argumentsJson: toolCall.argumentsJson,
+          isError: toolCall.isError,
+        })),
+      });
+    }
+
+    for (const [index, toolCall] of latestIteration.responseToolCalls.entries()) {
+      entries.push({
+        key: `tool-result-${latestIteration.iteration}-${toolCall.id || toolCall.name}-${index}`,
+        role: 'tool',
+        phase: 'tool',
+        content: toolCall.resultText,
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        resultJson: toolCall.resultJson,
+        isError: toolCall.isError,
+      });
+    }
+
+    return [{
+      iteration: latestIteration.iteration,
+      entries,
+    }];
+  })() : [];
+  const transcriptFinalAnswer = finalAnswer?.trim() ? finalAnswer : lastIterationResponse;
+  const transcriptFinalAnswerText = transcriptFinalAnswer?.trim() ?? '';
+  const hasMatchingAssistantContextEntry = contextSections.some(section =>
+    section.entries.some(entry =>
+      entry.role === 'assistant' &&
+      (entry.content ?? '').trim() === transcriptFinalAnswerText,
+    ),
+  );
+  const showFinalAnswerInContext = Boolean(
+    transcriptFinalAnswerText && !hasMatchingAssistantContextEntry,
+  );
+  const contextEntryCount = contextSections.reduce(
+    (sum, section) => sum + section.entries.length,
+    showFinalAnswerInContext ? 1 : 0,
   );
   const rawBlockCount = [
     hasJsonPayload(snapshot?.queryIr),
     hasJsonPayload(snapshot?.agentLoop),
-    showFinalAnswer,
   ].filter(Boolean).length;
   const hasContent =
     stagesAggregated.length > 0 ||
@@ -320,7 +395,7 @@ export function AssistantDebugInspector({
             <div className="grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
               <Stat label={t('assistant.mcpStatStages')} value={stagesAggregated.length} />
               {snapshot && <Stat label={t('assistant.mcpStatIterations')} value={snapshot.totalIterations} />}
-              <Stat label={t('assistant.llmContextMessages')} value={messageCount} />
+              <Stat label={t('assistant.llmContextMessages')} value={contextEntryCount} />
               <Stat label={t('assistant.mcpStatTools')} value={totalToolCalls} />
               {summary && (
                 <>
@@ -331,7 +406,7 @@ export function AssistantDebugInspector({
                 </>
               )}
             </div>
-            <div className="mt-3 grid grid-cols-2 gap-1 rounded-lg border border-border/70 bg-background p-1">
+            <div className="mt-3 grid grid-cols-3 gap-1 rounded-lg border border-border/70 bg-background p-1">
               <InspectorTab
                 active={activeView === 'timeline'}
                 icon={<ListTree className="h-3.5 w-3.5" />}
@@ -340,17 +415,10 @@ export function AssistantDebugInspector({
                 onClick={() => setActiveView('timeline')}
               />
               <InspectorTab
-                active={activeView === 'tools'}
-                icon={<Wrench className="h-3.5 w-3.5" />}
-                label={t('assistant.debugViewTools')}
-                count={toolCalls.length}
-                onClick={() => setActiveView('tools')}
-              />
-              <InspectorTab
                 active={activeView === 'context'}
                 icon={<ScrollText className="h-3.5 w-3.5" />}
                 label={t('assistant.debugViewContext')}
-                count={messageCount}
+                count={contextEntryCount}
                 onClick={() => setActiveView('context')}
               />
               <InspectorTab
@@ -515,83 +583,44 @@ export function AssistantDebugInspector({
               </>
             )}
 
-            {activeView === 'tools' && (
-              <>
-                <div className="section-label">{t('assistant.debugViewTools')}</div>
-                {toolCalls.length === 0 ? (
-                  <div className="rounded-lg border border-border/70 bg-card p-4 text-sm text-muted-foreground">
-                    {t('assistant.mcpNoToolCalls')}
-                  </div>
-                ) : (
-                  <div className="grid gap-3">
-                    {toolCalls.map((toolCall) => (
-                      <ToolCallCard
-                        key={`${toolCall.iteration}-${toolCall.id}`}
-                        t={t}
-                        iteration={toolCall.iterationDisplayIndex}
-                        name={toolCall.name}
-                        callId={toolCall.id}
-                        isError={toolCall.isError}
-                        argumentsJson={toolCall.argumentsJson}
-                        resultText={toolCall.resultText}
-                        resultJson={toolCall.resultJson}
-                        providerKind={toolCall.providerKind}
-                        modelName={toolCall.modelName}
-                      />
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
-
-            {activeView === 'context' && iterations.length > 0 && (
+            {activeView === 'context' && contextEntryCount > 0 && (
               <>
                 <div className="section-label mt-2">{t('assistant.requestMessages')}</div>
-                {iterations.map(iter => (
+                {contextSections.map(section => (
                   <details
-                    key={`messages-${iter.iteration}`}
+                    key={`messages-${section.iteration}`}
                     className="rounded-md border border-border/70 bg-card"
-                    open={iter.displayIndex === iterations.length}
+                    open
                   >
                     <summary className="cursor-pointer px-3 py-2 text-xs font-semibold">
-                      {t('assistant.iteration')} #{iter.iteration} · {iter.requestMessages.length}
+                      {t('assistant.iteration')} #{section.iteration} · {section.entries.length}
                     </summary>
                     <div className="space-y-2 border-t border-border/60 p-3">
-                      {iter.requestMessages.map((message, index) => (
-                        <article key={`${message.role}-${index}`} className="rounded-md border border-border/60 bg-background/60 p-2">
-                          <div className="mb-1 flex items-center gap-2">
-                            <span className="rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase text-primary">
-                              {message.role}
-                            </span>
-                            {message.tool_call_id && (
-                              <span className="truncate font-mono text-[10px] text-muted-foreground">
-                                {t('assistant.toolCallIdLabel')}: {message.tool_call_id}
-                              </span>
-                            )}
-                          </div>
-                          {message.content && (
-                            <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-foreground/80">
-                              {message.content}
-                            </pre>
-                          )}
-                          {message.tool_calls && message.tool_calls.length > 0 && (
-                            <div className="mt-2 space-y-1">
-                              {message.tool_calls.map(toolCall => (
-                                <div key={toolCall.id} className="rounded border border-status-warning/30 bg-status-warning/5 p-2 font-mono text-[10px] text-status-warning">
-                                  {toolCall.name}({toolCall.arguments_json})
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </article>
+                      {section.entries.map(entry => (
+                        <ContextTranscriptCard
+                          key={entry.key}
+                          t={t}
+                          entry={entry}
+                        />
                       ))}
                     </div>
                   </details>
                 ))}
+                {showFinalAnswerInContext && transcriptFinalAnswer && (
+                  <ContextTranscriptCard
+                    t={t}
+                    entry={{
+                      key: 'final-answer',
+                      role: 'assistant',
+                      phase: 'final',
+                      content: transcriptFinalAnswer,
+                    }}
+                  />
+                )}
               </>
             )}
 
-            {activeView === 'context' && iterations.length === 0 && (
+            {activeView === 'context' && contextEntryCount === 0 && (
               <div className="rounded-lg border border-border/70 bg-card p-4 text-sm text-muted-foreground">
                 {t('assistant.mcpContextEmpty')}
               </div>
@@ -609,23 +638,6 @@ export function AssistantDebugInspector({
                   <RawJsonBlock icon={<FileJson className="h-3.5 w-3.5" />} title={t('assistant.agentLoop')} value={snapshot?.agentLoop} />
                 )}
 
-                {showFinalAnswer && finalAnswer && (
-                  <TimelineStep
-                    icon={<Sparkles className="h-3.5 w-3.5" />}
-                    tone="success"
-                    order="OK"
-                    title={t('assistant.mcpFinalAnswer')}
-                  >
-                    <details className="mt-2">
-                      <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground hover:text-foreground">
-                        {t('assistant.mcpFinalAnswerExpand')}
-                      </summary>
-                      <pre className="mt-1.5 max-h-60 overflow-auto rounded border border-border/40 bg-background p-2 font-mono text-[10px] leading-relaxed [overflow-wrap:anywhere] whitespace-pre-wrap">
-                        {finalAnswer}
-                      </pre>
-                    </details>
-                  </TimelineStep>
-                )}
               </>
             )}
           </div>
@@ -687,88 +699,103 @@ function InspectorTab({
   );
 }
 
-function ToolCallCard({
+function ContextTranscriptCard({
   t,
-  iteration,
-  name,
-  callId,
-  isError,
-  argumentsJson,
-  resultText,
-  resultJson,
-  providerKind,
-  modelName,
+  entry,
 }: {
   t: TFunction;
-  iteration: number;
-  name: string;
-  callId: string;
-  isError: boolean;
-  argumentsJson: string;
-  resultText?: string | null;
-  resultJson?: unknown;
-  providerKind: string;
-  modelName: string;
+  entry: ContextTranscriptEntry;
 }) {
+  const contentHeightClass = entry.role === 'system' ? 'max-h-32' : 'max-h-60';
   return (
     <article
-      className={`overflow-hidden rounded-lg border bg-card shadow-sm ${
-        isError ? 'border-status-failed/35' : 'border-border/70'
+      className={`rounded-md border p-2 ${
+        entry.isError
+          ? 'border-status-failed/30 bg-status-failed/5'
+          : 'border-border/60 bg-background/60'
       }`}
     >
-      <header className="flex items-start gap-3 border-b border-border/60 bg-surface-sunken px-3 py-2">
-        <div
-          className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border ${
-            isError
-              ? 'border-status-failed/30 bg-status-failed/10 text-status-failed'
-              : 'border-primary/20 bg-primary/10 text-primary'
-          }`}
-        >
-          {isError ? <AlertCircle className="h-3.5 w-3.5" /> : <Wrench className="h-3.5 w-3.5" />}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <code className="truncate font-mono text-xs font-bold" title={name}>
-              {name}
-            </code>
-            <span className="shrink-0 rounded bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-              #{iteration}
-            </span>
-          </div>
-          <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
-            {modelName} @ {providerKind}
-          </div>
-        </div>
+      <header className="mb-1 flex min-w-0 items-center gap-2">
         <span
-          className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
-            isError
-              ? 'bg-status-failed/10 text-status-failed'
-              : 'bg-status-ready/10 text-status-ready'
+          className={`rounded px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase ${
+            entry.role === 'tool'
+              ? entry.isError
+                ? 'bg-status-failed/10 text-status-failed'
+                : 'bg-status-ready/10 text-status-ready'
+              : 'bg-primary/10 text-primary'
           }`}
         >
-          {isError ? t('assistant.mcpToolStatusError') : t('assistant.mcpToolStatusOk')}
+          {entry.role}
         </span>
+        <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          {contextPhaseLabel(t, entry.phase)}
+        </span>
+        {entry.toolName && (
+          <code className="truncate font-mono text-[10px] text-muted-foreground" title={entry.toolName}>
+            {entry.toolName}
+          </code>
+        )}
+        {entry.toolCallId && (
+          <span className="ml-auto truncate font-mono text-[10px] text-muted-foreground">
+            {t('assistant.toolCallIdLabel')}: {entry.toolCallId}
+          </span>
+        )}
       </header>
-      <div className="grid gap-2 p-3">
-        <div className="truncate font-mono text-[10px] text-muted-foreground">
-          {t('assistant.toolCallIdLabel')}: {callId}
+      {entry.content && (
+        <pre className={`${contentHeightClass} overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-foreground/80`}>
+          {entry.content}
+        </pre>
+      )}
+      {entry.toolCalls && entry.toolCalls.length > 0 && (
+        <div className="mt-2 space-y-1">
+          {entry.toolCalls.map((toolCall, index) => (
+            <div
+              key={`${toolCall.id || toolCall.name}-${index}`}
+              className={`rounded border p-2 font-mono text-[10px] ${
+                toolCall.isError
+                  ? 'border-status-failed/30 bg-status-failed/5 text-status-failed'
+                  : 'border-status-warning/30 bg-status-warning/5 text-status-warning'
+              }`}
+            >
+              <div className="mb-1 flex min-w-0 items-center gap-2">
+                <Wrench className="h-3 w-3 shrink-0" />
+                <code className="truncate font-bold" title={toolCall.name}>
+                  {toolCall.name}
+                </code>
+                <span className="ml-auto truncate text-[9px] opacity-75">
+                  {toolCall.id}
+                </span>
+              </div>
+              {toolCall.argumentsJson && toolCall.argumentsJson !== '{}' && (
+                <pre className="max-h-36 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere]">
+                  {formatJsonish(toolCall.argumentsJson)}
+                </pre>
+              )}
+            </div>
+          ))}
         </div>
-        {argumentsJson && argumentsJson !== '{}' && (
-          <JsonDetails label={t('assistant.mcpToolsArgs')} value={argumentsJson} defaultOpen />
-        )}
-        {resultText && (
-          <JsonDetails label={t('assistant.mcpToolsResult')} value={resultText} defaultOpen />
-        )}
-        {hasJsonPayload(resultJson) && (
-          <JsonDetails
-            label={t('assistant.mcpToolsPayload')}
-            value={stringifyJson(resultJson)}
-            defaultOpen
-          />
-        )}
-      </div>
+      )}
+      {hasJsonPayload(entry.resultJson) && (
+        <JsonDetails
+          label={t('assistant.mcpToolsPayload')}
+          value={stringifyJson(entry.resultJson)}
+        />
+      )}
     </article>
   );
+}
+
+function contextPhaseLabel(t: TFunction, phase: ContextTranscriptPhase) {
+  switch (phase) {
+    case 'request':
+      return t('assistant.contextPhaseRequest');
+    case 'model':
+      return t('assistant.contextPhaseModel');
+    case 'tool':
+      return t('assistant.contextPhaseTool');
+    case 'final':
+      return t('assistant.contextPhaseFinal');
+  }
 }
 
 function JsonDetails({

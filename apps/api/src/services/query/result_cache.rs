@@ -25,9 +25,9 @@ pub(crate) struct QueryResultCacheKeyInput<'a> {
     pub(crate) answer_runtime_fingerprint: &'a str,
     pub(crate) mode_label: &'static str,
     pub(crate) top_k: usize,
-    pub(crate) source_links_enabled: bool,
     pub(crate) user_question: &'a str,
-    pub(crate) prompt_history_text: Option<&'a str>,
+    pub(crate) effective_question: &'a str,
+    pub(crate) answer_history_text: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -105,9 +105,9 @@ pub(crate) fn cache_key(input: &QueryResultCacheKeyInput<'_>) -> String {
     update_str(&mut hasher, input.answer_runtime_fingerprint);
     update_str(&mut hasher, input.mode_label);
     update_usize(&mut hasher, input.top_k);
-    hasher.update([u8::from(input.source_links_enabled)]);
     update_normalized_text(&mut hasher, input.user_question);
-    match input.prompt_history_text {
+    update_normalized_text(&mut hasher, input.effective_question);
+    match input.answer_history_text {
         Some(history) => {
             hasher.update([1]);
             update_normalized_text(&mut hasher, history);
@@ -391,9 +391,9 @@ mod tests {
             answer_runtime_fingerprint: "answer-runtime:baseline",
             mode_label: "mix",
             top_k,
-            source_links_enabled: true,
             user_question: "  TargetName   how ",
-            prompt_history_text: None,
+            effective_question: "scope: target details\nquestion: TargetName how",
+            answer_history_text: None,
         }
     }
 
@@ -407,6 +407,13 @@ mod tests {
     #[test]
     fn cache_key_changes_with_top_k() {
         assert_ne!(cache_key(&base_input(8)), cache_key(&base_input(12)));
+    }
+
+    #[test]
+    fn cache_key_changes_with_effective_question() {
+        let mut changed = base_input(8);
+        changed.effective_question = "scope: different details\nquestion: TargetName how";
+        assert_ne!(cache_key(&base_input(8)), cache_key(&changed));
     }
 
     #[test]
@@ -424,9 +431,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_changes_with_prompt_history() {
+    fn cache_key_changes_with_answer_history() {
         let mut with_history = base_input(8);
-        with_history.prompt_history_text = Some("assistant: target details");
+        with_history.answer_history_text = Some("assistant: target details");
         assert_ne!(cache_key(&base_input(8)), cache_key(&with_history));
     }
 

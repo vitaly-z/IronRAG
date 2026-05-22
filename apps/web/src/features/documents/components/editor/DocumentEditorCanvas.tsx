@@ -15,10 +15,12 @@ type DocumentEditorCanvasProps = {
   error: string | null;
   loading: boolean;
   onRawTextChange: (markdown: string) => void;
+  lineWrapEnabled: boolean;
   rawTextEditor: boolean;
   readOnly?: boolean;
   saving: boolean;
   sourceFormat?: string;
+  sourceHref?: string;
   statusLabel: string;
   surfaceMode: EditorSurfaceMode;
   t: TFunction;
@@ -41,10 +43,12 @@ export function DocumentEditorCanvas({
   error,
   loading,
   onRawTextChange,
+  lineWrapEnabled,
   rawTextEditor,
   readOnly = false,
   saving,
   sourceFormat,
+  sourceHref,
   statusLabel,
   surfaceMode,
   t,
@@ -71,6 +75,14 @@ export function DocumentEditorCanvas({
     }
 
     const updateLayout = () => {
+      if (lineWrapEnabled) {
+        if (viewport.scrollLeft !== 0) {
+          viewport.scrollLeft = 0;
+        }
+        setTableScrollState(EMPTY_TABLE_SCROLL_STATE);
+        return;
+      }
+
       const clientWidth = viewport.clientWidth;
       const scrollWidth = Math.max(content.scrollWidth, viewport.scrollWidth, clientWidth);
       const maxScrollLeft = Math.max(scrollWidth - clientWidth, 0);
@@ -119,7 +131,7 @@ export function DocumentEditorCanvas({
       window.removeEventListener('resize', updateLayout);
       resizeObserver?.disconnect();
     };
-  }, [editorMarkdown, surfaceMode]);
+  }, [editorMarkdown, lineWrapEnabled, surfaceMode]);
 
   const handleTableRailChange = (event: ChangeEvent<HTMLInputElement>) => {
     const viewport = tableViewportRef.current;
@@ -179,7 +191,10 @@ export function DocumentEditorCanvas({
 
             <textarea
               aria-label={documentName}
-              className="document-editor-raw-textarea"
+              className={cn(
+                'document-editor-raw-textarea',
+                lineWrapEnabled && 'document-editor-raw-textarea--wrap',
+              )}
               disabled={saving}
               onChange={(event) => onRawTextChange(event.target.value)}
               readOnly={readOnly}
@@ -206,6 +221,20 @@ export function DocumentEditorCanvas({
     );
   }
 
+  if (readOnly && sourceFormat?.toLowerCase() === 'pdf' && sourceHref) {
+    return (
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col px-4 py-4 sm:px-6 sm:py-5">
+        <div className="mx-auto flex min-h-0 min-w-0 w-full max-w-[96rem] flex-1">
+          <iframe
+            className="min-h-[68vh] w-full rounded-[20px] border border-border/70 bg-background shadow-[0_24px_90px_hsl(var(--foreground)/0.08)]"
+            src={sourceHref}
+            title={documentName}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col px-4 py-4 sm:px-6 sm:py-5">
       <div className={cn('mx-auto flex min-h-0 min-w-0 w-full flex-1', frameWidthClassName(surfaceMode))}>
@@ -221,17 +250,24 @@ export function DocumentEditorCanvas({
               <div
                 ref={tableViewportRef}
                 className={cn(
-                  'document-editor-table-scroll min-h-0 min-w-0 w-full flex-1 overflow-auto',
+                  'document-editor-table-scroll min-h-0 min-w-0 w-full flex-1 overflow-x-hidden overflow-y-auto',
                   effectiveTableScrollState.canScrollLeft && 'document-editor-table-scroll--can-left',
                   effectiveTableScrollState.canScrollRight && 'document-editor-table-scroll--can-right',
                 )}
               >
-                <div ref={tableContentRef} className="min-h-full w-max min-w-full pb-4">
+                <div
+                  ref={tableContentRef}
+                  className={cn(
+                    'min-h-full min-w-full pb-4',
+                    lineWrapEnabled ? 'w-full' : 'w-max',
+                  )}
+                  data-testid="document-editor-table-content"
+                >
                   <EditorContent editor={editor} />
                 </div>
               </div>
 
-              {effectiveTableScrollState.showRail ? (
+              {!lineWrapEnabled && effectiveTableScrollState.showRail ? (
                 <div className="document-editor-table-rail-shell">
                   <input
                     aria-label={t('documents.editor.tableScrollRail')}

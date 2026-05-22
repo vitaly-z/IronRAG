@@ -1,4 +1,5 @@
 pub(crate) mod backfill;
+pub(crate) mod canonical_projection;
 pub mod community_detection;
 pub mod error;
 pub(crate) mod extract;

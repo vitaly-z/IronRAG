@@ -71,10 +71,15 @@ pub fn sanitize_graph_extraction_candidate_set(
         .entities
         .into_iter()
         .filter_map(|mut entity| {
-            if is_unstable_graph_label(&entity.label) {
+            if crate::services::graph::identity::is_structural_literal_label(&entity.label)
+                || is_unstable_graph_label(&entity.label, source_text)
+            {
                 return None;
             }
-            entity.aliases.retain(|alias| !is_unstable_graph_label(alias));
+            entity.aliases.retain(|alias| {
+                !crate::services::graph::identity::is_structural_literal_label(alias)
+                    && !is_unstable_graph_label(alias, source_text)
+            });
             if entity.summary.as_deref().is_some_and(is_low_confidence_text) {
                 entity.summary = None;
             }
@@ -85,8 +90,12 @@ pub fn sanitize_graph_extraction_candidate_set(
         .relations
         .into_iter()
         .filter_map(|mut relation| {
-            if is_unstable_graph_label(&relation.source_label)
-                || is_unstable_graph_label(&relation.target_label)
+            if crate::services::graph::identity::is_structural_literal_label(&relation.source_label)
+                || crate::services::graph::identity::is_structural_literal_label(
+                    &relation.target_label,
+                )
+                || is_unstable_graph_label(&relation.source_label, source_text)
+                || is_unstable_graph_label(&relation.target_label, source_text)
             {
                 return None;
             }
@@ -211,8 +220,68 @@ fn repair_extracted_text(value: &str) -> String {
     repair_utf8_latin1_mojibake(value.trim()).trim().to_string()
 }
 
-fn is_unstable_graph_label(value: &str) -> bool {
-    is_low_confidence_text(value) || is_structurally_unstable_fragment(value)
+fn is_unstable_graph_label(value: &str, source_text: &str) -> bool {
+    is_tiny_unstable_graph_label(value)
+        || is_low_confidence_text(value)
+        || (is_structurally_unstable_fragment(value)
+            && !has_symbolic_measurement_context(value, source_text))
+}
+
+fn is_tiny_unstable_graph_label(value: &str) -> bool {
+    let trimmed = value.trim();
+    let mut chars = trimmed.chars();
+    matches!((chars.next(), chars.next()), (Some(ch), None) if ch.is_alphabetic())
+}
+
+fn has_symbolic_measurement_context(value: &str, source_text: &str) -> bool {
+    let value = value.trim();
+    if !is_short_mixed_script_alpha_label(value) {
+        return false;
+    }
+
+    source_text.match_indices(value).any(|(offset, matched)| {
+        let after = nearest_non_whitespace_after(&source_text[offset + matched.len()..]);
+        has_numeric_measurement_value_before(&source_text[..offset])
+            || after.is_some_and(is_formula_operator)
+    })
+}
+
+fn is_short_mixed_script_alpha_label(value: &str) -> bool {
+    let chars = value.chars().collect::<Vec<_>>();
+    if !(2..=4).contains(&chars.len()) || !chars.iter().all(|ch| ch.is_alphabetic()) {
+        return false;
+    }
+    chars.iter().any(|ch| ch.is_ascii_alphabetic())
+        && chars.iter().any(|ch| ch.is_alphabetic() && !ch.is_ascii_alphabetic())
+}
+
+fn nearest_non_whitespace_after(text: &str) -> Option<char> {
+    text.chars().find(|ch| !ch.is_whitespace())
+}
+
+fn has_numeric_measurement_value_before(text: &str) -> bool {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut index = chars.len();
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    let end = index;
+    while index > 0 && (chars[index - 1].is_ascii_digit() || matches!(chars[index - 1], '.' | ','))
+    {
+        index -= 1;
+    }
+    if index == end || !chars[index..end].iter().any(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    if index == 0 {
+        return true;
+    }
+    let preceding = chars[index - 1];
+    !preceding.is_alphanumeric() && !matches!(preceding, '_' | '-')
+}
+
+fn is_formula_operator(ch: char) -> bool {
+    matches!(ch, '=' | ':' | '+' | '-' | '*' | '/' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}')
 }
 
 pub fn validate_graph_extraction_candidate_set(
@@ -429,4 +498,114 @@ fn extract_json_payload(output_text: &str) -> AnyhowResult<serde_json::Value> {
         return Err(anyhow!("graph extraction output is empty"));
     }
     serde_json::from_str::<serde_json::Value>(trimmed).context("invalid graph extraction json")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        domains::runtime_graph::RuntimeNodeType,
+        services::graph::extract::{
+            parse::{has_symbolic_measurement_context, sanitize_graph_extraction_candidate_set},
+            types::{GraphEntityCandidate, GraphExtractionCandidateSet, GraphRelationCandidate},
+        },
+    };
+
+    #[test]
+    fn graph_sanitizer_removes_short_ocr_noise_labels_without_dropping_identifiers() {
+        let candidate_set = GraphExtractionCandidateSet {
+            entities: vec![
+                entity("HARBOR-SIGNAL-42"),
+                entity("ALPHA_TIMEOUT_MS"),
+                entity("μs"),
+                entity("ΔT"),
+                entity("CTpoKe"),
+                entity("Enμα"),
+                entity("∑nμα"),
+                entity("μe"),
+                entity("B"),
+            ],
+            relations: vec![
+                relation("HARBOR-SIGNAL-42", "ALPHA_TIMEOUT_MS"),
+                relation("ALPHA_TIMEOUT_MS", "μs"),
+                relation("ΔT", "ALPHA_TIMEOUT_MS"),
+                relation("CTpoKe", "ALPHA_TIMEOUT_MS"),
+                relation("HARBOR-SIGNAL-42", "Enμα"),
+                relation("μe", "ALPHA_TIMEOUT_MS"),
+                relation("B", "ALPHA_TIMEOUT_MS"),
+            ],
+        };
+
+        let sanitized = sanitize_graph_extraction_candidate_set(
+            candidate_set,
+            "HARBOR-SIGNAL-42 ALPHA_TIMEOUT_MS latency = 10 μs and ΔT=5 CTpoKe Enμα ∑nμα μe B",
+        );
+
+        let labels =
+            sanitized.entities.iter().map(|entity| entity.label.as_str()).collect::<Vec<_>>();
+        assert_eq!(labels, vec!["HARBOR-SIGNAL-42", "ALPHA_TIMEOUT_MS", "μs", "ΔT"]);
+        assert_eq!(sanitized.relations.len(), 3);
+        assert_eq!(sanitized.relations[0].source_label, "HARBOR-SIGNAL-42");
+        assert_eq!(sanitized.relations[0].target_label, "ALPHA_TIMEOUT_MS");
+        assert_eq!(sanitized.relations[1].source_label, "ALPHA_TIMEOUT_MS");
+        assert_eq!(sanitized.relations[1].target_label, "μs");
+        assert_eq!(sanitized.relations[2].source_label, "ΔT");
+        assert_eq!(sanitized.relations[2].target_label, "ALPHA_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn measurement_context_requires_numeric_value_not_code_identifier_suffix() {
+        assert!(has_symbolic_measurement_context("μs", "latency = 10 μs"));
+        assert!(has_symbolic_measurement_context("ΔT", "ΔT = 5"));
+        assert!(!has_symbolic_measurement_context("μe", "NODE_ALPHA-42 μe"));
+    }
+
+    #[test]
+    fn graph_sanitizer_removes_structural_literal_entities_and_relations() {
+        let candidate_set = GraphExtractionCandidateSet {
+            entities: vec![
+                entity("Alpha Switch"),
+                entity("false"),
+                entity("42"),
+                entity("3.12.4"),
+                entity("Alpha false mode"),
+            ],
+            relations: vec![
+                relation("Alpha Switch", "Alpha false mode"),
+                relation("Alpha Switch", "false"),
+                relation("false", "Alpha Switch"),
+                relation("42", "Alpha Switch"),
+            ],
+        };
+
+        let sanitized = sanitize_graph_extraction_candidate_set(
+            candidate_set,
+            "Alpha Switch supports Alpha false mode with values false, 42, and 3.12.4.",
+        );
+
+        let labels =
+            sanitized.entities.iter().map(|entity| entity.label.as_str()).collect::<Vec<_>>();
+        assert_eq!(labels, vec!["Alpha Switch", "42", "3.12.4", "Alpha false mode"]);
+        assert_eq!(sanitized.relations.len(), 2);
+        assert_eq!(sanitized.relations[0].target_label, "Alpha false mode");
+        assert_eq!(sanitized.relations[1].source_label, "42");
+    }
+
+    fn entity(label: &str) -> GraphEntityCandidate {
+        GraphEntityCandidate {
+            label: label.to_string(),
+            node_type: RuntimeNodeType::Artifact,
+            sub_type: None,
+            aliases: Vec::new(),
+            summary: None,
+        }
+    }
+
+    fn relation(source_label: &str, target_label: &str) -> GraphRelationCandidate {
+        GraphRelationCandidate {
+            source_label: source_label.to_string(),
+            target_label: target_label.to_string(),
+            relation_type: "uses".to_string(),
+            summary: None,
+        }
+    }
 }

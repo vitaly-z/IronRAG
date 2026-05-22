@@ -11,7 +11,7 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use super::RuntimeGraphFilteredArtifactRow;
-use crate::shared::text_tokens::normalized_alnum_token_sequence_by;
+use crate::shared::text_tokens::{literal_wildcard_prefixes, normalized_alnum_token_sequence_by};
 
 pub use coordination::*;
 pub use snapshot::*;
@@ -1469,28 +1469,49 @@ pub async fn list_runtime_graph_evidence_by_targets(
     }
     let target_kinds = targets.iter().map(|(kind, _)| kind.clone()).collect::<Vec<_>>();
     let target_ids = targets.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+    let per_target_limit = (limit as usize).div_ceil(targets.len()).max(1) as i64;
 
     sqlx::query_as::<_, RuntimeGraphEvidenceRow>(
         "with requested(target_kind, target_id, ordinal) as (
-             select *
+             select target_kind, target_id, ordinal::integer
              from unnest($2::text[], $3::uuid[]) with ordinality
+                as request(target_kind, target_id, ordinal)
+         ),
+         ranked_evidence as (
+             select
+                evidence.id,
+                evidence.library_id,
+                evidence.target_kind,
+                evidence.target_id,
+                evidence.document_id,
+                evidence.chunk_id,
+                evidence.source_file_name,
+                evidence.page_ref,
+                evidence.evidence_text,
+                evidence.confidence_score,
+                evidence.created_at,
+                requested.ordinal,
+                row_number() over (
+                    partition by requested.ordinal
+                    order by evidence.created_at desc, evidence.id desc
+                ) as target_rank
+             from requested
+             join runtime_graph_evidence as evidence
+               on evidence.library_id = $1
+              and evidence.target_kind = requested.target_kind
+              and evidence.target_id = requested.target_id
          )
-         select evidence.id, evidence.library_id, evidence.target_kind, evidence.target_id,
+         select id, library_id, target_kind, target_id,
             evidence.document_id, evidence.chunk_id, evidence.source_file_name,
-            evidence.page_ref, evidence.evidence_text, evidence.confidence_score,
-            evidence.created_at
-         from requested
-         join runtime_graph_evidence as evidence
-           on evidence.library_id = $1
-          and evidence.target_kind = requested.target_kind
-          and evidence.target_id = requested.target_id
-         order by requested.ordinal asc, evidence.created_at desc, evidence.id desc
-         limit $4",
+            page_ref, evidence_text, confidence_score, created_at
+         from ranked_evidence as evidence
+         where target_rank <= $4
+         order by ordinal asc, target_rank asc, created_at desc, id desc",
     )
     .bind(library_id)
     .bind(target_kinds)
     .bind(target_ids)
-    .bind(limit)
+    .bind(per_target_limit)
     .fetch_all(pool)
     .await
 }
@@ -2553,6 +2574,62 @@ pub async fn delete_runtime_graph_edges_without_support_by_ids(
     .await
 }
 
+/// Deletes explicit canonical graph edges by id.
+///
+/// # Errors
+/// Returns any `SQLx` error raised while pruning graph edges.
+pub async fn delete_runtime_graph_edges_by_ids(
+    pool: &PgPool,
+    library_id: Uuid,
+    projection_version: i64,
+    edge_ids: &[Uuid],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    if edge_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    sqlx::query_scalar::<_, Uuid>(
+        "delete from runtime_graph_edge
+         where library_id = $1
+           and projection_version = $2
+           and id = any($3)
+         returning id",
+    )
+    .bind(library_id)
+    .bind(projection_version)
+    .bind(edge_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Lists canonical graph edge ids incident to any node in `node_ids`.
+///
+/// # Errors
+/// Returns any `SQLx` error raised while querying graph edges.
+pub async fn list_runtime_graph_edge_ids_by_node_ids(
+    pool: &PgPool,
+    library_id: Uuid,
+    projection_version: i64,
+    node_ids: &[Uuid],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    sqlx::query_scalar::<_, Uuid>(
+        "select id
+         from runtime_graph_edge
+         where library_id = $1
+           and projection_version = $2
+           and (from_node_id = any($3) or to_node_id = any($3))",
+    )
+    .bind(library_id)
+    .bind(projection_version)
+    .bind(node_ids)
+    .fetch_all(pool)
+    .await
+}
+
 /// Deletes canonical graph nodes with zero surviving active evidence and returns their canonical keys.
 ///
 /// # Errors
@@ -2571,6 +2648,34 @@ pub async fn delete_runtime_graph_nodes_without_support(
     )
     .bind(library_id)
     .bind(projection_version)
+    .fetch_all(pool)
+    .await
+}
+
+/// Deletes explicit canonical graph nodes by id.
+///
+/// # Errors
+/// Returns any `SQLx` error raised while pruning graph nodes.
+pub async fn delete_runtime_graph_nodes_by_ids(
+    pool: &PgPool,
+    library_id: Uuid,
+    projection_version: i64,
+    node_ids: &[Uuid],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    sqlx::query_scalar::<_, Uuid>(
+        "delete from runtime_graph_node
+         where library_id = $1
+           and projection_version = $2
+           and id = any($3)
+         returning id",
+    )
+    .bind(library_id)
+    .bind(projection_version)
+    .bind(node_ids)
     .fetch_all(pool)
     .await
 }
@@ -2718,6 +2823,21 @@ pub async fn search_admitted_runtime_graph_entities_by_query_text(
     let normalized_query = query_text.trim().to_lowercase();
     if normalized_query.is_empty() {
         return Ok(Vec::new());
+    }
+
+    let wildcard_prefixes = runtime_graph_entity_wildcard_prefixes(&normalized_query);
+    if !wildcard_prefixes.is_empty() {
+        let rows = search_admitted_runtime_graph_entities_by_wildcard_prefixes(
+            pool,
+            library_id,
+            projection_version,
+            &wildcard_prefixes,
+            limit,
+        )
+        .await?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
     }
 
     let search_terms = runtime_graph_entity_search_terms(&normalized_query);
@@ -2887,6 +3007,101 @@ pub async fn search_admitted_runtime_graph_entities_by_query_text(
     Ok(rows)
 }
 
+async fn search_admitted_runtime_graph_entities_by_wildcard_prefixes(
+    pool: &PgPool,
+    library_id: Uuid,
+    projection_version: i64,
+    wildcard_prefixes: &[String],
+    limit: i64,
+) -> Result<Vec<RuntimeGraphNodeRow>, sqlx::Error> {
+    let candidate_limit = limit.saturating_mul(6).min(1_000).max(limit);
+    sqlx::query_as::<_, RuntimeGraphNodeRow>(
+        "with wildcard_prefixes(value) as (
+            select unnest($3::text[])
+         ),
+         matched_ids as (
+            select id, min(match_rank) as match_rank
+            from (
+                select id, 0::integer as match_rank
+                from (
+                    select n.id
+                    from runtime_graph_node n
+                    join wildcard_prefixes prefix
+                      on lower(n.label) like prefix.value || '%' escape '~'
+                    where n.library_id = $1
+                      and n.projection_version = $2
+                      and n.node_type <> 'document'
+                    order by n.support_count desc, n.label asc, n.created_at asc, n.id asc
+                    limit $5
+                ) label_prefix
+                union all
+                select id, 1::integer as match_rank
+                from (
+                    select n.id
+                    from runtime_graph_node n
+                    where n.library_id = $1
+                      and n.projection_version = $2
+                      and n.node_type <> 'document'
+                      and exists (
+                        select 1
+                        from jsonb_array_elements_text(
+                            case
+                                when jsonb_typeof(n.aliases_json) = 'array'
+                                then n.aliases_json
+                                else '[]'::jsonb
+                            end
+                        ) as alias(value)
+                        join wildcard_prefixes prefix
+                          on lower(alias.value) like prefix.value || '%' escape '~'
+                      )
+                    order by n.support_count desc, n.label asc, n.created_at asc, n.id asc
+                    limit $5
+                ) alias_prefix
+            ) matches
+            group by id
+            order by min(match_rank) asc, id asc
+            limit $5
+         )
+         select
+            n.id, n.library_id, n.canonical_key, n.label, n.node_type,
+            n.aliases_json, n.summary, n.metadata_json, n.support_count,
+            n.projection_version, n.created_at, n.updated_at
+         from matched_ids matched
+         join runtime_graph_node n on n.id = matched.id
+         order by
+            matched.match_rank asc,
+            n.support_count desc,
+            n.label asc,
+            n.created_at asc
+         limit $4",
+    )
+    .bind(library_id)
+    .bind(projection_version)
+    .bind(wildcard_prefixes)
+    .bind(limit)
+    .bind(candidate_limit)
+    .fetch_all(pool)
+    .await
+}
+
+fn runtime_graph_entity_wildcard_prefixes(query_text: &str) -> Vec<String> {
+    literal_wildcard_prefixes(query_text, 2)
+        .into_iter()
+        .map(|prefix| escape_sql_like_literal(&prefix))
+        .collect()
+}
+
+fn escape_sql_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '~' | '%' | '_') {
+            escaped.push('~');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 fn runtime_graph_entity_search_terms(query_text: &str) -> Vec<String> {
     normalized_alnum_token_sequence_by(
         query_text,
@@ -2937,7 +3152,7 @@ fn admitted_runtime_graph_counts_query() -> String {
 mod tests {
     use super::{
         RUNTIME_GRAPH_EVIDENCE_TEXT_SEARCH_QUERY_CAP, runtime_graph_entity_search_terms,
-        runtime_graph_evidence_literal_search_queries,
+        runtime_graph_entity_wildcard_prefixes, runtime_graph_evidence_literal_search_queries,
         runtime_graph_evidence_per_query_candidate_limit,
         runtime_graph_evidence_text_search_queries,
         runtime_graph_evidence_text_search_token_prefix, runtime_graph_evidence_text_search_tokens,
@@ -2980,6 +3195,14 @@ mod tests {
                 "80".to_string(),
             ],
         );
+    }
+
+    #[test]
+    fn entity_wildcard_prefixes_keep_literal_prefix_semantics() {
+        let prefixes =
+            runtime_graph_entity_wildcard_prefixes("show alpha-* and beta_module* entries");
+
+        assert_eq!(prefixes, vec!["alpha-".to_string(), "beta~_module".to_string()]);
     }
 
     #[test]

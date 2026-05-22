@@ -5,7 +5,7 @@ import { toast } from 'sonner';
 import { documentsApi } from '@/shared/api';
 import type { DocumentItem } from '@/shared/types';
 
-import { buildEditorBlocks, serializeEditorBlocks, serializeSourceTextForEditor } from './documentEditorBlocks';
+import { serializeSourceTextForEditor } from './documentEditorBlocks';
 import { isCodeLikeSourceFormat, isPlainTextSourceFormat } from './editorSurfaceMode';
 
 type EditorAvailability = {
@@ -80,9 +80,9 @@ export function useDocumentEditor({
       setEditorOpen(true);
 
       try {
-        const nextMarkdown = shouldLoadSourceTextForEditor(doc)
+        const nextMarkdown = shouldLoadStoredSourceTextForEditor(doc)
           ? await loadSourceEditorMarkdown(doc)
-          : await loadStructuredEditorMarkdown(doc);
+          : await documentsApi.getEditorSourceText(doc.id);
         setEditorMarkdown(nextMarkdown);
       } catch (err: unknown) {
         setEditorError(errorMessage(err, t('documents.editor.loadFailed')));
@@ -144,11 +144,6 @@ export function useDocumentEditor({
   };
 }
 
-async function loadStructuredEditorMarkdown(doc: DocumentItem): Promise<string> {
-  const segments = await documentsApi.getAllPreparedSegments(doc.id);
-  return serializeEditorBlocks(buildEditorBlocks(segments, doc.fileType));
-}
-
 async function loadSourceEditorMarkdown(doc: DocumentItem): Promise<string> {
   const sourceHref = doc.sourceAccess?.href;
   if (!sourceHref) {
@@ -159,8 +154,8 @@ async function loadSourceEditorMarkdown(doc: DocumentItem): Promise<string> {
   return serializeSourceTextForEditor(sourceText, doc.fileType);
 }
 
-function shouldLoadSourceTextForEditor(doc: DocumentItem): boolean {
-  return Boolean(doc.sourceAccess?.href) && (
+function shouldLoadStoredSourceTextForEditor(doc: DocumentItem): boolean {
+  return doc.sourceAccess?.kind === 'stored_document' && (
     isCodeLikeSourceFormat(doc.fileType) || isPlainTextSourceFormat(doc.fileType)
   );
 }

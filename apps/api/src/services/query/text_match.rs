@@ -7,12 +7,25 @@ pub(crate) use crate::shared::text_tokens::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelatedTokenSelection {
     tokens: BTreeSet<String>,
-    allow_near: bool,
+    mode: RelatedTokenMatchMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelatedTokenCandidate {
+    token_sequence: Vec<String>,
+    tokens: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelatedTokenMatchMode {
+    Exact,
+    Near,
+    Prefix,
 }
 
 impl RelatedTokenSelection {
     pub(crate) fn empty() -> Self {
-        Self { tokens: BTreeSet::new(), allow_near: false }
+        Self { tokens: BTreeSet::new(), mode: RelatedTokenMatchMode::Exact }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -20,12 +33,19 @@ impl RelatedTokenSelection {
     }
 
     pub(crate) fn matches_tokens(&self, label_tokens: &BTreeSet<String>) -> bool {
-        if self.allow_near {
-            return self.tokens.iter().any(|target_token| {
+        match self.mode {
+            RelatedTokenMatchMode::Exact => {
+                self.tokens.iter().any(|target_token| label_tokens.contains(target_token))
+            }
+            RelatedTokenMatchMode::Near => self.tokens.iter().any(|target_token| {
                 label_tokens.iter().any(|label_token| near_token_match(target_token, label_token))
-            });
+            }),
+            RelatedTokenMatchMode::Prefix => self.tokens.iter().any(|target_token| {
+                label_tokens
+                    .iter()
+                    .any(|label_token| related_prefix_token_match(target_token, label_token))
+            }),
         }
-        self.tokens.iter().any(|target_token| label_tokens.contains(target_token))
     }
 }
 
@@ -35,15 +55,20 @@ pub(crate) fn token_sequence_contains(haystack: &str, needle: &str, min_chars: u
         return false;
     }
     let haystack_tokens = normalized_alnum_token_sequence(haystack, min_chars);
-    if haystack_tokens.len() < needle_tokens.len() {
-        return false;
-    }
-    haystack_tokens.windows(needle_tokens.len()).any(|window| window == needle_tokens)
+    token_sequence_contains_tokens(&haystack_tokens, &needle_tokens)
 }
 
 pub(crate) fn token_sequence_exact_or_contains(left: &str, right: &str, min_chars: usize) -> bool {
     token_sequence_contains(left, right, min_chars)
         || token_sequence_contains(right, left, min_chars)
+}
+
+pub(crate) fn token_sequence_exact_or_contains_tokens(
+    left_tokens: &[String],
+    right_tokens: &[String],
+) -> bool {
+    token_sequence_contains_tokens(left_tokens, right_tokens)
+        || token_sequence_contains_tokens(right_tokens, left_tokens)
 }
 
 pub(crate) fn near_token_match(left: &str, right: &str) -> bool {
@@ -61,6 +86,19 @@ pub(crate) fn near_token_match(left: &str, right: &str) -> bool {
     bounded_edit_distance_at_most_one(left, right)
 }
 
+pub(crate) fn related_prefix_token_match(target_token: &str, label_token: &str) -> bool {
+    if target_token == label_token {
+        return true;
+    }
+    let target_len = target_token.chars().count();
+    let label_len = label_token.chars().count();
+    if target_len < 5 || label_len <= target_len {
+        return false;
+    }
+    let common_prefix = common_prefix_char_count(target_token, label_token);
+    common_prefix >= 4 && common_prefix.saturating_add(1) >= target_len
+}
+
 pub(crate) fn near_token_overlap_count(left: &BTreeSet<String>, right: &BTreeSet<String>) -> usize {
     left.iter()
         .filter(|left_token| {
@@ -69,15 +107,40 @@ pub(crate) fn near_token_overlap_count(left: &BTreeSet<String>, right: &BTreeSet
         .count()
 }
 
-pub(crate) fn select_related_overlap_tokens<I, S>(
-    target_label: &str,
+pub(crate) fn common_prefix_char_count(left: &str, right: &str) -> usize {
+    left.chars().zip(right.chars()).take_while(|(left, right)| left == right).count()
+}
+
+pub(crate) fn build_related_token_candidates<I, S>(
     candidate_labels: I,
     min_chars: usize,
-) -> RelatedTokenSelection
+) -> Vec<RelatedTokenCandidate>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    candidate_labels
+        .into_iter()
+        .filter_map(|candidate_label| {
+            let label = candidate_label.as_ref().trim();
+            if label.is_empty() {
+                return None;
+            }
+            let token_sequence = normalized_alnum_token_sequence(label, min_chars);
+            if token_sequence.is_empty() {
+                return None;
+            }
+            let tokens = token_sequence.iter().cloned().collect::<BTreeSet<_>>();
+            Some(RelatedTokenCandidate { token_sequence, tokens })
+        })
+        .collect()
+}
+
+pub(crate) fn select_related_overlap_tokens_from_candidates(
+    target_label: &str,
+    candidates: &[RelatedTokenCandidate],
+    min_chars: usize,
+) -> RelatedTokenSelection {
     let target_sequence = normalized_alnum_token_sequence(target_label, min_chars);
     if target_sequence.is_empty() {
         return RelatedTokenSelection::empty();
@@ -86,38 +149,88 @@ where
     let mut exact_frequencies =
         target_tokens.iter().map(|token| (token.clone(), 0usize)).collect::<HashMap<_, _>>();
     let mut near_frequencies = exact_frequencies.clone();
+    let mut prefix_frequencies = exact_frequencies.clone();
+    let mut prefix_match_label_tokens = target_tokens
+        .iter()
+        .map(|token| (token.clone(), BTreeSet::new()))
+        .collect::<HashMap<_, _>>();
 
-    for candidate_label in candidate_labels {
-        let label = candidate_label.as_ref().trim();
-        if label.is_empty() {
-            continue;
-        }
-        if token_sequence_exact_or_contains(label, target_label, min_chars) {
-            continue;
-        }
-        let label_tokens = normalized_alnum_tokens(label, min_chars);
-        if label_tokens.is_empty() {
+    for candidate in candidates {
+        if token_sequence_contains_tokens(&candidate.token_sequence, &target_sequence)
+            || token_sequence_contains_tokens(&target_sequence, &candidate.token_sequence)
+        {
             continue;
         }
         for target_token in &target_tokens {
-            if label_tokens.contains(target_token) {
+            if candidate.tokens.contains(target_token) {
                 *exact_frequencies.entry(target_token.clone()).or_insert(0) += 1;
-            } else if label_tokens
+            } else if candidate
+                .tokens
                 .iter()
                 .any(|label_token| near_token_match(target_token, label_token))
             {
                 *near_frequencies.entry(target_token.clone()).or_insert(0) += 1;
+            } else {
+                let matching_label_tokens = candidate
+                    .tokens
+                    .iter()
+                    .filter(|label_token| related_prefix_token_match(target_token, label_token))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !matching_label_tokens.is_empty() {
+                    *prefix_frequencies.entry(target_token.clone()).or_insert(0) += 1;
+                    let label_tokens =
+                        prefix_match_label_tokens.entry(target_token.clone()).or_default();
+                    label_tokens.extend(matching_label_tokens);
+                }
             }
         }
     }
 
     if let Some(tokens) = select_min_frequency_tokens(&exact_frequencies, &target_sequence) {
-        return RelatedTokenSelection { tokens, allow_near: false };
+        return RelatedTokenSelection { tokens, mode: RelatedTokenMatchMode::Exact };
     }
     if let Some(tokens) = select_min_frequency_tokens(&near_frequencies, &target_sequence) {
-        return RelatedTokenSelection { tokens, allow_near: true };
+        return RelatedTokenSelection { tokens, mode: RelatedTokenMatchMode::Near };
+    }
+    let coherent_prefix_frequencies = prefix_frequencies
+        .iter()
+        .filter_map(|(token, frequency)| {
+            let label_tokens = prefix_match_label_tokens.get(token)?;
+            prefix_match_label_tokens_are_coherent(label_tokens)
+                .then_some((token.clone(), *frequency))
+        })
+        .collect::<HashMap<_, _>>();
+    if let Some(tokens) =
+        select_min_frequency_tokens(&coherent_prefix_frequencies, &target_sequence)
+    {
+        return RelatedTokenSelection { tokens, mode: RelatedTokenMatchMode::Prefix };
     }
     RelatedTokenSelection::empty()
+}
+
+fn prefix_match_label_tokens_are_coherent(label_tokens: &BTreeSet<String>) -> bool {
+    match label_tokens.len() {
+        0 => false,
+        1 => true,
+        _ => {
+            let Some(shortest) = label_tokens.iter().min_by_key(|token| token.chars().count())
+            else {
+                return false;
+            };
+            label_tokens.iter().all(|token| token.starts_with(shortest))
+        }
+    }
+}
+
+pub(crate) fn token_sequence_contains_tokens(
+    haystack_tokens: &[String],
+    needle_tokens: &[String],
+) -> bool {
+    if needle_tokens.is_empty() || haystack_tokens.len() < needle_tokens.len() {
+        return false;
+    }
+    haystack_tokens.windows(needle_tokens.len()).any(|window| window == needle_tokens)
 }
 
 fn select_min_frequency_tokens(
@@ -192,6 +305,18 @@ mod tests {
     }
 
     #[test]
+    fn related_prefix_token_match_accepts_longer_canonical_label_prefix() {
+        assert!(related_prefix_token_match("acmew", "acmealpha"));
+    }
+
+    #[test]
+    fn related_prefix_token_match_rejects_short_or_unrelated_prefixes() {
+        assert!(!related_prefix_token_match("acme", "acmealpha"));
+        assert!(!related_prefix_token_match("acmew", "betalpha"));
+        assert!(!related_prefix_token_match("acmealpha", "acmew"));
+    }
+
+    #[test]
     fn token_sequence_exact_or_contains_rejects_embedded_short_labels() {
         assert!(token_sequence_exact_or_contains("Project Omega", "Omega", 3));
         assert!(token_sequence_exact_or_contains("Project Omega", "Project Omega", 3));
@@ -208,19 +333,94 @@ mod tests {
 
     #[test]
     fn related_overlap_prefers_exact_rare_token_over_near_name_noise() {
-        let selection = select_related_overlap_tokens(
-            "Alpha Omega",
-            ["Omega Delta", "Alphb Person", "Alpha Team"],
-            3,
-        );
+        let candidates =
+            build_related_token_candidates(["Omega Delta", "Alphb Person", "Alpha Team"], 3);
+        let selection =
+            select_related_overlap_tokens_from_candidates("Alpha Omega", &candidates, 3);
         assert!(selection.matches_tokens(&normalized_alnum_tokens("Omega Delta", 3)));
         assert!(!selection.matches_tokens(&normalized_alnum_tokens("Alphb Person", 3)));
         assert!(!selection.matches_tokens(&normalized_alnum_tokens("Alpha Team", 3)));
     }
 
     #[test]
-    fn related_overlap_allows_near_match_when_no_exact_token_candidate_exists() {
-        let selection = select_related_overlap_tokens("Omegax", ["Omega Delta"], 3);
+    fn related_overlap_candidates_exclude_short_token_labels() {
+        let labels = ["Omega Delta", "Alphb Person", "Alpha Team", "AI"];
+        let candidates = build_related_token_candidates(labels, 3);
+        assert_eq!(candidates.len(), 3);
+
+        let selection =
+            select_related_overlap_tokens_from_candidates("Alpha Omega", &candidates, 3);
+
         assert!(selection.matches_tokens(&normalized_alnum_tokens("Omega Delta", 3)));
+    }
+
+    #[test]
+    fn related_overlap_preserves_candidate_label_multiplicity() {
+        let candidates =
+            build_related_token_candidates(["Omega Delta", "Omega Delta", "Alpha Team"], 3);
+        let selection =
+            select_related_overlap_tokens_from_candidates("Alpha Omega", &candidates, 3);
+
+        assert!(selection.matches_tokens(&normalized_alnum_tokens("Alpha Team", 3)));
+        assert!(!selection.matches_tokens(&normalized_alnum_tokens("Omega Delta", 3)));
+    }
+
+    #[test]
+    fn related_overlap_allows_near_match_when_no_exact_token_candidate_exists() {
+        let candidates = build_related_token_candidates(["Omega Delta"], 3);
+        let selection = select_related_overlap_tokens_from_candidates("Omegax", &candidates, 3);
+        assert!(selection.matches_tokens(&normalized_alnum_tokens("Omega Delta", 3)));
+    }
+
+    #[test]
+    fn related_overlap_allows_prefix_match_when_no_exact_or_near_candidate_exists() {
+        let candidates = build_related_token_candidates(["Acmealpha Gateway", "Beta Gateway"], 3);
+        let selection = select_related_overlap_tokens_from_candidates("Acmew", &candidates, 3);
+
+        assert!(selection.matches_tokens(&normalized_alnum_tokens("Acmealpha Gateway", 3)));
+        assert!(!selection.matches_tokens(&normalized_alnum_tokens("Beta Gateway", 3)));
+    }
+
+    #[test]
+    fn related_overlap_rejects_ambiguous_prefix_candidates() {
+        let candidates =
+            build_related_token_candidates(["Acmealpha Gateway", "Acmebeta Gateway"], 3);
+        let selection = select_related_overlap_tokens_from_candidates("Acmew", &candidates, 3);
+
+        assert!(selection.is_empty());
+    }
+
+    #[test]
+    fn related_overlap_allows_nested_prefix_family_candidates() {
+        let candidates = build_related_token_candidates(
+            ["Acmealpha Gateway", "Acmealphaextra Gateway", "Beta Gateway"],
+            3,
+        );
+        let selection = select_related_overlap_tokens_from_candidates("Acmew", &candidates, 3);
+
+        assert!(selection.matches_tokens(&normalized_alnum_tokens("Acmealpha Gateway", 3)));
+        assert!(selection.matches_tokens(&normalized_alnum_tokens("Acmealphaextra Gateway", 3)));
+        assert!(!selection.matches_tokens(&normalized_alnum_tokens("Beta Gateway", 3)));
+    }
+
+    #[test]
+    fn related_overlap_allows_repeated_same_prefix_canonical_token() {
+        let candidates = build_related_token_candidates(
+            ["Acmealpha Gateway", "Acmealpha Integration", "Beta Gateway"],
+            3,
+        );
+        let selection = select_related_overlap_tokens_from_candidates("Acmew", &candidates, 3);
+
+        assert!(selection.matches_tokens(&normalized_alnum_tokens("Acmealpha Gateway", 3)));
+        assert!(selection.matches_tokens(&normalized_alnum_tokens("Acmealpha Integration", 3)));
+        assert!(!selection.matches_tokens(&normalized_alnum_tokens("Beta Gateway", 3)));
+    }
+
+    #[test]
+    fn related_overlap_rejects_short_prefix_target_tokens() {
+        let candidates = build_related_token_candidates(["Acmealpha Gateway"], 3);
+        let selection = select_related_overlap_tokens_from_candidates("Acme", &candidates, 3);
+
+        assert!(selection.is_empty());
     }
 }

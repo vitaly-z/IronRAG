@@ -2,11 +2,25 @@ use std::collections::{BTreeSet, HashMap};
 
 use uuid::Uuid;
 
-use crate::domains::query_ir::QueryIR;
+use crate::domains::query_ir::{
+    LiteralKind, QueryAct, QueryIR, QueryScope, literal_text_is_identifier_shaped,
+};
 use crate::infra::arangodb::document_store::KnowledgeDocumentRow;
-use crate::services::query::text_match::{near_token_overlap_count, normalized_alnum_tokens};
+use crate::services::query::text_match::{
+    build_related_token_candidates, common_prefix_char_count, near_token_match,
+    near_token_overlap_count, normalized_alnum_tokens,
+    select_related_overlap_tokens_from_candidates,
+};
 
-use super::{retrieve::score_value, types::RuntimeMatchedChunk};
+use super::{
+    question_intent::{
+        canonical_target_type_tag, classify_query_ir_intents,
+        query_ir_has_focused_document_answer_intent,
+        query_ir_targets_graph_entities_or_relationships,
+    },
+    retrieve::score_value,
+    types::RuntimeMatchedChunk,
+};
 
 /// Score gap multiplier for dominant-document detection in answer assembly.
 const DOMINANT_DOCUMENT_SCORE_MULTIPLIER: f32 = 1.2;
@@ -346,7 +360,7 @@ pub(crate) fn resolve_scoped_target_document_ids(
     let Some(ir) = query_ir else {
         return BTreeSet::new();
     };
-    if !matches!(ir.scope, crate::domains::query_ir::QueryScope::SingleDocument) {
+    if !query_ir_allows_document_focus_scope(ir) {
         return BTreeSet::new();
     }
 
@@ -354,12 +368,26 @@ pub(crate) fn resolve_scoped_target_document_ids(
         let hint = document_focus.hint.trim();
         if !hint.is_empty() {
             let targets = document_ids_matching_focus_hint(hint, &document_values);
+            if targets.len() == 1 {
+                return targets;
+            }
+            let entity_hints = ir
+                .target_entities
+                .iter()
+                .filter_map(|entity| {
+                    let label = entity.label.trim();
+                    (!label.is_empty()).then_some(label)
+                })
+                .collect::<Vec<_>>();
+            let targets = refine_document_focus_targets(&targets, &entity_hints, &document_values);
             return if targets.len() == 1 { targets } else { BTreeSet::new() };
         }
     }
 
-    let target_entities_are_document_selectors =
-        ir.target_types.iter().any(|target_type| target_type.trim() == "document");
+    let target_entities_are_document_selectors = ir
+        .target_types
+        .iter()
+        .any(|target_type| canonical_target_type_tag(target_type) == "document");
     if !target_entities_are_document_selectors {
         return BTreeSet::new();
     }
@@ -376,11 +404,68 @@ pub(crate) fn resolve_scoped_target_document_ids(
     if focused_targets.len() == 1 { focused_targets } else { BTreeSet::new() }
 }
 
-fn document_ids_matching_focus_hint(
-    hint: &str,
+pub(crate) fn query_ir_allows_document_focus_scope(ir: &QueryIR) -> bool {
+    if !matches!(ir.scope, QueryScope::SingleDocument) {
+        return false;
+    }
+    if query_ir_has_explicit_document_focus_target(ir) {
+        return true;
+    }
+    !query_ir_requests_broad_document_recall(ir)
+}
+
+fn query_ir_has_explicit_document_focus_target(ir: &QueryIR) -> bool {
+    query_ir_has_focused_document_answer_intent(ir)
+        || ir
+            .target_types
+            .iter()
+            .any(|target_type| canonical_target_type_tag(target_type) == "document")
+}
+
+fn query_ir_requests_broad_document_recall(ir: &QueryIR) -> bool {
+    if query_ir_has_precision_literal_signal(ir) || ir.source_slice.is_some() || ir.is_follow_up() {
+        return false;
+    }
+
+    if !query_ir_has_open_content_target_signal(ir) {
+        return false;
+    }
+
+    ir.requests_source_coverage_context() || ir.comparison.is_some() || ir.target_entities.len() > 1
+}
+
+fn query_ir_has_open_content_target_signal(ir: &QueryIR) -> bool {
+    if ir.target_types.is_empty() {
+        return matches!(ir.act, QueryAct::Enumerate | QueryAct::Meta);
+    }
+    query_ir_targets_open_content(ir)
+}
+
+fn query_ir_targets_open_content(ir: &QueryIR) -> bool {
+    query_ir_targets_graph_entities_or_relationships(ir) || classify_query_ir_intents(ir).is_empty()
+}
+
+fn query_ir_has_precision_literal_signal(ir: &QueryIR) -> bool {
+    ir.literal_constraints
+        .iter()
+        .any(|literal| literal_span_has_precision_shape(literal.kind, &literal.text))
+        && !query_ir_targets_open_content(ir)
+}
+
+fn literal_span_has_precision_shape(kind: LiteralKind, text: &str) -> bool {
+    match kind {
+        LiteralKind::Url | LiteralKind::Path | LiteralKind::Version => true,
+        LiteralKind::Identifier => literal_text_is_identifier_shaped(text),
+        LiteralKind::NumericCode | LiteralKind::Other => false,
+    }
+}
+
+fn document_ids_matching_focus_values(
+    hints: &[&str],
     document_values: &[(Uuid, String)],
 ) -> BTreeSet<Uuid> {
-    let hint_tokens = normalized_alnum_tokens(hint, 3);
+    let hint_tokens =
+        hints.iter().flat_map(|hint| normalized_alnum_tokens(hint, 3)).collect::<BTreeSet<_>>();
     if hint_tokens.is_empty() {
         return BTreeSet::new();
     }
@@ -406,6 +491,95 @@ fn document_ids_matching_focus_hint(
         .into_iter()
         .filter_map(|(document_id, score)| (score == max_score).then_some(document_id))
         .collect()
+}
+
+fn document_ids_matching_focus_hint(
+    hint: &str,
+    document_values: &[(Uuid, String)],
+) -> BTreeSet<Uuid> {
+    let exact_targets = document_ids_matching_focus_values(&[hint], document_values);
+    if !exact_targets.is_empty() {
+        return exact_targets;
+    }
+    document_ids_matching_related_focus_hint(hint, document_values)
+}
+
+fn document_ids_matching_related_focus_hint(
+    hint: &str,
+    document_values: &[(Uuid, String)],
+) -> BTreeSet<Uuid> {
+    let related_candidates =
+        build_related_token_candidates(document_values.iter().map(|(_, value)| value.as_str()), 3);
+    let selection = select_related_overlap_tokens_from_candidates(hint, &related_candidates, 3);
+    if selection.is_empty() {
+        return BTreeSet::new();
+    }
+
+    let mut matches = BTreeSet::new();
+    for (document_id, value) in document_values {
+        let tokens = normalized_alnum_tokens(value, 3);
+        if selection.matches_tokens(&tokens) {
+            matches.insert(*document_id);
+        }
+    }
+    matches
+}
+
+fn refine_document_focus_targets(
+    candidates: &BTreeSet<Uuid>,
+    hints: &[&str],
+    document_values: &[(Uuid, String)],
+) -> BTreeSet<Uuid> {
+    if candidates.len() < 2 || hints.is_empty() {
+        return BTreeSet::new();
+    }
+    let hint_tokens =
+        hints.iter().flat_map(|hint| normalized_alnum_tokens(hint, 3)).collect::<BTreeSet<_>>();
+    if hint_tokens.is_empty() {
+        return BTreeSet::new();
+    }
+
+    let mut scores = HashMap::<Uuid, usize>::new();
+    for (document_id, value) in document_values {
+        if !candidates.contains(document_id) {
+            continue;
+        }
+        let value_tokens = normalized_alnum_tokens(value, 3);
+        let overlap = flexible_token_overlap_count(&hint_tokens, &value_tokens);
+        if overlap > 0 {
+            scores
+                .entry(*document_id)
+                .and_modify(|score| *score = (*score).max(overlap))
+                .or_insert(overlap);
+        }
+    }
+
+    let max_score = scores.values().copied().max().unwrap_or_default();
+    scores
+        .into_iter()
+        .filter_map(|(document_id, score)| (score == max_score).then_some(document_id))
+        .collect()
+}
+
+fn flexible_token_overlap_count(left: &BTreeSet<String>, right: &BTreeSet<String>) -> usize {
+    left.iter()
+        .filter(|left_token| {
+            right.iter().any(|right_token| flexible_document_token_match(left_token, right_token))
+        })
+        .count()
+}
+
+fn flexible_document_token_match(left: &str, right: &str) -> bool {
+    if near_token_match(left, right) {
+        return true;
+    }
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    let min_len = left_len.min(right_len);
+    if min_len < 7 {
+        return false;
+    }
+    common_prefix_char_count(left, right) >= 6
 }
 
 fn flattened_document_candidate_values(
@@ -643,10 +817,12 @@ mod tests {
 
     use super::{
         explicit_document_reference_literal_is_present, explicit_document_reference_literals,
-        explicit_target_document_ids_from_values, resolve_scoped_target_document_ids,
+        explicit_target_document_ids_from_values, query_ir_allows_document_focus_scope,
+        resolve_scoped_target_document_ids,
     };
     use crate::domains::query_ir::{
-        DocumentHint, EntityMention, EntityRole, QueryAct, QueryIR, QueryLanguage, QueryScope,
+        DocumentHint, EntityMention, EntityRole, LiteralKind, LiteralSpan, QueryAct, QueryIR,
+        QueryLanguage, QueryScope,
     };
 
     fn scoped_query_ir(
@@ -748,6 +924,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_scoped_target_document_ids_uses_related_focus_prefix() {
+        let focused_document_id = Uuid::now_v7();
+        let other_document_id = Uuid::now_v7();
+        let index = scoped_document_index([
+            (
+                focused_document_id,
+                "acmealpha-guide.md",
+                Some("Acmealpha payment setup guide"),
+                "acmealpha-guide.md",
+            ),
+            (other_document_id, "beta-guide.md", Some("Beta payment setup guide"), "beta-guide.md"),
+        ]);
+        let ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Acmew"),
+            &["installation", "configuration file", "parameters"],
+        );
+
+        let target_ids =
+            resolve_scoped_target_document_ids("Show the setup details.", Some(&ir), &index);
+
+        assert_eq!(target_ids, BTreeSet::from([focused_document_id]));
+    }
+
+    #[test]
     fn resolve_scoped_target_document_ids_keeps_document_focus_when_entities_are_values() {
         let alpha_document_id = Uuid::now_v7();
         let beta_document_id = Uuid::now_v7();
@@ -765,6 +966,335 @@ mod tests {
             resolve_scoped_target_document_ids("What is the renewal policy?", Some(&ir), &index);
 
         assert_eq!(target_ids, BTreeSet::from([alpha_document_id]));
+    }
+
+    #[test]
+    fn compare_concept_query_ir_does_not_enable_document_focus_scope() {
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite"),
+            &["connector options", "fallback behavior", "regional limits"],
+        );
+        ir.act = QueryAct::Compare;
+        ir.target_types = vec!["concept".to_string()];
+
+        assert!(
+            !query_ir_allows_document_focus_scope(&ir),
+            "broad compare over concepts must preserve cross-document recall"
+        );
+    }
+
+    #[test]
+    fn describe_concept_query_ir_does_not_enable_document_focus_scope() {
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite"),
+            &["connector options"],
+        );
+        ir.act = QueryAct::Describe;
+        ir.target_types = vec!["concept".to_string()];
+
+        assert!(
+            !query_ir_allows_document_focus_scope(&ir),
+            "open-content descriptions must preserve source coverage unless the IR explicitly targets a document"
+        );
+    }
+
+    #[test]
+    fn configure_multi_target_query_ir_does_not_enable_document_focus_scope() {
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite"),
+            &["connector options", "fallback behavior", "regional limits"],
+        );
+        ir.act = QueryAct::ConfigureHow;
+        ir.target_types = vec!["procedure".to_string()];
+
+        assert!(
+            !query_ir_allows_document_focus_scope(&ir),
+            "multi-topic procedural questions must not collapse to one hinted document"
+        );
+    }
+
+    #[test]
+    fn broad_content_literal_other_does_not_enable_document_focus_scope() {
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite connector options"),
+            &["connector options", "fallback behavior", "regional limits"],
+        );
+        ir.act = QueryAct::Enumerate;
+        ir.target_types = vec!["concept".to_string()];
+        ir.literal_constraints =
+            vec![LiteralSpan { text: "Alpha Suite".to_string(), kind: LiteralKind::Other }];
+
+        assert!(
+            !query_ir_allows_document_focus_scope(&ir),
+            "broad open-content literals must not force single-document packing"
+        );
+    }
+
+    #[test]
+    fn plain_alphabetic_identifier_does_not_enable_document_focus_scope() {
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite fallback behavior"),
+            &["path", "condition"],
+        );
+        ir.act = QueryAct::RetrieveValue;
+        ir.target_types = vec!["path".to_string(), "concept".to_string()];
+        ir.literal_constraints =
+            vec![LiteralSpan { text: "alpha".to_string(), kind: LiteralKind::Identifier }];
+
+        assert!(
+            !query_ir_allows_document_focus_scope(&ir),
+            "plain alphabetic literals are weak topic echoes and must not force single-document packing"
+        );
+    }
+
+    #[test]
+    fn plain_alphabetic_identifier_does_not_block_enumerate_broad_recall() {
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite connector options"),
+            &["connector options", "fallback behavior"],
+        );
+        ir.act = QueryAct::Enumerate;
+        ir.literal_constraints =
+            vec![LiteralSpan { text: "alpha".to_string(), kind: LiteralKind::Identifier }];
+
+        assert!(
+            !query_ir_allows_document_focus_scope(&ir),
+            "plain alphabetic identifier literals must not cancel broad enumerate recall"
+        );
+    }
+
+    #[test]
+    fn exact_lookup_query_ir_keeps_document_focus_scope() {
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite Admin Guide"),
+            &["callback URL"],
+        );
+        ir.act = QueryAct::RetrieveValue;
+        ir.target_types = vec!["url".to_string()];
+        ir.literal_constraints =
+            vec![LiteralSpan { text: "callbackUrl".to_string(), kind: LiteralKind::Identifier }];
+
+        assert!(
+            query_ir_allows_document_focus_scope(&ir),
+            "exact lookup intents may use the single-document focus for precision and speed"
+        );
+    }
+
+    #[test]
+    fn compare_document_query_ir_keeps_explicit_document_focus_scope() {
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite Admin Guide"),
+            &["current section", "previous section"],
+        );
+        ir.act = QueryAct::Compare;
+        ir.target_types = vec!["document".to_string()];
+
+        assert!(
+            query_ir_allows_document_focus_scope(&ir),
+            "compare may pack one document only when the typed IR explicitly targets a document"
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_target_document_ids_refines_focus_with_entity_prefix_overlap() {
+        let catalog_document_id = Uuid::now_v7();
+        let generic_document_id = Uuid::now_v7();
+        let index = scoped_document_index([
+            (
+                catalog_document_id,
+                "catalog-options.md",
+                Some("Alpha Suite integrated connector catalog"),
+                "catalog-options.md",
+            ),
+            (
+                generic_document_id,
+                "alpha-overview.md",
+                Some("Alpha Suite overview"),
+                "alpha-overview.md",
+            ),
+        ]);
+        let ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite"),
+            &["integration variants", "connected catalog"],
+        );
+
+        let target_ids =
+            resolve_scoped_target_document_ids("Enumerate the variants.", Some(&ir), &index);
+
+        assert_eq!(target_ids, BTreeSet::from([catalog_document_id]));
+    }
+
+    #[test]
+    fn resolve_scoped_target_document_ids_does_not_hard_scope_enumerate_focus() {
+        let focused_document_id = Uuid::now_v7();
+        let companion_document_id = Uuid::now_v7();
+        let index = scoped_document_index([
+            (
+                focused_document_id,
+                "alpha-overview.md",
+                Some("Alpha Suite overview"),
+                "alpha-overview.md",
+            ),
+            (
+                companion_document_id,
+                "alpha-connectors.md",
+                Some("Alpha Suite connector catalog"),
+                "alpha-connectors.md",
+            ),
+        ]);
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite"),
+            &["connector catalog"],
+        );
+        ir.act = QueryAct::Enumerate;
+
+        let target_ids = resolve_scoped_target_document_ids(
+            "Enumerate the connector options.",
+            Some(&ir),
+            &index,
+        );
+
+        assert!(
+            target_ids.is_empty(),
+            "enumeration questions must keep library-wide recall unless the user names a concrete document"
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_target_document_ids_keeps_enumerate_document_target() {
+        let focused_document_id = Uuid::now_v7();
+        let companion_document_id = Uuid::now_v7();
+        let index = scoped_document_index([
+            (
+                focused_document_id,
+                "alpha-overview.md",
+                Some("Alpha Suite overview"),
+                "alpha-overview.md",
+            ),
+            (
+                companion_document_id,
+                "alpha-connectors.md",
+                Some("Alpha Suite connector catalog"),
+                "alpha-connectors.md",
+            ),
+        ]);
+        let mut ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite"),
+            &["connector catalog"],
+        );
+        ir.act = QueryAct::Enumerate;
+        ir.target_types = vec!["document".to_string()];
+
+        let target_ids = resolve_scoped_target_document_ids(
+            "Enumerate the sections in Alpha Suite overview.",
+            Some(&ir),
+            &index,
+        );
+
+        assert_eq!(target_ids, BTreeSet::from([focused_document_id]));
+    }
+
+    #[test]
+    fn resolve_scoped_target_document_ids_keeps_focus_anchor_before_entity_refine() {
+        let focused_document_id = Uuid::now_v7();
+        let entity_collision_document_id = Uuid::now_v7();
+        let index = scoped_document_index([
+            (
+                focused_document_id,
+                "alpha-overview.md",
+                Some("Alpha Suite overview"),
+                "alpha-overview.md",
+            ),
+            (
+                entity_collision_document_id,
+                "beta-connectors.md",
+                Some("Beta Suite integrated connector catalog"),
+                "beta-connectors.md",
+            ),
+        ]);
+        let ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite"),
+            &["connector catalog"],
+        );
+
+        let target_ids = resolve_scoped_target_document_ids(
+            "Enumerate the connector catalog.",
+            Some(&ir),
+            &index,
+        );
+
+        assert_eq!(target_ids, BTreeSet::from([focused_document_id]));
+    }
+
+    #[test]
+    fn resolve_scoped_target_document_ids_does_not_prefix_loosen_primary_focus() {
+        let exact_document_id = Uuid::now_v7();
+        let prefix_collision_document_id = Uuid::now_v7();
+        let index = scoped_document_index([
+            (
+                exact_document_id,
+                "alpha-integrated.md",
+                Some("Alpha integrated connector guide"),
+                "alpha-integrated.md",
+            ),
+            (
+                prefix_collision_document_id,
+                "alpha-integration.md",
+                Some("Alpha integration connector guide"),
+                "alpha-integration.md",
+            ),
+        ]);
+        let ir = scoped_query_ir(QueryScope::SingleDocument, Some("Alpha integrated"), &[]);
+
+        let target_ids =
+            resolve_scoped_target_document_ids("Open Alpha integrated.", Some(&ir), &index);
+
+        assert_eq!(target_ids, BTreeSet::from([exact_document_id]));
+    }
+
+    #[test]
+    fn resolve_scoped_target_document_ids_rejects_ambiguous_focus_refine() {
+        let first_document_id = Uuid::now_v7();
+        let second_document_id = Uuid::now_v7();
+        let index = scoped_document_index([
+            (
+                first_document_id,
+                "alpha-connectors-a.md",
+                Some("Alpha Suite integrated connector catalog"),
+                "alpha-connectors-a.md",
+            ),
+            (
+                second_document_id,
+                "alpha-connectors-b.md",
+                Some("Alpha Suite connector catalog matrix"),
+                "alpha-connectors-b.md",
+            ),
+        ]);
+        let ir = scoped_query_ir(
+            QueryScope::SingleDocument,
+            Some("Alpha Suite"),
+            &["connector catalog"],
+        );
+
+        let target_ids = resolve_scoped_target_document_ids(
+            "Enumerate the connector catalog.",
+            Some(&ir),
+            &index,
+        );
+
+        assert!(target_ids.is_empty());
     }
 
     #[test]

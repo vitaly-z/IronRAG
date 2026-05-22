@@ -10,7 +10,10 @@ use uuid::Uuid;
 use crate::{
     app::state::AppState,
     infra::repositories::{self, RuntimeGraphEdgeRow, RuntimeGraphNodeRow},
-    services::knowledge::error::KnowledgeServiceError,
+    services::{
+        graph::canonical_projection::canonicalize_runtime_graph_projection,
+        knowledge::error::KnowledgeServiceError,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -166,7 +169,11 @@ pub async fn load_active_runtime_graph_projection(
     .context("failed to load admitted runtime graph nodes")?;
     let elapsed_ms = load_started.elapsed().as_millis();
 
-    let projection = Arc::new(ActiveRuntimeGraphProjection { nodes, edges });
+    let canonical_projection = canonicalize_runtime_graph_projection(nodes, edges);
+    let projection = Arc::new(ActiveRuntimeGraphProjection {
+        nodes: canonical_projection.nodes,
+        edges: canonical_projection.edges,
+    });
     tracing::info!(
         stage = "graph_projection_cache",
         %library_id,

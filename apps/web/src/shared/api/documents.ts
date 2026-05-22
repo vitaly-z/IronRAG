@@ -304,6 +304,17 @@ export const documentsApi = {
     }
     return response.text();
   },
+  getEditorSourceText: async (documentId: string) => {
+    const query = new URLSearchParams({ representation: "editor_markdown" });
+    const response = await fetch(
+      `/v1/content/documents/${encodeURIComponent(documentId)}/source?${query}`,
+      { credentials: "include" },
+    );
+    if (!response.ok) {
+      throw new ApiError(response.status, await readApiErrorBody(response));
+    }
+    return response.text();
+  },
   getRevisions: (documentId: string) =>
     Content.listContentRevisions({ path: { documentId } }).then(
       (result): ContentRevision[] => unwrap(result),

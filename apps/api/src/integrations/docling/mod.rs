@@ -106,6 +106,8 @@ struct DoclingExtractionPayload {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
+    picture_ocr_text: Vec<String>,
+    #[serde(default)]
     page_count: Option<u32>,
     #[serde(default)]
     status: Option<String>,
@@ -260,6 +262,7 @@ async fn extract_document_paginated(
     let mut merged_markdown = String::new();
     let mut merged_text = String::new();
     let mut merged_pictures: Vec<DoclingExtractionPicture> = Vec::new();
+    let mut merged_picture_ocr_text: Vec<String> = Vec::new();
     let mut all_warnings: Vec<String> = Vec::new();
     let mut total_seconds = 0.0_f64;
     let mut status: Option<String> = None;
@@ -304,6 +307,7 @@ async fn extract_document_paginated(
             if let Some(ref text) = payload.text {
                 merged_text.push_str(text);
             }
+            merged_picture_ocr_text.extend(payload.picture_ocr_text);
 
             for mut pic in payload.pictures {
                 pic.index += picture_index_offset;
@@ -333,6 +337,7 @@ async fn extract_document_paginated(
     let merged_payload = DoclingExtractionPayload {
         markdown: merged_markdown,
         text: Some(merged_text),
+        picture_ocr_text: merged_picture_ocr_text,
         page_count: Some(page_count),
         status,
         input_format,
@@ -353,6 +358,7 @@ fn merge_batch_payload(
     let mut merged_markdown = String::new();
     let mut merged_text = String::new();
     let mut merged_pictures: Vec<DoclingExtractionPicture> = Vec::new();
+    let mut merged_picture_ocr_text: Vec<String> = Vec::new();
     let mut all_warnings: Vec<String> = Vec::new();
     let mut total_seconds = 0.0_f64;
     let mut status: Option<String> = None;
@@ -368,6 +374,7 @@ fn merge_batch_payload(
         if let Some(ref text) = payload.text {
             merged_text.push_str(text);
         }
+        merged_picture_ocr_text.extend(payload.picture_ocr_text);
 
         for mut picture in payload.pictures {
             picture.index += picture_index_offset;
@@ -386,6 +393,7 @@ fn merge_batch_payload(
     DoclingExtractionPayload {
         markdown: merged_markdown,
         text: Some(merged_text),
+        picture_ocr_text: merged_picture_ocr_text,
         page_count: Some(page_count),
         status,
         input_format,
@@ -666,8 +674,11 @@ fn build_output(
     mime_type: Option<&str>,
     source_format: &str,
 ) -> Result<ExtractionOutput, DoclingExtractionError> {
+    let has_picture_payload = !payload.pictures.is_empty();
+    let has_picture_ocr_text =
+        payload.picture_ocr_text.iter().any(|snippet| !snippet.trim().is_empty());
     let content = select_docling_content(payload.markdown, payload.text);
-    if content.trim().is_empty() {
+    if content.trim().is_empty() && !has_picture_payload && !has_picture_ocr_text {
         return Err(DoclingExtractionError::EmptyOutput);
     }
 
@@ -714,6 +725,7 @@ fn build_output(
             "docling_input_format": input_format,
             "docling_status": payload.status,
             "docling_version": payload.docling_version,
+            "docling_picture_ocr_text": payload.picture_ocr_text,
             "timings": payload.timings,
         }),
         provider_kind: None,
@@ -903,6 +915,7 @@ mod tests {
             markdown: "# Operations Report\n\n| Region | Amount |\n|---|---:|\n| West | 42 |"
                 .to_string(),
             text: None,
+            picture_ocr_text: Vec::new(),
             page_count: Some(2),
             status: Some("success".to_string()),
             input_format: Some("pdf".to_string()),
@@ -931,6 +944,7 @@ mod tests {
         let payload = DoclingExtractionPayload {
             markdown: "<!-- image -->".to_string(),
             text: Some("Formats PDF / DOCX / PPTX / PNG / JPG".to_string()),
+            picture_ocr_text: Vec::new(),
             page_count: Some(1),
             status: Some("success".to_string()),
             input_format: Some("pdf".to_string()),
@@ -951,6 +965,7 @@ mod tests {
         let payload = DoclingExtractionPayload {
             markdown: "<!-- image -->".to_string(),
             text: None,
+            picture_ocr_text: Vec::new(),
             page_count: Some(1),
             status: Some("success".to_string()),
             input_format: Some("pdf".to_string()),

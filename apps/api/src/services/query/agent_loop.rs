@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::{
     app::state::AppState,
     domains::provider_profiles::ProviderModelSelection,
+    domains::query::{QueryTurnKind, resolve_contextual_grounded_answer_top_k},
     domains::{agent_runtime::RuntimeSurfaceKind, ai::AiBindingPurpose},
     integrations::llm::{ChatMessage, ChatToolCall, ChatToolDef, ToolUseRequest},
     interfaces::http::{
@@ -39,7 +40,9 @@ use crate::{
         llm_context_debug::{
             AgentLoopMetadata, AgentStopReason, LlmIterationDebug, ResponseToolCallDebug,
         },
+        service::ExternalConversationTurn,
     },
+    shared::text_tokens::literal_wildcard_prefixes,
 };
 
 const RUNTIME_RETRIEVED_CONTEXT_TOOL: &str = "ironrag_retrieved_context";
@@ -68,6 +71,7 @@ pub struct AgentTurnResult {
     pub iterations: usize,
     pub assistant_grounding: AssistantGroundingEvidence,
     pub child_query_execution_ids: Vec<Uuid>,
+    pub verified_grounded_answer_passthrough_execution_id: Option<Uuid>,
     /// Per-iteration capture of the exact LLM request/response chain,
     /// for the assistant debug panel. Populated unconditionally — the
     /// cost is a few clones and the operator toggles the UI to view.
@@ -121,6 +125,7 @@ pub struct McpToolAgentTurnInput<'a> {
     pub library_ref: &'a str,
     pub user_question: &'a str,
     pub conversation_history: &'a [ChatMessage],
+    pub grounded_answer_tool_history: &'a [ExternalConversationTurn],
     pub request_id: &'a str,
     pub grounded_answer_top_k: usize,
     pub iteration_cap: usize,
@@ -160,6 +165,8 @@ pub enum AgentLoopActivityEvent {
 
 #[derive(Debug, Clone)]
 struct ToolExecutionOutcome {
+    arguments_json: Option<String>,
+    requested_arguments_json: Option<String>,
     message_content: String,
     result_text: Option<String>,
     result_json: Option<Value>,
@@ -242,6 +249,10 @@ pub async fn run_mcp_tool_agent_turn(
     let mut child_query_execution_ids = Vec::new();
     let mut stopped_reason = AgentStopReason::IterationCap;
     let mut last_required_tool_refusal_answer: Option<String> = None;
+    let requires_grounded_answer_tool = user_question_requires_grounded_answer_tool(
+        input.user_question,
+        input.grounded_answer_tool_history,
+    );
 
     // There is no hidden post-loop synthesis pass: the model must spend
     // one of these iterations on a final answer after seeing tool results.
@@ -268,9 +279,14 @@ pub async fn run_mcp_tool_agent_turn(
             force_final_answer,
             &tool_defs,
             &successful_tool_names,
+            requires_grounded_answer_tool,
         );
-        let tools_for_iteration =
-            tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, force_final_answer);
+        let tools_for_iteration = tool_defs_for_agent_iteration(
+            &tool_defs,
+            &successful_tool_names,
+            force_final_answer,
+            requires_grounded_answer_tool,
+        );
         let request_messages = messages.clone();
         emit_activity(
             &input.activity_tx,
@@ -372,6 +388,7 @@ pub async fn run_mcp_tool_agent_turn(
                         iterations: debug_iterations.len(),
                         assistant_grounding,
                         child_query_execution_ids,
+                        verified_grounded_answer_passthrough_execution_id: None,
                         debug_iterations,
                         agent_loop: Some(agent_loop_metadata(
                             iteration_cap,
@@ -397,6 +414,7 @@ pub async fn run_mcp_tool_agent_turn(
                 iterations: debug_iterations.len(),
                 assistant_grounding,
                 child_query_execution_ids,
+                verified_grounded_answer_passthrough_execution_id: None,
                 debug_iterations,
                 agent_loop: Some(agent_loop_metadata(
                     iteration_cap,
@@ -442,7 +460,7 @@ pub async fn run_mcp_tool_agent_turn(
         let mut child_runtime_execution_ids = Vec::new();
         let can_return_verified_grounded_answer =
             can_return_verified_grounded_answer_without_synthesis(&tool_calls);
-        let mut verified_grounded_answer_final: Option<String> = None;
+        let mut verified_grounded_answer_final: Option<(String, Option<Uuid>)> = None;
         for (call, outcome) in tool_calls.iter().zip(outcomes.iter()) {
             child_query_execution_ids.extend(outcome.child_query_execution_ids.iter().copied());
             child_runtime_execution_ids.extend(outcome.child_runtime_execution_ids.iter().copied());
@@ -453,7 +471,10 @@ pub async fn run_mcp_tool_agent_turn(
                     verified_grounded_answer_call_count =
                         verified_grounded_answer_call_count.saturating_add(1);
                     if can_return_verified_grounded_answer {
-                        verified_grounded_answer_final = Some(answer_text.clone());
+                        verified_grounded_answer_final = Some((
+                            answer_text.clone(),
+                            outcome.child_query_execution_ids.first().copied(),
+                        ));
                     }
                 }
                 if let Some(grounding_text) = &outcome.grounding_text {
@@ -467,7 +488,11 @@ pub async fn run_mcp_tool_agent_turn(
             response_tool_calls.push(ResponseToolCallDebug {
                 id: call.id.clone(),
                 name: call.name.clone(),
-                arguments_json: call.arguments_json.clone(),
+                arguments_json: outcome
+                    .arguments_json
+                    .clone()
+                    .unwrap_or_else(|| call.arguments_json.clone()),
+                requested_arguments_json: outcome.requested_arguments_json.clone(),
                 result_text: outcome.result_text.clone(),
                 result_json: outcome.result_json.clone(),
                 is_error: outcome.is_error,
@@ -490,7 +515,7 @@ pub async fn run_mcp_tool_agent_turn(
             usage: response.usage_json,
             child_runtime_execution_ids,
         });
-        if let Some(answer) = verified_grounded_answer_final {
+        if let Some((answer, passthrough_execution_id)) = verified_grounded_answer_final {
             stopped_reason = AgentStopReason::FinalAnswer;
             return Ok(AgentTurnResult {
                 answer,
@@ -499,6 +524,7 @@ pub async fn run_mcp_tool_agent_turn(
                 iterations: debug_iterations.len(),
                 assistant_grounding,
                 child_query_execution_ids,
+                verified_grounded_answer_passthrough_execution_id: passthrough_execution_id,
                 debug_iterations,
                 agent_loop: Some(agent_loop_metadata(
                     iteration_cap,
@@ -607,9 +633,16 @@ fn should_require_tool_call_before_final(
     force_final_answer: bool,
     tool_defs: &[ChatToolDef],
     successful_tool_names: &BTreeSet<String>,
+    requires_grounded_answer_tool: bool,
 ) -> bool {
     if force_final_answer || tool_defs.is_empty() {
         return false;
+    }
+    if requires_grounded_answer_tool
+        && tool_defs.iter().any(|tool| tool.name == GROUNDED_ANSWER_TOOL_NAME)
+        && !successful_tool_names.contains(GROUNDED_ANSWER_TOOL_NAME)
+    {
+        return true;
     }
     successful_tool_names.len() < required_distinct_tool_count(tool_defs, successful_tool_names)
 }
@@ -618,9 +651,21 @@ fn tool_defs_for_agent_iteration(
     tool_defs: &[ChatToolDef],
     successful_tool_names: &BTreeSet<String>,
     force_final_answer: bool,
+    requires_grounded_answer_tool: bool,
 ) -> Vec<ChatToolDef> {
     if force_final_answer || tool_defs.is_empty() {
         return Vec::new();
+    }
+
+    if requires_grounded_answer_tool && !successful_tool_names.contains(GROUNDED_ANSWER_TOOL_NAME) {
+        let grounded_only = tool_defs
+            .iter()
+            .filter(|tool| tool.name == GROUNDED_ANSWER_TOOL_NAME)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !grounded_only.is_empty() {
+            return grounded_only;
+        }
     }
 
     if successful_tool_names.is_empty() {
@@ -664,6 +709,14 @@ fn has_composite_tool_signal(successful_tool_names: &BTreeSet<String>) -> bool {
         successful_tool_names.contains(GROUNDED_ANSWER_TOOL_NAME),
     ];
     categories.into_iter().filter(|present| *present).count() >= 2
+}
+
+fn user_question_requires_grounded_answer_tool(
+    user_question: &str,
+    grounded_answer_tool_history: &[ExternalConversationTurn],
+) -> bool {
+    text_has_wildcard_scope(user_question)
+        || grounded_answer_history_has_dense_code_literals(None, grounded_answer_tool_history)
 }
 
 fn is_document_content_tool(tool_name: &str) -> bool {
@@ -772,11 +825,13 @@ async fn execute_one_tool_call(
     {
         return tool_execution_error(message);
     }
+    let requested_arguments = arguments.clone();
     apply_agent_tool_argument_defaults(
         &call.name,
         &mut arguments,
         input.grounded_answer_top_k,
         input.library_ref,
+        input.grounded_answer_tool_history,
     );
 
     let context = ToolCallContext {
@@ -799,8 +854,13 @@ async fn execute_one_tool_call(
     let grounding_text = tool_result_verification_text(&call.name, &result);
     let verified_grounded_answer_text = verified_grounded_answer_text(&call.name, &result);
     let result_json = Some(debug_tool_result_json(&result));
+    let arguments_json = Some(arguments.to_string());
+    let requested_arguments_json =
+        (requested_arguments != arguments).then(|| call.arguments_json.clone());
 
     ToolExecutionOutcome {
+        arguments_json,
+        requested_arguments_json,
         message_content,
         result_text,
         result_json,
@@ -857,6 +917,7 @@ fn apply_agent_tool_argument_defaults(
     arguments: &mut Value,
     grounded_top_k: usize,
     library_ref: &str,
+    grounded_answer_tool_history: &[ExternalConversationTurn],
 ) {
     let Value::Object(object) = arguments else {
         return;
@@ -873,8 +934,31 @@ fn apply_agent_tool_argument_defaults(
             .get("topK")
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok());
-        if requested_top_k.is_none_or(|value| value > bounded_top_k) {
-            object.insert("topK".to_string(), serde_json::json!(bounded_top_k));
+        let turns = grounded_answer_conversation_turn_defaults(grounded_answer_tool_history);
+        let has_explicit_conversation_turns = object.contains_key("conversationTurns");
+        let has_contextual_turns = has_nonempty_conversation_turns(object.get("conversationTurns"))
+            || (!has_explicit_conversation_turns && !turns.is_empty());
+        let mut effective_top_k = resolve_contextual_grounded_answer_top_k(
+            requested_top_k,
+            has_contextual_turns,
+            bounded_top_k,
+        );
+        if has_contextual_turns
+            && grounded_answer_history_has_dense_code_literals(
+                object.get("conversationTurns"),
+                grounded_answer_tool_history,
+            )
+        {
+            effective_top_k = effective_top_k.max(bounded_top_k);
+        }
+        if grounded_answer_query_has_wildcard_scope(object.get("query")) {
+            effective_top_k = effective_top_k.max(bounded_top_k);
+        }
+        if requested_top_k != Some(effective_top_k) {
+            object.insert("topK".to_string(), serde_json::json!(effective_top_k));
+        }
+        if !turns.is_empty() && !object.contains_key("conversationTurns") {
+            object.insert("conversationTurns".to_string(), Value::Array(turns));
         }
         return;
     }
@@ -895,6 +979,91 @@ fn apply_agent_tool_argument_defaults(
             object.insert("limit".to_string(), serde_json::json!(bounded_limit));
         }
     }
+}
+
+fn has_nonempty_conversation_turns(value: Option<&Value>) -> bool {
+    matches!(value, Some(Value::Array(items)) if !items.is_empty())
+}
+
+fn grounded_answer_history_has_dense_code_literals(
+    explicit_turns: Option<&Value>,
+    fallback_turns: &[ExternalConversationTurn],
+) -> bool {
+    const DENSE_CODE_LITERAL_MIN_COUNT: usize = 8;
+
+    let mut literal_count = 0usize;
+    if let Some(Value::Array(turns)) = explicit_turns {
+        for turn in turns {
+            let is_assistant = turn.get("role").and_then(Value::as_str) == Some("assistant");
+            if !is_assistant {
+                continue;
+            }
+            if let Some(content) = turn.get("content").and_then(Value::as_str) {
+                literal_count += code_literal_count(content);
+            }
+        }
+    } else {
+        for turn in fallback_turns {
+            if !matches!(turn.turn_kind, QueryTurnKind::Assistant) {
+                continue;
+            }
+            literal_count += code_literal_count(&turn.content_text);
+        }
+    }
+
+    literal_count >= DENSE_CODE_LITERAL_MIN_COUNT
+}
+
+fn grounded_answer_query_has_wildcard_scope(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(text_has_wildcard_scope)
+}
+
+fn text_has_wildcard_scope(value: &str) -> bool {
+    !literal_wildcard_prefixes(value, 2).is_empty()
+}
+
+fn code_literal_count(value: &str) -> usize {
+    let mut count = 0usize;
+    let mut in_literal = false;
+    let mut literal_start = 0usize;
+    for (index, ch) in value.char_indices() {
+        if ch != '`' {
+            continue;
+        }
+        if in_literal {
+            if index > literal_start {
+                count += 1;
+            }
+            in_literal = false;
+        } else {
+            in_literal = true;
+            literal_start = index + ch.len_utf8();
+        }
+    }
+    count
+}
+
+fn grounded_answer_conversation_turn_defaults(
+    conversation_turns: &[ExternalConversationTurn],
+) -> Vec<Value> {
+    conversation_turns
+        .iter()
+        .filter_map(|turn| {
+            let role = match turn.turn_kind {
+                QueryTurnKind::User => "user",
+                QueryTurnKind::Assistant => "assistant",
+                QueryTurnKind::System | QueryTurnKind::Tool => return None,
+            };
+            let content = turn.content_text.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "role": role,
+                "content": content,
+            }))
+        })
+        .collect()
 }
 
 fn tool_uses_single_library_scope(tool_name: &str) -> bool {
@@ -963,6 +1132,8 @@ fn tool_execution_error(message: impl Into<String>) -> ToolExecutionOutcome {
         "isError": true
     });
     ToolExecutionOutcome {
+        arguments_json: None,
+        requested_arguments_json: None,
         message_content: serde_json::to_string(&result_json).unwrap_or_else(|_| {
             serde_json::json!({
                 "content": [{
@@ -1380,6 +1551,7 @@ pub async fn run_single_shot_turn(
         // grounding when it records the generation stage.
         assistant_grounding: AssistantGroundingEvidence::default(),
         child_query_execution_ids: Vec::new(),
+        verified_grounded_answer_passthrough_execution_id: None,
         debug_iterations: vec![debug_iteration],
         agent_loop: None,
     })
@@ -1466,6 +1638,7 @@ pub async fn run_literal_fidelity_revision_turn(
         iterations: 1,
         assistant_grounding: AssistantGroundingEvidence::default(),
         child_query_execution_ids: Vec::new(),
+        verified_grounded_answer_passthrough_execution_id: None,
         debug_iterations: vec![debug_iteration],
         agent_loop: None,
     })
@@ -1562,6 +1735,7 @@ pub async fn run_clarify_turn(
         iterations: 1,
         assistant_grounding: AssistantGroundingEvidence::default(),
         child_query_execution_ids: Vec::new(),
+        verified_grounded_answer_passthrough_execution_id: None,
         debug_iterations: vec![debug_iteration],
         agent_loop: None,
     })
@@ -1942,34 +2116,50 @@ mod tests {
         })
         .collect::<Vec<_>>();
 
-        assert!(should_require_tool_call_before_final(false, &tool_defs, &BTreeSet::new()));
+        assert!(should_require_tool_call_before_final(false, &tool_defs, &BTreeSet::new(), false));
 
         let simple_evidence = BTreeSet::from(["search_documents".to_string()]);
-        assert!(!should_require_tool_call_before_final(false, &tool_defs, &simple_evidence));
+        assert!(!should_require_tool_call_before_final(false, &tool_defs, &simple_evidence, false));
 
         let composite_evidence =
             BTreeSet::from(["search_documents".to_string(), "search_entities".to_string()]);
-        assert!(should_require_tool_call_before_final(false, &tool_defs, &composite_evidence));
+        assert!(should_require_tool_call_before_final(
+            false,
+            &tool_defs,
+            &composite_evidence,
+            false
+        ));
 
         let complete_composite = BTreeSet::from([
             "search_documents".to_string(),
             "search_entities".to_string(),
             "read_document".to_string(),
         ]);
-        assert!(!should_require_tool_call_before_final(false, &tool_defs, &complete_composite));
-        assert!(!should_require_tool_call_before_final(true, &tool_defs, &BTreeSet::new()));
-        assert!(!should_require_tool_call_before_final(false, &[], &BTreeSet::new()));
+        assert!(!should_require_tool_call_before_final(
+            false,
+            &tool_defs,
+            &complete_composite,
+            false
+        ));
+        assert!(!should_require_tool_call_before_final(true, &tool_defs, &BTreeSet::new(), false));
+        assert!(!should_require_tool_call_before_final(false, &[], &BTreeSet::new(), false));
 
         let answer_only = [ChatToolDef {
             name: GROUNDED_ANSWER_TOOL_NAME.to_string(),
             description: String::new(),
             parameters: serde_json::json!({}),
         }];
-        assert!(should_require_tool_call_before_final(false, &answer_only, &BTreeSet::new()));
+        assert!(should_require_tool_call_before_final(
+            false,
+            &answer_only,
+            &BTreeSet::new(),
+            false
+        ));
         assert!(!should_require_tool_call_before_final(
             false,
             &answer_only,
-            &BTreeSet::from([GROUNDED_ANSWER_TOOL_NAME.to_string()])
+            &BTreeSet::from([GROUNDED_ANSWER_TOOL_NAME.to_string()]),
+            false
         ));
     }
 
@@ -1992,7 +2182,8 @@ mod tests {
         .collect::<Vec<_>>();
         let successful_tool_names = BTreeSet::new();
 
-        let next_tools = tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, false);
+        let next_tools =
+            tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, false, false);
         let next_names = next_tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
         assert_eq!(
             next_names,
@@ -2008,7 +2199,8 @@ mod tests {
 
         let mut successful_tool_names = BTreeSet::from(["search_documents".to_string()]);
 
-        let next_tools = tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, false);
+        let next_tools =
+            tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, false, false);
         let next_names = next_tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
         assert_eq!(
             next_names,
@@ -2023,14 +2215,16 @@ mod tests {
         );
 
         successful_tool_names.insert("search_entities".to_string());
-        let next_tools = tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, false);
+        let next_tools =
+            tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, false, false);
         assert_eq!(
             next_tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
             vec!["grounded_answer", "read_document"]
         );
 
         successful_tool_names.insert("read_document".to_string());
-        let next_tools = tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, false);
+        let next_tools =
+            tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, false, false);
         assert_eq!(
             next_tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
             vec![
@@ -2043,7 +2237,10 @@ mod tests {
             ]
         );
 
-        assert!(tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, true).is_empty());
+        assert!(
+            tool_defs_for_agent_iteration(&tool_defs, &successful_tool_names, true, false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2057,12 +2254,43 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let next_tools = tool_defs_for_agent_iteration(&tool_defs, &BTreeSet::new(), false);
+        let next_tools = tool_defs_for_agent_iteration(&tool_defs, &BTreeSet::new(), false, false);
 
         assert_eq!(
             next_tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
             vec!["list_workspaces", "list_libraries", "grounded_answer"]
         );
+    }
+
+    #[test]
+    fn wildcard_scope_iteration_exposes_only_grounded_answer_until_it_runs() {
+        let tool_defs =
+            ["list_documents", "grounded_answer", "search_documents", "search_entities"]
+                .into_iter()
+                .map(|name| ChatToolDef {
+                    name: name.to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                })
+                .collect::<Vec<_>>();
+
+        assert!(user_question_requires_grounded_answer_tool("list alpha-* modules", &[]));
+        let next_tools = tool_defs_for_agent_iteration(&tool_defs, &BTreeSet::new(), false, true);
+        assert_eq!(
+            next_tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            vec![GROUNDED_ANSWER_TOOL_NAME]
+        );
+
+        let listing_only = BTreeSet::from(["list_documents".to_string()]);
+        assert!(should_require_tool_call_before_final(false, &tool_defs, &listing_only, true));
+        let next_tools = tool_defs_for_agent_iteration(&tool_defs, &listing_only, false, true);
+        assert_eq!(
+            next_tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            vec![GROUNDED_ANSWER_TOOL_NAME]
+        );
+
+        let grounded = BTreeSet::from([GROUNDED_ANSWER_TOOL_NAME.to_string()]);
+        assert!(!should_require_tool_call_before_final(false, &tool_defs, &grounded, true));
     }
 
     #[test]
@@ -2125,6 +2353,7 @@ mod tests {
             &mut missing,
             8,
             "workspace-a/library-b",
+            &[],
         );
         assert_eq!(missing["topK"], 8);
         assert_eq!(missing["library"], "workspace-a/library-b");
@@ -2139,6 +2368,7 @@ mod tests {
             &mut wider,
             8,
             "workspace-a/library-b",
+            &[],
         );
         assert_eq!(wider["topK"], 8);
         assert_eq!(wider["library"], "workspace-a/library-b");
@@ -2153,8 +2383,269 @@ mod tests {
             &mut narrower,
             8,
             "workspace-a/library-b",
+            &[],
         );
         assert_eq!(narrower["topK"], 4);
+    }
+
+    #[test]
+    fn ui_agent_defaults_non_contextual_grounded_answer_top_k_to_canonical_default() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "focused subquestion"
+        });
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            32,
+            "workspace-a/library-b",
+            &[],
+        );
+
+        assert_eq!(arguments["topK"], 24);
+    }
+
+    #[test]
+    fn ui_agent_raises_contextual_grounded_answer_tool_top_k_floor() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "follow-up subquestion",
+            "topK": 4,
+            "conversationTurns": [
+                {"role": "user", "content": "original question"},
+                {"role": "assistant", "content": "original answer"}
+            ]
+        });
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            32,
+            "workspace-a/library-b",
+            &[],
+        );
+
+        assert_eq!(arguments["topK"], 8);
+    }
+
+    #[test]
+    fn ui_agent_raises_injected_contextual_grounded_answer_tool_top_k_floor() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "follow-up subquestion",
+            "topK": 4
+        });
+        let history = vec![
+            ExternalConversationTurn {
+                turn_kind: QueryTurnKind::User,
+                content_text: "original question".to_string(),
+            },
+            ExternalConversationTurn {
+                turn_kind: QueryTurnKind::Assistant,
+                content_text: "original answer".to_string(),
+            },
+        ];
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            32,
+            "workspace-a/library-b",
+            &history,
+        );
+
+        assert_eq!(arguments["topK"], 8);
+        assert_eq!(
+            arguments["conversationTurns"],
+            serde_json::json!([
+                {"role": "user", "content": "original question"},
+                {"role": "assistant", "content": "original answer"}
+            ])
+        );
+    }
+
+    #[test]
+    fn ui_agent_uses_parent_grounded_answer_top_k_for_dense_literal_follow_up() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "describe each item",
+            "topK": 4,
+            "conversationTurns": [
+                {"role": "user", "content": "which package-like modules exist"},
+                {"role": "assistant", "content": "`pkg-alpha` `pkg-beta` `pkg-gamma` `pkg-delta` `pkg-epsilon` `pkg-zeta` `pkg-eta` `pkg-theta`"}
+            ]
+        });
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            24,
+            "workspace-a/library-b",
+            &[],
+        );
+
+        assert_eq!(arguments["topK"], 24);
+    }
+
+    #[test]
+    fn ui_agent_uses_parent_grounded_answer_top_k_for_wildcard_scope() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "list alpha-* modules",
+            "topK": 5
+        });
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            24,
+            "workspace-a/library-b",
+            &[],
+        );
+
+        assert_eq!(arguments["topK"], 24);
+    }
+
+    #[test]
+    fn ui_agent_preserves_explicit_empty_context_with_narrow_grounded_answer_top_k() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "new standalone topic",
+            "topK": 4,
+            "conversationTurns": []
+        });
+        let history = vec![ExternalConversationTurn {
+            turn_kind: QueryTurnKind::User,
+            content_text: "previous topic".to_string(),
+        }];
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            32,
+            "workspace-a/library-b",
+            &history,
+        );
+
+        assert_eq!(arguments["topK"], 4);
+        assert_eq!(arguments["conversationTurns"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn ui_agent_defaults_grounded_answer_conversation_turns_from_typed_history() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "follow-up question"
+        });
+        let history = vec![
+            ExternalConversationTurn {
+                turn_kind: QueryTurnKind::User,
+                content_text: "original user question".to_string(),
+            },
+            ExternalConversationTurn {
+                turn_kind: QueryTurnKind::Assistant,
+                content_text: "original assistant answer".to_string(),
+            },
+        ];
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            8,
+            "workspace-a/library-b",
+            &history,
+        );
+
+        assert_eq!(
+            arguments["conversationTurns"],
+            serde_json::json!([
+                {"role": "user", "content": "original user question"},
+                {"role": "assistant", "content": "original assistant answer"}
+            ])
+        );
+    }
+
+    #[test]
+    fn ui_agent_preserves_explicit_grounded_answer_conversation_turns() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "follow-up question",
+            "conversationTurns": [
+                {"role": "user", "content": "model supplied context"}
+            ]
+        });
+        let history = vec![ExternalConversationTurn {
+            turn_kind: QueryTurnKind::User,
+            content_text: "different context".to_string(),
+        }];
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            8,
+            "workspace-a/library-b",
+            &history,
+        );
+
+        assert_eq!(
+            arguments["conversationTurns"],
+            serde_json::json!([
+                {"role": "user", "content": "model supplied context"}
+            ])
+        );
+    }
+
+    #[test]
+    fn ui_agent_preserves_explicit_empty_grounded_answer_conversation_turns() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "new standalone topic",
+            "conversationTurns": []
+        });
+        let history = vec![ExternalConversationTurn {
+            turn_kind: QueryTurnKind::User,
+            content_text: "previous topic".to_string(),
+        }];
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            8,
+            "workspace-a/library-b",
+            &history,
+        );
+
+        assert_eq!(arguments["conversationTurns"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn ui_agent_preserves_explicit_empty_grounded_answer_conversation_turns_for_follow_up() {
+        let mut arguments = serde_json::json!({
+            "library": "workspace-a/library-b",
+            "query": "follow-up question",
+            "conversationTurns": []
+        });
+        let history = vec![
+            ExternalConversationTurn {
+                turn_kind: QueryTurnKind::User,
+                content_text: "original user question".to_string(),
+            },
+            ExternalConversationTurn {
+                turn_kind: QueryTurnKind::Assistant,
+                content_text: "original assistant answer".to_string(),
+            },
+        ];
+
+        apply_agent_tool_argument_defaults(
+            GROUNDED_ANSWER_TOOL_NAME,
+            &mut arguments,
+            8,
+            "workspace-a/library-b",
+            &history,
+        );
+
+        assert_eq!(arguments["conversationTurns"], serde_json::json!([]));
     }
 
     #[test]
@@ -2168,6 +2659,7 @@ mod tests {
             &mut missing,
             8,
             "workspace-a/library-b",
+            &[],
         );
         assert_eq!(missing["limit"], 8);
         assert_eq!(missing["library"], "workspace-a/library-b");
@@ -2181,6 +2673,7 @@ mod tests {
             &mut wider,
             12,
             "workspace-a/library-b",
+            &[],
         );
         assert_eq!(wider["limit"], 12);
 
@@ -2193,6 +2686,7 @@ mod tests {
             &mut narrower,
             12,
             "workspace-a/library-b",
+            &[],
         );
         assert_eq!(narrower["limit"], 4);
     }
@@ -2209,6 +2703,7 @@ mod tests {
             &mut arguments,
             8,
             "workspace-a/library-b",
+            &[],
         );
 
         assert_eq!(arguments["libraries"], serde_json::json!(["workspace-a/library-b"]));

@@ -45,7 +45,13 @@ pub struct LlmIterationDebug {
 pub struct ResponseToolCallDebug {
     pub id: String,
     pub name: String,
+    /// Effective arguments executed after server-side defaults and
+    /// scope guards were applied.
     pub arguments_json: String,
+    /// Raw arguments emitted by the model when server-side defaults or
+    /// guards changed the executable payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_arguments_json: Option<String>,
     pub result_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_json: Option<serde_json::Value>,

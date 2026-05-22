@@ -58,7 +58,7 @@ describe('ChatMessage', () => {
           message={{
             id: 'assistant-2',
             role: 'assistant',
-            content: 'The answer cites a source title in plain text.\n\n---\nSources\nAlpha Guide',
+            content: 'The answer cites a source title in plain text.',
             timestamp: '2026-04-10T10:00:00Z',
             evidence: {
               segmentRefs: [
@@ -96,7 +96,110 @@ describe('ChatMessage', () => {
     expect(sourceLink?.rel).toContain('noopener');
     expect(sourceLink?.className).toContain('text-primary');
     expect(sourceLink?.className).toContain('underline');
+    expect(container.textContent).toContain('assistant.sources');
+    expect(container.textContent).not.toContain('assistant.attachedSources');
+    expect(container.textContent).not.toContain('assistant.attachedSourcesNote');
     expect(container.querySelector('hr')).toBeNull();
+  });
+
+  it('keeps model-authored trailing source links and separates structured evidence sources', async () => {
+    await act(async () => {
+      root?.render(
+        <ChatMessage
+          t={t}
+          message={{
+            id: 'assistant-3',
+            role: 'assistant',
+            content:
+              'The answer body stays visible.\n\nSources:\n- [Generated Source](https://generated.example/source)',
+            timestamp: '2026-04-10T10:00:00Z',
+            evidence: {
+              segmentRefs: [
+                {
+                  documentId: 'doc-1',
+                  documentName: 'Alpha Guide.md',
+                  documentTitle: 'Alpha Guide',
+                  sourceUri: 'upload://doc-1',
+                  sourceAccess: {
+                    kind: 'stored_document',
+                    href: '/v1/content/documents/doc-1/source',
+                  },
+                  segmentOrdinal: 1,
+                  excerpt: 'Installation',
+                  relevance: 0.91,
+                },
+              ],
+              factRefs: [],
+              entityRefs: [],
+              relationRefs: [],
+              verificationState: 'passed',
+              verificationWarnings: [],
+            },
+          }}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain('The answer body stays visible.');
+    expect(container.textContent).toContain('Generated Source');
+    expect(container.querySelector('a[href="https://generated.example/source"]')).toBeTruthy();
+    expect(container.textContent).toContain('assistant.sources');
+    expect(container.textContent).not.toContain('assistant.attachedSources');
+    expect(container.textContent).not.toContain('assistant.attachedSourcesNote');
+
+    const sourceLink = container.querySelector<HTMLAnchorElement>(
+      'a[href="/v1/content/documents/doc-1/source"]',
+    );
+    expect(sourceLink).toBeTruthy();
+    expect(sourceLink?.textContent).toContain('Alpha Guide');
+  });
+
+  it('keeps inline model links distinct from the attached structured evidence block', async () => {
+    await act(async () => {
+      root?.render(
+        <ChatMessage
+          t={t}
+          message={{
+            id: 'assistant-4',
+            role: 'assistant',
+            content: 'See [Alpha Guide](/v1/content/documents/doc-1/source) for setup details.',
+            timestamp: '2026-04-10T10:00:00Z',
+            evidence: {
+              segmentRefs: [
+                {
+                  documentId: 'doc-1',
+                  documentName: 'Alpha Guide.md',
+                  documentTitle: 'Alpha Guide',
+                  sourceUri: 'upload://doc-1',
+                  sourceAccess: {
+                    kind: 'stored_document',
+                    href: '/v1/content/documents/doc-1/source',
+                  },
+                  segmentOrdinal: 1,
+                  excerpt: 'Setup details',
+                  relevance: 0.91,
+                },
+              ],
+              factRefs: [],
+              entityRefs: [],
+              relationRefs: [],
+              verificationState: 'passed',
+              verificationWarnings: [],
+            },
+          }}
+        />,
+      );
+    });
+
+    const matchingLinks = container.querySelectorAll<HTMLAnchorElement>(
+      'a[href="/v1/content/documents/doc-1/source"]',
+    );
+    expect(matchingLinks).toHaveLength(2);
+    expect(matchingLinks[0]?.textContent).toBe('Alpha Guide');
+    expect(matchingLinks[1]?.textContent).toContain('Alpha Guide');
+    expect(container.textContent).toContain('assistant.sources');
+    expect(container.textContent).not.toContain('assistant.attachedSources');
+    expect(container.textContent).not.toContain('assistant.attachedSourcesNote');
   });
 
   it('keeps prose after a separator when it is not a bare source list', async () => {
@@ -105,7 +208,7 @@ describe('ChatMessage', () => {
         <ChatMessage
           t={t}
           message={{
-            id: 'assistant-3',
+            id: 'assistant-5',
             role: 'assistant',
             content:
               'The answer has a separate note.\n\n---\nConclusion\nAlpha Guide covers setup details.',

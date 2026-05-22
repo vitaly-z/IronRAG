@@ -13,7 +13,6 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use uuid::Uuid;
 
 mod decode;
-mod library_generations;
 mod technical_facts;
 mod types;
 
@@ -24,11 +23,16 @@ pub use self::types::{
     KnowledgeStructuredRevisionRow, KnowledgeTechnicalFactRow,
 };
 
-use crate::infra::arangodb::{
-    client::ArangoClient,
-    collections::{
-        KNOWLEDGE_CHUNK_COLLECTION, KNOWLEDGE_DOCUMENT_COLLECTION, KNOWLEDGE_REVISION_COLLECTION,
-        KNOWLEDGE_STRUCTURED_BLOCK_COLLECTION, KNOWLEDGE_STRUCTURED_REVISION_COLLECTION,
+use crate::{
+    domains::content::READABLE_TEXT_STATES,
+    infra::arangodb::{
+        client::ArangoClient,
+        collections::{
+            KNOWLEDGE_CHUNK_COLLECTION, KNOWLEDGE_CHUNK_VECTOR_COLLECTION,
+            KNOWLEDGE_DOCUMENT_COLLECTION, KNOWLEDGE_REVISION_COLLECTION,
+            KNOWLEDGE_STRUCTURED_BLOCK_COLLECTION, KNOWLEDGE_STRUCTURED_REVISION_COLLECTION,
+        },
+        search_store::KNOWLEDGE_CHUNK_VECTOR_KIND,
     },
 };
 
@@ -539,13 +543,14 @@ impl ArangoDocumentStore {
                  )
                  LET text_ready_max = MAX(
                      FOR r IN rows
-                         FILTER r.text_state IN [\"ready\", \"text_ready\", \"graph_ready\", \"vector_ready\"]
+                         FILTER r.text_state IN @readable_text_states
                          RETURN r.revision_number
                  )
                  LET vector_ready_max = MAX(
-                     FOR r IN rows
-                         FILTER r.vector_state IN [\"ready\", \"vector_ready\", \"graph_ready\"]
-                         RETURN r.revision_number
+                     FOR vector IN @@chunk_vector_collection
+                         FILTER vector.library_id == @library_id
+                           AND vector.vector_kind == @chunk_vector_kind
+                         RETURN vector.freshness_generation
                  )
                  LET graph_ready_max = MAX(
                      FOR r IN rows
@@ -564,7 +569,10 @@ impl ArangoDocumentStore {
                  }",
                 serde_json::json!({
                     "@collection": KNOWLEDGE_REVISION_COLLECTION,
+                    "@chunk_vector_collection": KNOWLEDGE_CHUNK_VECTOR_COLLECTION,
                     "library_id": library_id.to_string(),
+                    "chunk_vector_kind": KNOWLEDGE_CHUNK_VECTOR_KIND,
+                    "readable_text_states": READABLE_TEXT_STATES,
                 }),
             )
             .await
@@ -575,6 +583,47 @@ impl ArangoDocumentStore {
         let signals: LibraryGenerationSignals =
             serde_json::from_value(row).context("decode library generation signals aggregate")?;
         Ok(signals)
+    }
+
+    pub async fn count_vector_ready_revisions_missing_chunk_vectors(
+        &self,
+        library_id: Uuid,
+    ) -> anyhow::Result<i64> {
+        let cursor = self
+            .client
+            .query_json(
+                "FOR revision IN @@revision_collection
+                     FILTER revision.library_id == @library_id
+                       AND revision.vector_state == \"ready\"
+                       AND revision.revision_state == \"active\"
+                       AND revision.superseded_by_revision_id == null
+                     LET has_chunks = LENGTH(
+                         FOR chunk IN @@chunk_collection
+                             FILTER chunk.revision_id == revision.revision_id
+                             LIMIT 1
+                             RETURN 1
+                     ) > 0
+                     LET has_vectors = LENGTH(
+                         FOR vector IN @@chunk_vector_collection
+                             FILTER vector.revision_id == revision.revision_id
+                               AND vector.vector_kind == @chunk_vector_kind
+                             LIMIT 1
+                             RETURN 1
+                     ) > 0
+                     FILTER has_chunks AND !has_vectors
+                     COLLECT WITH COUNT INTO stale_count
+                     RETURN stale_count",
+                serde_json::json!({
+                    "@revision_collection": KNOWLEDGE_REVISION_COLLECTION,
+                    "@chunk_collection": KNOWLEDGE_CHUNK_COLLECTION,
+                    "@chunk_vector_collection": KNOWLEDGE_CHUNK_VECTOR_COLLECTION,
+                    "library_id": library_id.to_string(),
+                    "chunk_vector_kind": KNOWLEDGE_CHUNK_VECTOR_KIND,
+                }),
+            )
+            .await
+            .context("failed to count vector-ready revisions missing chunk vectors")?;
+        decode_single_result(cursor)
     }
 
     pub async fn update_revision_readiness(

@@ -47,8 +47,9 @@ use crate::{
             KNOWLEDGE_BLOCK_CHUNK_EDGE, KNOWLEDGE_BUNDLE_CHUNK_EDGE, KNOWLEDGE_BUNDLE_ENTITY_EDGE,
             KNOWLEDGE_BUNDLE_EVIDENCE_EDGE, KNOWLEDGE_BUNDLE_RELATION_EDGE,
             KNOWLEDGE_CHUNK_COLLECTION, KNOWLEDGE_CHUNK_MENTIONS_ENTITY_EDGE,
-            KNOWLEDGE_CONTEXT_BUNDLE_COLLECTION, KNOWLEDGE_DOCUMENT_COLLECTION,
-            KNOWLEDGE_DOCUMENT_REVISION_EDGE, KNOWLEDGE_ENTITY_COLLECTION,
+            KNOWLEDGE_CHUNK_VECTOR_COLLECTION, KNOWLEDGE_CONTEXT_BUNDLE_COLLECTION,
+            KNOWLEDGE_DOCUMENT_COLLECTION, KNOWLEDGE_DOCUMENT_REVISION_EDGE,
+            KNOWLEDGE_ENTITY_COLLECTION, KNOWLEDGE_ENTITY_VECTOR_COLLECTION,
             KNOWLEDGE_EVIDENCE_COLLECTION, KNOWLEDGE_EVIDENCE_SOURCE_EDGE,
             KNOWLEDGE_EVIDENCE_SUPPORTS_ENTITY_EDGE, KNOWLEDGE_EVIDENCE_SUPPORTS_RELATION_EDGE,
             KNOWLEDGE_FACT_EVIDENCE_EDGE, KNOWLEDGE_RELATION_COLLECTION,
@@ -68,7 +69,7 @@ use crate::{
 /// Schema version of the snapshot archive format. Bumped any time the
 /// manifest shape or on-disk layout changes in a backwards-incompatible
 /// way.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 
 /// Soft cap for a single NDJSON part inside the tar stream. Small enough
 /// that no individual table part holds the entire table in memory, large
@@ -254,6 +255,8 @@ const ARANGO_DOC_COLLECTIONS: &[&str] = &[
     KNOWLEDGE_STRUCTURED_REVISION_COLLECTION,
     KNOWLEDGE_STRUCTURED_BLOCK_COLLECTION,
     KNOWLEDGE_TECHNICAL_FACT_COLLECTION,
+    KNOWLEDGE_CHUNK_VECTOR_COLLECTION,
+    KNOWLEDGE_ENTITY_VECTOR_COLLECTION,
     KNOWLEDGE_ENTITY_COLLECTION,
     KNOWLEDGE_RELATION_COLLECTION,
     KNOWLEDGE_EVIDENCE_COLLECTION,
@@ -1526,12 +1529,37 @@ where
             "snapshot import skipped dangling arango edges",
         );
     }
+    if let Err(error) = analyze_imported_postgres_tables(pool, &counts_pg).await {
+        tracing::warn!(
+            %library_id,
+            error = %error,
+            "snapshot import postgres stats refresh failed",
+        );
+    }
 
     report.postgres_rows_by_table = counts_pg.into_iter().collect();
     report.arango_docs_by_collection = counts_arango_doc.into_iter().collect();
     report.arango_edges_by_collection = counts_arango_edge.into_iter().collect();
     report.skipped_arango_edges_by_collection = skipped_arango_edge.into_iter().collect();
     Ok(report)
+}
+
+async fn analyze_imported_postgres_tables(
+    pool: &PgPool,
+    row_counts: &BTreeMap<String, u64>,
+) -> anyhow::Result<()> {
+    for (table, row_count) in row_counts {
+        if *row_count == 0 {
+            continue;
+        }
+        let table = require_known_snapshot_pg_table(table)?;
+        let statement = format!("ANALYZE {table}");
+        sqlx::query(&statement)
+            .execute(pool)
+            .await
+            .with_context(|| format!("analyze imported snapshot table `{table}`"))?;
+    }
+    Ok(())
 }
 
 fn validate_archive_path(path: &str) -> anyhow::Result<()> {
@@ -2082,6 +2110,18 @@ mod tests {
     }
 
     #[test]
+    fn library_data_snapshot_scope_includes_vector_material() {
+        assert!(
+            ARANGO_DOC_COLLECTIONS.contains(&KNOWLEDGE_CHUNK_VECTOR_COLLECTION),
+            "library snapshots must preserve chunk vectors when revisions are restored as vector-ready"
+        );
+        assert!(
+            ARANGO_DOC_COLLECTIONS.contains(&KNOWLEDGE_ENTITY_VECTOR_COLLECTION),
+            "library snapshots must preserve entity vectors when graph/search state is restored"
+        );
+    }
+
+    #[test]
     fn snapshot_manifest_sections_reject_unknown_or_undeclared_names() {
         let manifest = manifest_with_sections(
             vec!["catalog_library", "pg_catalog_authid"],
@@ -2280,6 +2320,23 @@ mod tests {
         assert_eq!(
             scope.normalize_arango_row(KNOWLEDGE_CHUNK_COLLECTION, &mut chunk).unwrap(),
             SnapshotArangoRowAction::Import
+        );
+
+        let mut chunk_vector = serde_json::json!({
+            "_key": "chunk-vector-1",
+            "library_id": source_library_id,
+            "workspace_id": source_workspace_id,
+        });
+        assert_eq!(
+            scope
+                .normalize_arango_row(KNOWLEDGE_CHUNK_VECTOR_COLLECTION, &mut chunk_vector)
+                .unwrap(),
+            SnapshotArangoRowAction::Import
+        );
+        assert_eq!(
+            required_uuid_field(KNOWLEDGE_CHUNK_VECTOR_COLLECTION, &chunk_vector, "library_id")
+                .unwrap(),
+            target_library_id
         );
 
         let mut missing_bundle_edge = serde_json::json!({

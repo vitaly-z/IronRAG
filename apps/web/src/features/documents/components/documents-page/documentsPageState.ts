@@ -19,11 +19,15 @@ import {
   useTableState,
   type TableSortState,
 } from "@/shared/hooks/useTableState";
+import {
+  TABLE_PAGE_SIZE_OPTIONS,
+  type TablePageSizeOption,
+} from "@/shared/components/TablePaginationFooter";
 
 import { formatWebIngestPatterns } from "@/features/documents/model/webIngestPatterns";
 
-export const PAGE_SIZE_OPTIONS = [50, 100, 250, 1000] as const;
-export type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number];
+export const PAGE_SIZE_OPTIONS = TABLE_PAGE_SIZE_OPTIONS;
+export type PageSizeOption = TablePageSizeOption;
 export const DEFAULT_PAGE_SIZE: PageSizeOption = 50;
 
 export const SEARCH_DEBOUNCE_MS = 300;

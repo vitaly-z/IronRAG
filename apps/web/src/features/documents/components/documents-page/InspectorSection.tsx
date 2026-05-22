@@ -328,6 +328,7 @@ export function InspectorSection({
           readOnly={documentEditor.editorReadOnly}
           saving={documentEditor.editorSaving}
           sourceFormat={documentEditor.editorDocument.fileType}
+          sourceHref={documentEditor.editorDocument.sourceAccess?.href}
           t={t}
         />
       )}

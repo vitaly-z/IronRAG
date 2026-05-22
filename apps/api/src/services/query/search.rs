@@ -26,8 +26,9 @@ use crate::{
         document_store::KnowledgeChunkRow,
         graph_store::KnowledgeEntityRow,
         search_store::{
-            KnowledgeChunkSearchRow, KnowledgeChunkVectorRow, KnowledgeEntitySearchRow,
-            KnowledgeEntityVectorRow, KnowledgeRelationSearchRow, KnowledgeTechnicalFactSearchRow,
+            KNOWLEDGE_CHUNK_VECTOR_KIND, KNOWLEDGE_ENTITY_VECTOR_KIND, KnowledgeChunkSearchRow,
+            KnowledgeChunkVectorRow, KnowledgeEntitySearchRow, KnowledgeEntityVectorRow,
+            KnowledgeRelationSearchRow, KnowledgeTechnicalFactSearchRow,
         },
     },
     infra::repositories::{ai_repository, catalog_repository, content_repository},
@@ -38,7 +39,6 @@ use crate::{
             cancellation::{StageError, ensure_not_cancelled},
             service::{INGEST_STAGE_EMBED_CHUNK, RecordStageUnitProgressCommand},
         },
-        knowledge::service::RefreshKnowledgeLibraryGenerationCommand,
     },
 };
 
@@ -55,9 +55,6 @@ use super::{
 /// reduces the blast radius of one bad chunk failing the whole revision.
 const CHUNK_EMBEDDING_BATCH_SIZE: usize = 16;
 const CHUNK_VECTOR_REUSE_SOURCE_BATCH_SIZE: usize = 128;
-
-const VECTOR_KIND_CHUNK: &str = "chunk_embedding";
-const VECTOR_KIND_ENTITY: &str = "entity_embedding";
 const FACT_FETCH_MULTIPLIER: usize = 2;
 const FACT_FETCH_MIN: usize = 6;
 const VECTOR_PLANE_ADVISORY_LOCK_KEY: &str = "query.vector_plane";
@@ -310,7 +307,7 @@ impl SearchService {
                 chunk_id: chunk.chunk_id,
                 revision_id: chunk.revision_id,
                 embedding_model_key: write.model_catalog_id.to_string(),
-                vector_kind: VECTOR_KIND_CHUNK.to_string(),
+                vector_kind: KNOWLEDGE_CHUNK_VECTOR_KIND.to_string(),
                 dimensions: validate_embedding_vector_dimensions(
                     expected_dimensions,
                     &vector,
@@ -374,7 +371,7 @@ impl SearchService {
                 library_id: entity.library_id,
                 entity_id: entity.entity_id,
                 embedding_model_key: write.model_catalog_id.to_string(),
-                vector_kind: VECTOR_KIND_ENTITY.to_string(),
+                vector_kind: KNOWLEDGE_ENTITY_VECTOR_KIND.to_string(),
                 dimensions: validate_embedding_vector_dimensions(
                     expected_dimensions,
                     &vector,
@@ -861,7 +858,7 @@ impl SearchService {
                         chunk_id: chunk.chunk_id,
                         revision_id: chunk.revision_id,
                         embedding_model_key: embedding_model_key.clone(),
-                        vector_kind: VECTOR_KIND_CHUNK.to_string(),
+                        vector_kind: KNOWLEDGE_CHUNK_VECTOR_KIND.to_string(),
                         dimensions,
                         vector: vector.clone(),
                         freshness_generation,
@@ -920,7 +917,7 @@ impl SearchService {
             .count_chunk_vectors_by_revision(
                 revision_id,
                 &embedding_model_key,
-                VECTOR_KIND_CHUNK,
+                KNOWLEDGE_CHUNK_VECTOR_KIND,
                 freshness_generation,
             )
             .await
@@ -1129,7 +1126,6 @@ impl SearchService {
                 }
 
                 let mut local_touched = Vec::new();
-                let mut local_max_gen: Option<i64> = None;
                 for (index, embedding) in batch.iter().zip(response.embeddings.iter()) {
                     let chunk = &chunks_ref[*index];
                     let freshness_generation = freshness_ref[*index];
@@ -1147,7 +1143,7 @@ impl SearchService {
                         chunk_id: chunk.chunk_id,
                         revision_id: chunk.revision_id,
                         embedding_model_key: embedding_model_key_ref.clone(),
-                        vector_kind: VECTOR_KIND_CHUNK.to_string(),
+                        vector_kind: KNOWLEDGE_CHUNK_VECTOR_KIND.to_string(),
                         dimensions: validate_embedding_vector_dimensions(
                             expected_dimensions,
                             embedding.as_slice(),
@@ -1171,11 +1167,8 @@ impl SearchService {
                         format!("failed to persist rebuilt chunk vector for {}", chunk.chunk_id)
                     })?;
                     local_touched.push(chunk.revision_id);
-                    local_max_gen = Some(local_max_gen.map_or(freshness_generation, |current| {
-                        current.max(freshness_generation)
-                    }));
                 }
-                anyhow::Ok((batch.len(), local_touched, local_max_gen))
+                anyhow::Ok((batch.len(), local_touched))
             }
         }))
         .buffer_unordered(parallelism)
@@ -1183,33 +1176,18 @@ impl SearchService {
         .await;
 
         let mut touched_revision_ids = BTreeSet::new();
-        let mut max_vector_generation = None::<i64>;
         let mut rebuilt = 0usize;
         for batch_result in batch_results {
-            let (count, local_touched, local_max_gen) = batch_result?;
+            let (count, local_touched) = batch_result?;
             rebuilt += count;
             for revision_id in local_touched {
                 touched_revision_ids.insert(revision_id);
-            }
-            if let Some(gen_value) = local_max_gen {
-                max_vector_generation =
-                    Some(max_vector_generation.map_or(gen_value, |current| current.max(gen_value)));
             }
         }
 
         mark_revisions_vector_ready(state, &touched_revision_ids)
             .await
             .context("failed to mark rebuilt revisions as vector-ready")?;
-        if let Some(vector_generation) = max_vector_generation {
-            refresh_library_vector_generation_if_present(
-                state,
-                library_id,
-                chunks[0].workspace_id,
-                vector_generation,
-            )
-            .await
-            .context("failed to refresh library vector generation after chunk rebuild")?;
-        }
 
         Ok(rebuilt)
     }
@@ -1258,7 +1236,6 @@ impl SearchService {
             return Ok(0);
         }
 
-        let mut max_vector_generation = None::<i64>;
         let mut rebuilt = 0usize;
         for entity_batch in entities.chunks(64) {
             let batch_response = state
@@ -1297,7 +1274,7 @@ impl SearchService {
                     library_id: entity.library_id,
                     entity_id: entity.entity_id,
                     embedding_model_key: model_catalog_id.to_string(),
-                    vector_kind: VECTOR_KIND_ENTITY.to_string(),
+                    vector_kind: KNOWLEDGE_ENTITY_VECTOR_KIND.to_string(),
                     dimensions: validate_embedding_vector_dimensions(
                         expected_dimensions,
                         embedding.as_slice(),
@@ -1318,23 +1295,8 @@ impl SearchService {
                 )?;
                 self.activate_graph_node_embedding_index(state, entity.entity_id, model_catalog_id)
                     .await?;
-                max_vector_generation =
-                    Some(max_vector_generation.map_or(entity.freshness_generation, |current| {
-                        current.max(entity.freshness_generation)
-                    }));
                 rebuilt += 1;
             }
-        }
-
-        if let Some(vector_generation) = max_vector_generation {
-            refresh_library_vector_generation_if_present(
-                state,
-                library_id,
-                entities[0].workspace_id,
-                vector_generation,
-            )
-            .await
-            .context("failed to refresh library vector generation after entity rebuild")?;
         }
 
         Ok(rebuilt)
@@ -1499,7 +1461,11 @@ async fn load_current_revision_chunk_vector_ids(
         let chunk_ids = chunk_batch.iter().map(|chunk| chunk.chunk_id).collect::<Vec<_>>();
         let vectors = state
             .arango_search_store
-            .list_chunk_vectors_by_chunks(&chunk_ids, embedding_model_key, VECTOR_KIND_CHUNK)
+            .list_chunk_vectors_by_chunks(
+                &chunk_ids,
+                embedding_model_key,
+                KNOWLEDGE_CHUNK_VECTOR_KIND,
+            )
             .await
             .with_context(|| {
                 format!("failed to load current chunk vectors for revision {revision_id}")
@@ -1507,7 +1473,7 @@ async fn load_current_revision_chunk_vector_ids(
         for vector in vectors {
             if vector.revision_id == revision_id
                 && vector.freshness_generation == freshness_generation
-                && vector.vector_kind == VECTOR_KIND_CHUNK
+                && vector.vector_kind == KNOWLEDGE_CHUNK_VECTOR_KIND
                 && validate_embedding_vector_dimensions(
                     expected_dimensions,
                     &vector.vector,
@@ -1590,7 +1556,11 @@ async fn reuse_chunk_vectors_from_parent_revision(
     for parent_batch in parent_ids.chunks(CHUNK_VECTOR_REUSE_SOURCE_BATCH_SIZE) {
         let vectors = state
             .arango_search_store
-            .list_chunk_vectors_by_chunks(parent_batch, embedding_model_key, VECTOR_KIND_CHUNK)
+            .list_chunk_vectors_by_chunks(
+                parent_batch,
+                embedding_model_key,
+                KNOWLEDGE_CHUNK_VECTOR_KIND,
+            )
             .await
             .with_context(|| {
                 format!("failed to load parent chunk vectors for revision {parent_revision_id}")
@@ -1641,7 +1611,7 @@ async fn reuse_chunk_vectors_from_parent_revision(
                     chunk_id: new_chunk.chunk_id,
                     revision_id: new_chunk.revision_id,
                     embedding_model_key: embedding_model_key.to_string(),
-                    vector_kind: VECTOR_KIND_CHUNK.to_string(),
+                    vector_kind: KNOWLEDGE_CHUNK_VECTOR_KIND.to_string(),
                     dimensions: parent_dimensions,
                     vector: parent_vector.vector.clone(),
                     freshness_generation,
@@ -1829,46 +1799,6 @@ async fn mark_revisions_vector_ready(
             ));
         }
     }
-    Ok(())
-}
-
-async fn refresh_library_vector_generation_if_present(
-    state: &AppState,
-    library_id: Uuid,
-    workspace_id: Uuid,
-    vector_generation: i64,
-) -> AnyhowResult<()> {
-    let Some(existing) = state
-        .canonical_services
-        .knowledge
-        .derive_library_generation_rows(state, library_id)
-        .await
-        .with_context(|| format!("failed to derive library generations for {}", library_id))?
-        .into_iter()
-        .next()
-    else {
-        return Ok(());
-    };
-
-    state
-        .canonical_services
-        .knowledge
-        .refresh_library_generation(
-            state,
-            RefreshKnowledgeLibraryGenerationCommand {
-                generation_id: existing.generation_id,
-                workspace_id,
-                library_id,
-                active_text_generation: existing.active_text_generation,
-                active_vector_generation: existing.active_vector_generation.max(vector_generation),
-                active_graph_generation: existing.active_graph_generation,
-                degraded_state: existing.degraded_state,
-            },
-        )
-        .await
-        .map_err(|error| {
-            anyhow!("failed to refresh vector generation for library {}: {:?}", library_id, error)
-        })?;
     Ok(())
 }
 

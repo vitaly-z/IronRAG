@@ -4,7 +4,6 @@ pub const KNOWLEDGE_STRUCTURED_REVISION_COLLECTION: &str = "knowledge_structured
 pub const KNOWLEDGE_STRUCTURED_BLOCK_COLLECTION: &str = "knowledge_structured_block";
 pub const KNOWLEDGE_CHUNK_COLLECTION: &str = "knowledge_chunk";
 pub const KNOWLEDGE_TECHNICAL_FACT_COLLECTION: &str = "knowledge_technical_fact";
-pub const KNOWLEDGE_LIBRARY_GENERATION_COLLECTION: &str = "knowledge_library_generation";
 pub const KNOWLEDGE_CHUNK_VECTOR_COLLECTION: &str = "knowledge_chunk_vector";
 pub const KNOWLEDGE_ENTITY_VECTOR_COLLECTION: &str = "knowledge_entity_vector";
 pub const KNOWLEDGE_ENTITY_COLLECTION: &str = "knowledge_entity";
@@ -47,6 +46,10 @@ pub const KNOWLEDGE_CHUNK_VECTOR_REVISION_GENERATION_INDEX: &str =
     "knowledge_chunk_vector_revision_generation_index";
 pub const KNOWLEDGE_CHUNK_VECTOR_CHUNK_MODEL_INDEX: &str =
     "knowledge_chunk_vector_chunk_model_index";
+pub const KNOWLEDGE_CHUNK_VECTOR_LIBRARY_INDEX: &str = "knowledge_chunk_vector_library_index";
+pub const KNOWLEDGE_REVISION_LIBRARY_VECTOR_STATE_INDEX: &str =
+    "knowledge_revision_library_vector_state_index";
+pub const KNOWLEDGE_ENTITY_VECTOR_LIBRARY_INDEX: &str = "knowledge_entity_vector_library_index";
 pub const KNOWLEDGE_STRUCTURED_REVISION_REVISION_INDEX: &str =
     "knowledge_structured_revision_revision_index";
 pub const KNOWLEDGE_STRUCTURED_BLOCK_REVISION_ORDINAL_INDEX: &str =
@@ -62,8 +65,6 @@ pub const KNOWLEDGE_DOCUMENT_LIBRARY_UPDATED_INDEX: &str =
 pub const KNOWLEDGE_REVISION_REVISION_ID_INDEX: &str = "knowledge_revision_revision_id_index";
 pub const KNOWLEDGE_REVISION_DOCUMENT_REVISION_INDEX: &str =
     "knowledge_revision_document_revision_index";
-pub const KNOWLEDGE_LIBRARY_GENERATION_LIBRARY_UPDATED_INDEX: &str =
-    "knowledge_library_generation_library_updated_index";
 pub const KNOWLEDGE_ENTITY_LIBRARY_SUPPORT_INDEX: &str = "knowledge_entity_library_support_index";
 pub const KNOWLEDGE_RELATION_LIBRARY_SUPPORT_INDEX: &str =
     "knowledge_relation_library_support_index";
@@ -100,6 +101,13 @@ pub const KNOWLEDGE_PERSISTENT_INDEXES: &[ArangoPersistentIndexSpec] = &[
         collection: KNOWLEDGE_REVISION_COLLECTION,
         name: KNOWLEDGE_REVISION_DOCUMENT_REVISION_INDEX,
         fields: &["document_id", "revision_number", "revision_id"],
+        unique: false,
+        sparse: false,
+    },
+    ArangoPersistentIndexSpec {
+        collection: KNOWLEDGE_REVISION_COLLECTION,
+        name: KNOWLEDGE_REVISION_LIBRARY_VECTOR_STATE_INDEX,
+        fields: &["library_id", "vector_state", "revision_id"],
         unique: false,
         sparse: false,
     },
@@ -159,9 +167,16 @@ pub const KNOWLEDGE_PERSISTENT_INDEXES: &[ArangoPersistentIndexSpec] = &[
         sparse: false,
     },
     ArangoPersistentIndexSpec {
-        collection: KNOWLEDGE_LIBRARY_GENERATION_COLLECTION,
-        name: KNOWLEDGE_LIBRARY_GENERATION_LIBRARY_UPDATED_INDEX,
-        fields: &["library_id", "updated_at", "generation_id"],
+        collection: KNOWLEDGE_CHUNK_VECTOR_COLLECTION,
+        name: KNOWLEDGE_CHUNK_VECTOR_LIBRARY_INDEX,
+        fields: &["library_id", "vector_kind", "freshness_generation"],
+        unique: false,
+        sparse: false,
+    },
+    ArangoPersistentIndexSpec {
+        collection: KNOWLEDGE_ENTITY_VECTOR_COLLECTION,
+        name: KNOWLEDGE_ENTITY_VECTOR_LIBRARY_INDEX,
+        fields: &["library_id", "embedding_model_key"],
         unique: false,
         sparse: false,
     },
@@ -352,7 +367,6 @@ pub const DOCUMENT_COLLECTIONS: &[&str] = &[
     KNOWLEDGE_STRUCTURED_BLOCK_COLLECTION,
     KNOWLEDGE_CHUNK_COLLECTION,
     KNOWLEDGE_TECHNICAL_FACT_COLLECTION,
-    KNOWLEDGE_LIBRARY_GENERATION_COLLECTION,
     KNOWLEDGE_CHUNK_VECTOR_COLLECTION,
     KNOWLEDGE_ENTITY_VECTOR_COLLECTION,
     KNOWLEDGE_ENTITY_COLLECTION,

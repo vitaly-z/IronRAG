@@ -2058,9 +2058,31 @@ pub async fn search_document_metadata_rows(
                     and lower(coalesce(r.title, '')) like any($4) then 1320::double precision
                 when cardinality($4::text[]) > 0
                     and lower(d.external_key) like any($4) then 1280::double precision
-                when lower(coalesce(r.title, '')) like any($3) then 1120::double precision
-                when lower(d.external_key) like any($3) then 1080::double precision
-                else 1050::double precision
+                -- Partial metadata matches are calibrated against the
+                -- Arango lexical lane that merges with these rows via
+                -- max(score): title_soft_raw is about 50, while useful
+                -- body BM25 hits commonly land in the low hundreds. A
+                -- single title token should not flood the result set, but
+                -- a multi-token title match should beat ordinary body text.
+                when lower(coalesce(r.title, '')) like any($3) then
+                    70::double precision + 80::double precision * least(
+                        4,
+                        (
+                            select count(*)::integer
+                            from unnest($3::text[]) as pattern(value)
+                            where lower(coalesce(r.title, '')) like pattern.value
+                        )
+                    )
+                when lower(d.external_key) like any($3) then
+                    65::double precision + 75::double precision * least(
+                        4,
+                        (
+                            select count(*)::integer
+                            from unnest($3::text[]) as pattern(value)
+                            where lower(d.external_key) like pattern.value
+                        )
+                    )
+                else 70::double precision
             end as metadata_score,
             case
                 when lower(coalesce(r.title, '')) = any($2) then coalesce(r.title, d.external_key)

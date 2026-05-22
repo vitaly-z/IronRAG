@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     app::state::AppState,
-    domains::query_ir::{QueryIR, QueryScope, SourceSliceDirection, SourceSliceSpec},
+    domains::query_ir::{QueryAct, QueryIR, QueryScope, SourceSliceDirection, SourceSliceSpec},
     infra::arangodb::document_store::{
         KnowledgeChunkRow, KnowledgeDocumentRow, KnowledgeStructuredBlockRow,
     },
@@ -26,7 +26,10 @@ use super::{
 
 const SOURCE_CONTEXT_DOCUMENT_LIMIT: usize = 3;
 const SOURCE_CONTEXT_ANCHOR_LIMIT_PER_DOCUMENT: usize = 2;
-const SOURCE_CONTEXT_NEIGHBOR_RADIUS: i32 = 1;
+const SOURCE_CONTEXT_DEFAULT_NEIGHBOR_BACKWARD: i32 = 1;
+const SOURCE_CONTEXT_DEFAULT_NEIGHBOR_FORWARD: i32 = 1;
+const SOURCE_CONTEXT_PROCEDURAL_NEIGHBOR_BACKWARD: i32 = 3;
+const SOURCE_CONTEXT_PROFILE_HEADROOM: usize = 1;
 const SOURCE_CONTEXT_FOCUSED_MATCH_LIMIT_PER_DOCUMENT: usize = 2;
 const SOURCE_CONTEXT_FOCUSED_MATCH_CANDIDATE_LIMIT_PER_DOCUMENT: usize = 64;
 const SOURCE_CONTEXT_FOCUSED_MATCH_SCORE_BONUS: f32 = 1.0;
@@ -41,6 +44,8 @@ const SOURCE_CONTEXT_NEIGHBOR_PENALTY: f32 = 0.01;
 const SOURCE_CONTEXT_SLICE_PROFILE_BONUS: f32 = 4.0;
 const SOURCE_CONTEXT_SLICE_BONUS: f32 = 3.0;
 const SOURCE_CONTEXT_EXCERPT_CHARS: usize = 720;
+const SOURCE_CONTEXT_GRAPH_EVIDENCE_BONUS: f32 = 0.75;
+const SOURCE_CONTEXT_DOCUMENT_HEAD_CHUNK_INDEX: i32 = 0;
 
 pub(crate) fn source_anchor_window(anchor: i32, backward: i32, forward: i32) -> (i32, i32) {
     (anchor.saturating_sub(backward.max(0)), anchor.saturating_add(forward.max(0)))
@@ -73,6 +78,12 @@ struct SourceContextAnchor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceContextNeighborSpan {
+    backward: i32,
+    forward: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StructuredSourceCompanionKind {
     SourceProfile,
     Neighbor,
@@ -93,11 +104,21 @@ pub(crate) async fn augment_structured_source_context(
     query_ir: Option<&QueryIR>,
     document_index: &HashMap<Uuid, KnowledgeDocumentRow>,
     plan_keywords: &[String],
+    graph_evidence_source_document_ids: &[Uuid],
     chunks: &mut Vec<RuntimeMatchedChunk>,
 ) -> anyhow::Result<StructuredSourceContextDiagnostics> {
     let mut companions = Vec::<StructuredSourceCompanion>::new();
-    let candidates = collect_source_context_candidates(chunks);
+    let mut candidates = collect_source_context_candidates(chunks);
     let focus_keywords = source_context_focus_keywords(question, query_ir, plan_keywords);
+    if query_ir.is_some_and(requests_procedural_source_context) {
+        candidates = merge_graph_evidence_source_context_candidates(
+            candidates,
+            graph_evidence_source_document_ids,
+            document_index,
+            chunks,
+        );
+        seed_document_head_source_context_anchors(&mut candidates);
+    }
     // T2: source-slice loader now honours `temporal_constraints` via the
     // AQL substring filter on `occurred_at=ISO` headers, so we no longer
     // skip the slice path when bounds are present. Tail-N inside a
@@ -139,18 +160,25 @@ pub(crate) async fn augment_structured_source_context(
                     candidate.revision_id
                 )
             })?;
-        for (rank, row) in select_query_focused_source_rows(
+        let focused_rows = select_query_focused_source_rows(
             &focused_rows,
             &focus_keywords,
             false,
             &candidate.anchors,
             SOURCE_CONTEXT_FOCUSED_MATCH_LIMIT_PER_DOCUMENT,
-        )
-        .into_iter()
-        .enumerate()
-        {
+        );
+        let mut neighbor_anchors = candidate.anchors.clone();
+        for (rank, row) in focused_rows.into_iter().enumerate() {
             let score = candidate.best_score + SOURCE_CONTEXT_FOCUSED_MATCH_SCORE_BONUS
                 - rank as f32 * 0.01;
+            push_unique_source_context_anchor(
+                &mut neighbor_anchors,
+                SourceContextAnchor {
+                    chunk_index: row.chunk_index,
+                    score,
+                    first_rank: usize::MAX.saturating_sub(rank),
+                },
+            );
             if let Some(focused) = map_companion_chunk(row, score, document_index, &focus_keywords)
             {
                 companions.push(StructuredSourceCompanion {
@@ -170,49 +198,46 @@ pub(crate) async fn augment_structured_source_context(
                     candidate.revision_id
                 )
             })?;
-        let Some(profile_row) = profile_rows.into_iter().find(is_source_profile_chunk_row) else {
-            continue;
-        };
-        let profile_score = candidate.best_score + SOURCE_CONTEXT_SELECTED_PROFILE_BONUS;
-        if let Some(profile) =
-            map_companion_chunk(profile_row, profile_score, document_index, plan_keywords)
-        {
-            companions.push(StructuredSourceCompanion {
-                chunk: profile,
-                kind: StructuredSourceCompanionKind::SourceProfile,
-            });
+        if let Some(profile_row) = profile_rows.into_iter().find(is_source_profile_chunk_row) {
+            let profile_score = candidate.best_score + SOURCE_CONTEXT_SELECTED_PROFILE_BONUS;
+            if let Some(profile) =
+                map_companion_chunk(profile_row, profile_score, document_index, plan_keywords)
+            {
+                companions.push(StructuredSourceCompanion {
+                    chunk: profile,
+                    kind: StructuredSourceCompanionKind::SourceProfile,
+                });
+            }
         }
 
-        for anchor in candidate.anchors.iter().take(SOURCE_CONTEXT_ANCHOR_LIMIT_PER_DOCUMENT) {
-            let (min_index, max_index) = source_anchor_window(
-                anchor.chunk_index,
-                SOURCE_CONTEXT_NEIGHBOR_RADIUS,
-                SOURCE_CONTEXT_NEIGHBOR_RADIUS,
-            );
-            let rows = state
-                .arango_document_store
-                .list_chunks_by_revision_range(candidate.revision_id, min_index, max_index)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to load structured source neighbor chunks for revision {}",
-                        candidate.revision_id
-                    )
-                })?;
-            for row in rows {
-                if is_source_profile_chunk_row(&row) {
-                    continue;
-                }
-                let distance = row.chunk_index.abs_diff(anchor.chunk_index) as f32;
-                let score = source_context_neighbor_score(anchor.score, distance, row.chunk_index);
-                if let Some(neighbor) =
-                    map_companion_chunk(row, score, document_index, plan_keywords)
-                {
-                    companions.push(StructuredSourceCompanion {
-                        chunk: neighbor,
-                        kind: StructuredSourceCompanionKind::Neighbor,
-                    });
-                }
+        let neighbor_span = source_context_neighbor_span(query_ir);
+        let neighbor_windows = source_context_neighbor_windows(&neighbor_anchors, neighbor_span);
+        let rows = state
+            .arango_document_store
+            .list_chunks_by_revision_windows(candidate.revision_id, &neighbor_windows)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load structured source neighbor chunks for revision {}",
+                    candidate.revision_id
+                )
+            })?;
+        for row in rows {
+            if is_source_profile_chunk_row(&row) {
+                continue;
+            }
+            let Some(score) = source_context_best_neighbor_score(
+                &neighbor_anchors,
+                row.chunk_index,
+                neighbor_span,
+            ) else {
+                continue;
+            };
+            if let Some(neighbor) = map_companion_chunk(row, score, document_index, plan_keywords) {
+                companions.push(StructuredSourceCompanion {
+                    chunk: neighbor,
+                    kind: StructuredSourceCompanionKind::Neighbor,
+                });
             }
         }
     }
@@ -256,6 +281,15 @@ pub(crate) fn source_slice_context_top_k(query_ir: &QueryIR, base_top_k: usize) 
         return base_top_k;
     };
     base_top_k.max(source_slice_count(slice).saturating_add(1))
+}
+
+#[must_use]
+pub(crate) fn structured_source_context_top_k(query_ir: &QueryIR, base_top_k: usize) -> usize {
+    let top_k = source_slice_context_top_k(query_ir, base_top_k);
+    if !requests_procedural_source_context(query_ir) {
+        return top_k;
+    }
+    top_k.max(procedural_source_context_chunk_floor())
 }
 
 #[must_use]
@@ -506,12 +540,156 @@ fn collect_source_context_candidates(
     selected
 }
 
+fn merge_graph_evidence_source_context_candidates(
+    candidates: Vec<SourceContextCandidate>,
+    graph_evidence_source_document_ids: &[Uuid],
+    document_index: &HashMap<Uuid, KnowledgeDocumentRow>,
+    chunks: &[RuntimeMatchedChunk],
+) -> Vec<SourceContextCandidate> {
+    if graph_evidence_source_document_ids.is_empty() {
+        return candidates;
+    }
+
+    let global_best_score = chunks.iter().map(|chunk| score_value(chunk.score)).fold(0.0, f32::max);
+    let mut by_document = candidates
+        .iter()
+        .cloned()
+        .map(|candidate| (candidate.document_id, candidate))
+        .collect::<HashMap<_, _>>();
+    let mut seen_graph_document_ids = std::collections::BTreeSet::new();
+    let mut promoted_document_ids = std::collections::BTreeSet::new();
+    let mut merged = Vec::new();
+
+    for (rank, document_id) in graph_evidence_source_document_ids.iter().enumerate() {
+        if !seen_graph_document_ids.insert(*document_id) {
+            continue;
+        }
+        let Some(document) = document_index.get(document_id) else {
+            continue;
+        };
+        if document.document_state != "active" {
+            continue;
+        }
+        let Some(revision_id) = canonical_document_revision_id(document) else {
+            continue;
+        };
+        let graph_score =
+            global_best_score + SOURCE_CONTEXT_GRAPH_EVIDENCE_BONUS - rank as f32 * 0.01;
+        promoted_document_ids.insert(*document_id);
+        if let Some(mut candidate) = by_document.remove(document_id) {
+            candidate.first_rank = rank.min(candidate.first_rank);
+            candidate.revision_id = revision_id;
+            candidate.best_score = candidate.best_score.max(graph_score);
+            merged.push(candidate);
+        } else {
+            merged.push(SourceContextCandidate {
+                document_id: *document_id,
+                revision_id,
+                first_rank: rank,
+                best_score: graph_score,
+                anchors: Vec::new(),
+            });
+        }
+    }
+
+    for candidate in candidates {
+        if !promoted_document_ids.contains(&candidate.document_id) {
+            merged.push(candidate);
+        }
+    }
+    merged.truncate(SOURCE_CONTEXT_DOCUMENT_LIMIT);
+    merged
+}
+
+fn seed_document_head_source_context_anchors(candidates: &mut [SourceContextCandidate]) {
+    for (rank, candidate) in candidates.iter_mut().enumerate() {
+        push_unique_source_context_anchor(
+            &mut candidate.anchors,
+            SourceContextAnchor {
+                chunk_index: SOURCE_CONTEXT_DOCUMENT_HEAD_CHUNK_INDEX,
+                score: candidate.best_score,
+                first_rank: candidate.first_rank.min(rank),
+            },
+        );
+    }
+}
+
 fn source_context_anchor_is_better(
     score: f32,
     rank: usize,
     existing: &SourceContextAnchor,
 ) -> bool {
     score > existing.score || (score == existing.score && rank < existing.first_rank)
+}
+
+fn push_unique_source_context_anchor(
+    anchors: &mut Vec<SourceContextAnchor>,
+    anchor: SourceContextAnchor,
+) {
+    if let Some(existing) =
+        anchors.iter_mut().find(|existing| existing.chunk_index == anchor.chunk_index)
+    {
+        if source_context_anchor_is_better(anchor.score, anchor.first_rank, existing) {
+            *existing = anchor;
+        }
+    } else {
+        anchors.push(anchor);
+    }
+}
+
+fn source_context_neighbor_span(query_ir: Option<&QueryIR>) -> SourceContextNeighborSpan {
+    let mut span = SourceContextNeighborSpan {
+        backward: SOURCE_CONTEXT_DEFAULT_NEIGHBOR_BACKWARD,
+        forward: SOURCE_CONTEXT_DEFAULT_NEIGHBOR_FORWARD,
+    };
+    if query_ir.is_some_and(requests_procedural_source_context) {
+        span.backward = SOURCE_CONTEXT_PROCEDURAL_NEIGHBOR_BACKWARD;
+    }
+    span
+}
+
+fn requests_procedural_source_context(query_ir: &QueryIR) -> bool {
+    matches!(query_ir.act, QueryAct::ConfigureHow)
+        && matches!(query_ir.scope, QueryScope::SingleDocument)
+        && query_ir.source_slice.is_none()
+}
+
+fn procedural_source_context_chunk_floor() -> usize {
+    let span = SOURCE_CONTEXT_PROCEDURAL_NEIGHBOR_BACKWARD
+        .saturating_add(SOURCE_CONTEXT_DEFAULT_NEIGHBOR_FORWARD)
+        .saturating_add(1)
+        .max(0) as usize;
+    SOURCE_CONTEXT_PROFILE_HEADROOM
+        .saturating_add(SOURCE_CONTEXT_ANCHOR_LIMIT_PER_DOCUMENT.saturating_mul(span))
+        .saturating_add(SOURCE_CONTEXT_FOCUSED_MATCH_LIMIT_PER_DOCUMENT)
+}
+
+fn source_context_neighbor_windows(
+    anchors: &[SourceContextAnchor],
+    span: SourceContextNeighborSpan,
+) -> Vec<(i32, i32)> {
+    anchors
+        .iter()
+        .map(|anchor| source_anchor_window(anchor.chunk_index, span.backward, span.forward))
+        .collect()
+}
+
+fn source_context_best_neighbor_score(
+    anchors: &[SourceContextAnchor],
+    chunk_index: i32,
+    span: SourceContextNeighborSpan,
+) -> Option<f32> {
+    anchors
+        .iter()
+        .filter_map(|anchor| {
+            let min_index = anchor.chunk_index.saturating_sub(span.backward.max(0));
+            let max_index = anchor.chunk_index.saturating_add(span.forward.max(0));
+            (chunk_index >= min_index && chunk_index <= max_index).then(|| {
+                let distance = chunk_index.abs_diff(anchor.chunk_index) as f32;
+                source_context_neighbor_score(anchor.score, distance, chunk_index)
+            })
+        })
+        .max_by(f32::total_cmp)
 }
 
 fn source_context_focus_keywords(
@@ -740,7 +918,7 @@ fn source_profile_excerpt(text: &str) -> String {
 mod tests {
     use chrono::Utc;
 
-    use crate::domains::query_ir::{QueryAct, QueryLanguage};
+    use crate::domains::query_ir::{QueryAct, QueryLanguage, QueryScope};
 
     use super::*;
 
@@ -890,6 +1068,24 @@ mod tests {
         }
     }
 
+    fn source_context_ir(act: QueryAct, scope: QueryScope) -> QueryIR {
+        QueryIR {
+            act,
+            scope,
+            language: QueryLanguage::Auto,
+            target_types: Vec::new(),
+            target_entities: Vec::new(),
+            literal_constraints: Vec::new(),
+            temporal_constraints: Vec::new(),
+            comparison: None,
+            document_focus: None,
+            conversation_refs: Vec::new(),
+            needs_clarification: None,
+            source_slice: None,
+            confidence: 0.9,
+        }
+    }
+
     #[test]
     fn structural_source_profile_marker_is_recognized_without_kind() {
         let document_id = Uuid::now_v7();
@@ -942,7 +1138,7 @@ mod tests {
     fn source_context_focus_keywords_include_typed_query_ir_focus() {
         let mut query_ir = QueryIR {
             act: QueryAct::Describe,
-            scope: crate::domains::query_ir::QueryScope::SingleDocument,
+            scope: QueryScope::SingleDocument,
             language: QueryLanguage::Auto,
             target_types: Vec::new(),
             target_entities: vec![crate::domains::query_ir::EntityMention {
@@ -990,6 +1186,25 @@ mod tests {
         assert_eq!(source_slice_context_top_k(&requested, 8), 21);
         assert_eq!(source_slice_context_top_k(&defaulted, 8), 13);
         assert_eq!(source_slice_context_top_k(&too_large, 8), 31);
+        assert_eq!(structured_source_context_top_k(&requested, 8), 21);
+    }
+
+    #[test]
+    fn procedural_source_context_expands_default_top_k() {
+        let query_ir = source_context_ir(QueryAct::ConfigureHow, QueryScope::SingleDocument);
+
+        assert_eq!(
+            structured_source_context_top_k(&query_ir, 5),
+            procedural_source_context_chunk_floor()
+        );
+        assert_eq!(structured_source_context_top_k(&query_ir, 20), 20);
+    }
+
+    #[test]
+    fn descriptive_source_context_keeps_default_top_k() {
+        let query_ir = source_context_ir(QueryAct::Describe, QueryScope::SingleDocument);
+
+        assert_eq!(structured_source_context_top_k(&query_ir, 5), 5);
     }
 
     #[test]
@@ -1037,6 +1252,104 @@ mod tests {
     }
 
     #[test]
+    fn graph_evidence_documents_prepend_source_context_candidates() {
+        let graph_document_id = Uuid::now_v7();
+        let graph_revision_id = Uuid::now_v7();
+        let generic_document_id = Uuid::now_v7();
+        let generic_revision_id = Uuid::now_v7();
+        let document_index = HashMap::from([
+            (graph_document_id, document_row(graph_document_id, graph_revision_id)),
+            (generic_document_id, document_row(generic_document_id, generic_revision_id)),
+        ]);
+        let generic_chunk = RuntimeMatchedChunk {
+            score: Some(4.0),
+            ..runtime_chunk(generic_document_id, generic_revision_id, 7)
+        };
+        let candidates = collect_source_context_candidates(std::slice::from_ref(&generic_chunk));
+
+        let merged = merge_graph_evidence_source_context_candidates(
+            candidates,
+            &[graph_document_id],
+            &document_index,
+            &[generic_chunk],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].document_id, graph_document_id);
+        assert_eq!(merged[0].revision_id, graph_revision_id);
+        assert!(merged[0].anchors.is_empty());
+        assert_eq!(merged[1].document_id, generic_document_id);
+    }
+
+    #[test]
+    fn graph_evidence_documents_promote_existing_candidate_without_losing_anchors() {
+        let graph_document_id = Uuid::now_v7();
+        let graph_revision_id = Uuid::now_v7();
+        let other_document_id = Uuid::now_v7();
+        let other_revision_id = Uuid::now_v7();
+        let document_index = HashMap::from([
+            (graph_document_id, document_row(graph_document_id, graph_revision_id)),
+            (other_document_id, document_row(other_document_id, other_revision_id)),
+        ]);
+        let graph_chunk = RuntimeMatchedChunk {
+            score: Some(1.0),
+            ..runtime_chunk(graph_document_id, graph_revision_id, 3)
+        };
+        let other_chunk = RuntimeMatchedChunk {
+            score: Some(5.0),
+            ..runtime_chunk(other_document_id, other_revision_id, 4)
+        };
+        let candidates =
+            collect_source_context_candidates(&[other_chunk.clone(), graph_chunk.clone()]);
+
+        let merged = merge_graph_evidence_source_context_candidates(
+            candidates,
+            &[graph_document_id],
+            &document_index,
+            &[other_chunk, graph_chunk],
+        );
+
+        assert_eq!(merged[0].document_id, graph_document_id);
+        assert_eq!(merged[0].anchors.len(), 1);
+        assert_eq!(merged[0].anchors[0].chunk_index, 3);
+        assert!(merged[0].best_score > 5.0);
+    }
+
+    #[test]
+    fn procedural_head_anchor_reaches_initial_setup_chunk() {
+        let document_id = Uuid::now_v7();
+        let revision_id = Uuid::now_v7();
+        let late_detail_chunk =
+            RuntimeMatchedChunk { score: Some(7.0), ..runtime_chunk(document_id, revision_id, 22) };
+        let mut candidates =
+            collect_source_context_candidates(std::slice::from_ref(&late_detail_chunk));
+        seed_document_head_source_context_anchors(&mut candidates);
+        let span = SourceContextNeighborSpan {
+            backward: SOURCE_CONTEXT_PROCEDURAL_NEIGHBOR_BACKWARD,
+            forward: SOURCE_CONTEXT_DEFAULT_NEIGHBOR_FORWARD,
+        };
+
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0]
+                .anchors
+                .iter()
+                .any(|anchor| anchor.chunk_index == SOURCE_CONTEXT_DOCUMENT_HEAD_CHUNK_INDEX)
+        );
+        assert!(source_context_neighbor_windows(&candidates[0].anchors, span).contains(
+            &source_anchor_window(
+                SOURCE_CONTEXT_DOCUMENT_HEAD_CHUNK_INDEX,
+                SOURCE_CONTEXT_PROCEDURAL_NEIGHBOR_BACKWARD,
+                SOURCE_CONTEXT_DEFAULT_NEIGHBOR_FORWARD,
+            )
+        ));
+        assert!(
+            source_context_best_neighbor_score(&candidates[0].anchors, 1, span).is_some(),
+            "procedural source context must keep the document's setup block reachable"
+        );
+    }
+
+    #[test]
     fn collect_candidates_ranks_anchors_by_score_before_ordinal() {
         let document_id = Uuid::now_v7();
         let revision_id = Uuid::now_v7();
@@ -1078,6 +1391,84 @@ mod tests {
         let score = source_context_neighbor_score(42.0, 0.0, 10);
 
         assert!(score < 42.0);
+    }
+
+    #[test]
+    fn focused_match_extends_neighbor_windows() {
+        let span = source_context_neighbor_span(None);
+        let mut anchors = vec![
+            SourceContextAnchor { chunk_index: 24, score: 12.0, first_rank: 0 },
+            SourceContextAnchor { chunk_index: 22, score: 11.0, first_rank: 1 },
+        ];
+
+        push_unique_source_context_anchor(
+            &mut anchors,
+            SourceContextAnchor { chunk_index: 20, score: 13.0, first_rank: usize::MAX },
+        );
+
+        assert_eq!(
+            anchors.iter().map(|anchor| anchor.chunk_index).collect::<Vec<_>>(),
+            [24, 22, 20]
+        );
+        assert!(source_context_neighbor_windows(&anchors, span).contains(&(19, 21)));
+        assert!(
+            source_context_best_neighbor_score(&anchors, 19, span).is_some(),
+            "the source chunk immediately before a focused match must be eligible"
+        );
+    }
+
+    #[test]
+    fn configure_how_expands_preceding_setup_context() {
+        let query_ir = source_context_ir(QueryAct::ConfigureHow, QueryScope::SingleDocument);
+        let span = source_context_neighbor_span(Some(&query_ir));
+        let anchors = vec![SourceContextAnchor { chunk_index: 22, score: 11.0, first_rank: 0 }];
+
+        assert_eq!(
+            span,
+            SourceContextNeighborSpan {
+                backward: SOURCE_CONTEXT_PROCEDURAL_NEIGHBOR_BACKWARD,
+                forward: SOURCE_CONTEXT_DEFAULT_NEIGHBOR_FORWARD
+            }
+        );
+        assert!(source_context_neighbor_windows(&anchors, span).contains(&(19, 23)));
+        assert!(
+            source_context_best_neighbor_score(&anchors, 19, span).is_some(),
+            "procedural answers need the setup block that precedes the matching detail chunk"
+        );
+    }
+
+    #[test]
+    fn non_procedural_source_context_stays_narrow() {
+        let query_ir = source_context_ir(QueryAct::Describe, QueryScope::SingleDocument);
+        let span = source_context_neighbor_span(Some(&query_ir));
+        let anchors = vec![SourceContextAnchor { chunk_index: 22, score: 11.0, first_rank: 0 }];
+
+        assert_eq!(
+            span,
+            SourceContextNeighborSpan {
+                backward: SOURCE_CONTEXT_DEFAULT_NEIGHBOR_BACKWARD,
+                forward: SOURCE_CONTEXT_DEFAULT_NEIGHBOR_FORWARD
+            }
+        );
+        assert!(source_context_neighbor_windows(&anchors, span).contains(&(21, 23)));
+        assert!(
+            source_context_best_neighbor_score(&anchors, 19, span).is_none(),
+            "default descriptive context should not silently widen evidence windows"
+        );
+    }
+
+    #[test]
+    fn focused_match_anchor_dedupes_against_existing_anchor() {
+        let mut anchors = vec![SourceContextAnchor { chunk_index: 7, score: 5.0, first_rank: 4 }];
+
+        push_unique_source_context_anchor(
+            &mut anchors,
+            SourceContextAnchor { chunk_index: 7, score: 8.0, first_rank: usize::MAX },
+        );
+
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].chunk_index, 7);
+        assert_eq!(anchors[0].score, 8.0);
     }
 
     #[test]

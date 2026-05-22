@@ -52,6 +52,7 @@ utoipa.workspace = true
 config = "0.15"
 http = "1"
 reqwest = { version = "0.13", features = ["json", "rustls", "stream"] }
+regex = "1.12.3"
 semver = "1"
 opentelemetry = { version = "0.31", features = ["logs", "metrics", "trace"] }
 opentelemetry_sdk = { version = "0.31", features = ["logs", "metrics", "rt-tokio"] }
@@ -150,7 +151,6 @@ path = "src/bin/emit_openapi.rs"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-regex = "1.12.3"
 yaml-rust2 = "0.11.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 insta = { version = "1.43.2", features = ["json"] }

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::domains::query::{DEFAULT_TOP_K, MAX_TOP_K, QueryPlanningMetadata, RuntimeQueryMode};
+use crate::domains::query_ir::literal_text_is_identifier_shaped;
 const DEFAULT_CONTEXT_BUDGET_CHARS: usize = 22_000;
 /// Minimum token length after stripping punctuation. Tokens shorter than
 /// this mostly carry no retrieval signal; a length cutoff avoids a
@@ -115,7 +116,7 @@ pub fn build_query_plan(
     let case_preserving = extract_keywords_preserving_case(question);
     let (entity_keywords, concept_keywords) = classify_keyword_levels(&case_preserving);
 
-    let intent_profile = classify_query_intent_profile(question, &keywords);
+    let intent_profile = classify_query_intent_profile(question, &case_preserving);
     let hyde_recommended =
         intent_profile.multi_document_technical && !intent_profile.exact_literal_technical;
 
@@ -150,7 +151,7 @@ pub fn build_query_plan_from_metadata(
     let case_preserving = extract_keywords_preserving_case(question);
     let (entity_keywords, concept_keywords) = classify_keyword_levels(&case_preserving);
 
-    let intent_profile = classify_query_intent_profile(question, &keywords);
+    let intent_profile = classify_query_intent_profile(question, &case_preserving);
     let hyde_recommended =
         intent_profile.multi_document_technical && !intent_profile.exact_literal_technical;
 
@@ -188,11 +189,7 @@ fn is_exact_literal_technical_question(question: &str, keywords: &[String]) -> b
     question.contains("http://")
         || question.contains("https://")
         || question.contains('/')
-        || keywords.iter().any(|keyword| {
-            keyword.contains('_')
-                || keyword.chars().any(|ch| ch.is_ascii_digit())
-                || keyword.chars().any(|ch| ch.is_ascii_uppercase())
-        })
+        || keywords.iter().any(|keyword| literal_text_is_identifier_shaped(keyword))
 }
 
 fn is_multi_document_technical_question(question: &str) -> bool {
@@ -322,6 +319,21 @@ mod tests {
     }
 
     #[test]
+    fn exact_literal_profile_uses_structural_token_shape() {
+        let plain = build_query_plan("Explain Alpha Suite settings", None, None, None);
+        assert!(!plain.intent_profile.exact_literal_technical);
+
+        let camel = build_query_plan("What does callbackUrl configure?", None, None, None);
+        assert!(camel.intent_profile.exact_literal_technical);
+
+        let acronym = build_query_plan("Where is DATABASE_URL documented?", None, None, None);
+        assert!(acronym.intent_profile.exact_literal_technical);
+
+        let separated = build_query_plan("Explain Настройка_2", None, None, None);
+        assert!(separated.intent_profile.exact_literal_technical);
+    }
+
+    #[test]
     fn build_query_plan_from_metadata_preserves_keyword_levels() {
         let metadata = QueryPlanningMetadata {
             requested_mode: RuntimeQueryMode::Hybrid,
@@ -354,6 +366,27 @@ mod tests {
             ]
         );
         assert!(!plan.intent_profile.multi_document_technical);
+    }
+
+    #[test]
+    fn metadata_query_plan_uses_question_shape_for_exact_literal_profile() {
+        let metadata = QueryPlanningMetadata {
+            requested_mode: RuntimeQueryMode::Hybrid,
+            planned_mode: RuntimeQueryMode::Hybrid,
+            intent_cache_status: crate::domains::query::QueryIntentCacheStatus::Miss,
+            keywords: crate::domains::query::IntentKeywords {
+                high_level: vec!["plain".to_string()],
+                low_level: vec!["topic".to_string()],
+            },
+            warnings: Vec::new(),
+        };
+
+        let plain = build_query_plan_from_metadata("Explain Alpha Suite settings", &metadata, None);
+        assert!(!plain.intent_profile.exact_literal_technical);
+
+        let structural =
+            build_query_plan_from_metadata("What does callbackUrl configure?", &metadata, None);
+        assert!(structural.intent_profile.exact_literal_technical);
     }
 
     #[test]

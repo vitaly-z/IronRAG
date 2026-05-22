@@ -12,10 +12,26 @@ use crate::{
 
 pub const DEFAULT_TOP_K: usize = 24;
 pub const MAX_TOP_K: usize = 32;
+pub const CONTEXTUAL_GROUNDED_ANSWER_MIN_TOP_K: usize = 8;
 
 #[must_use]
 pub fn resolve_top_k(requested_top_k: Option<usize>) -> usize {
     requested_top_k.unwrap_or(DEFAULT_TOP_K).clamp(1, MAX_TOP_K)
+}
+
+#[must_use]
+pub fn resolve_contextual_grounded_answer_top_k(
+    requested_top_k: Option<usize>,
+    has_contextual_turns: bool,
+    max_top_k: usize,
+) -> usize {
+    let bounded_max = max_top_k.clamp(1, MAX_TOP_K);
+    let mut effective_top_k = requested_top_k.unwrap_or(DEFAULT_TOP_K).clamp(1, bounded_max);
+    if has_contextual_turns {
+        effective_top_k =
+            effective_top_k.max(CONTEXTUAL_GROUNDED_ANSWER_MIN_TOP_K.min(bounded_max));
+    }
+    effective_top_k
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]

@@ -1,4 +1,4 @@
-use crate::domains::query_ir::{LiteralKind, QueryAct, QueryIR};
+use crate::domains::query_ir::{LiteralKind, QueryAct, QueryIR, SourceSliceDirection};
 
 const LATEST_VERSION_DEFAULT_COUNT: usize = 5;
 const LATEST_VERSION_MAX_COUNT: usize = 10;
@@ -7,9 +7,16 @@ pub(crate) const LATEST_VERSION_CHUNKS_PER_DOCUMENT: usize = 4;
 pub(crate) fn query_requests_latest_versions(ir: &QueryIR) -> bool {
     matches!(ir.act, QueryAct::Describe | QueryAct::Enumerate | QueryAct::Meta)
         && ir_target_types_include(ir, &["version"])
+        && ir
+            .source_slice
+            .as_ref()
+            .is_none_or(|slice| matches!(slice.direction, SourceSliceDirection::Tail))
 }
 
 pub(crate) fn requested_latest_version_count(ir: &QueryIR) -> usize {
+    if let Some(count) = ir.source_slice.as_ref().and_then(|slice| slice.count) {
+        return usize::from(count).clamp(1, LATEST_VERSION_MAX_COUNT);
+    }
     for literal in &ir.literal_constraints {
         if !matches!(literal.kind, LiteralKind::NumericCode) {
             continue;

@@ -125,6 +125,14 @@ pub fn is_noise_relation_type(normalized_slug: &str) -> bool {
     NOISE_RELATION_TYPES.contains(&normalized_slug)
 }
 
+#[must_use]
+pub fn is_structural_literal_label(label: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(label.trim()),
+        Ok(serde_json::Value::Bool(_) | serde_json::Value::Null)
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GraphLabelNodeTypeIndex {
     node_types_by_identity: BTreeMap<String, RuntimeNodeType>,
@@ -351,6 +359,17 @@ mod tests {
         assert!(is_noise_relation_type("unknown"));
         assert!(is_noise_relation_type("related_to"));
         assert!(!is_noise_relation_type("uses"));
+    }
+
+    #[test]
+    fn structural_literal_label_detection_is_json_bool_or_null_only() {
+        assert!(is_structural_literal_label("false"));
+        assert!(is_structural_literal_label(" true "));
+        assert!(is_structural_literal_label("null"));
+        assert!(!is_structural_literal_label("False"));
+        assert!(!is_structural_literal_label("42"));
+        assert!(!is_structural_literal_label("3.12.4"));
+        assert!(!is_structural_literal_label("Alpha false mode"));
     }
 
     #[test]

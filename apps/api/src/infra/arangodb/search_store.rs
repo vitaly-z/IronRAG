@@ -39,6 +39,9 @@ const VECTOR_OVER_FETCH_DEFAULT_FLOOR: usize = 64;
 const VECTOR_OVER_FETCH_MAX: usize = 8_192;
 const KNOWLEDGE_CHUNK_VECTOR_UPSERT_BATCH_ROWS: usize = 8;
 
+pub const KNOWLEDGE_CHUNK_VECTOR_KIND: &str = "chunk_embedding";
+pub const KNOWLEDGE_ENTITY_VECTOR_KIND: &str = "entity_embedding";
+
 // TODO(IRONRAG-001): extract the duplicated `FILTER (@temporal_start_iso ==
 // null AND @temporal_end_iso == null) OR (X.occurred_at != null AND ...)`
 // snippet from the four lexical lanes of `search_chunks` (text view,
@@ -335,7 +338,8 @@ impl ArangoSearchStore {
                     occurred_at: row.occurred_at,
                     occurred_until: row.occurred_until
                  }
-                 IN @@collection",
+                 IN @@collection
+                 RETURN NEW._key",
                 serde_json::json!({
                     "@collection": KNOWLEDGE_CHUNK_VECTOR_COLLECTION,
                     "rows": rows,
@@ -345,8 +349,11 @@ impl ArangoSearchStore {
             .context("failed to bulk-upsert knowledge chunk vectors")?;
         let row_count =
             cursor.get("result").and_then(serde_json::Value::as_array).map_or(0, Vec::len);
-        if row_count != 0 {
-            return Err(anyhow!("chunk vector bulk upsert returned unexpected rows"));
+        if row_count != rows.len() {
+            return Err(anyhow!(
+                "chunk vector bulk upsert persisted {row_count} rows for {} requested rows",
+                rows.len()
+            ));
         }
         Ok(())
     }
@@ -1584,8 +1591,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        KnowledgeChunkVectorRow, KnowledgeEntityVectorRow, lexical_query_terms,
-        numeric_title_literals, title_identity_terms, title_ngram_terms, title_soft_raw_enabled,
+        KNOWLEDGE_CHUNK_VECTOR_KIND, KNOWLEDGE_ENTITY_VECTOR_KIND, KnowledgeChunkVectorRow,
+        KnowledgeEntityVectorRow, lexical_query_terms, numeric_title_literals,
+        title_identity_terms, title_ngram_terms, title_soft_raw_enabled,
     };
 
     #[test]
@@ -1667,6 +1675,12 @@ mod tests {
     fn title_soft_raw_enabled_for_short_title_lookup_queries() {
         let terms = lexical_query_terms("how configure payment");
         assert!(title_soft_raw_enabled(&terms));
+    }
+
+    #[test]
+    fn vector_kind_constants_preserve_persisted_arango_vocabulary() {
+        assert_eq!(KNOWLEDGE_CHUNK_VECTOR_KIND, "chunk_embedding");
+        assert_eq!(KNOWLEDGE_ENTITY_VECTOR_KIND, "entity_embedding");
     }
 
     #[test]

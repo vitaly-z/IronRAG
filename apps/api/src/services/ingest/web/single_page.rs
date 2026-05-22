@@ -7,8 +7,9 @@ use super::{
     UpdateAsyncOperationCommand, UpdateMutationCommand, UpdateWebIngestRun, WebCandidateState,
     WebClassificationReason, WebDiscoveredPageRow, WebIngestRunRow, WebIngestService,
     WebRunFailure, WebRunFailureCode, WebRunState, derive_terminal_run_state, extraction_title,
-    fallback_title_from_url, ingest_repository, map_web_run_counts_row, now_if_terminal,
-    parse_run_url_filter, resolved_web_mime_type, source_file_name_from_url, telemetry,
+    fallback_title_from_url, ingest_repository, is_direct_image_web_resource,
+    map_web_run_counts_row, now_if_terminal, parse_run_url_filter, resolved_web_mime_type,
+    source_file_name_from_url, telemetry,
 };
 use crate::services::content::service::MaterializedWebCapture;
 use crate::shared::web::ingest::classify_web_materialization_filter_exclusion;
@@ -447,6 +448,16 @@ pub(super) async fn materialize_snapshot_resource(
     resource: &FetchedWebResource,
     storage_key: &str,
 ) -> Result<MaterializedWebPage, WebRunFailure> {
+    if is_direct_image_web_resource(&resource.final_url, resource.content_type.as_deref()) {
+        return Err(WebRunFailure::unsupported_content(
+            "web ingest materializes document resources; upload standalone images as files"
+                .to_string(),
+            Some(resource.final_url.clone()),
+            resource.content_type.clone(),
+            Some(resource.http_status),
+        ));
+    }
+
     let file_name =
         source_file_name_from_url(&resource.final_url, resource.content_type.as_deref());
     let extraction_plan = state

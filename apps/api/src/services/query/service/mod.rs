@@ -39,11 +39,12 @@ pub(crate) const MAX_PROMPT_HISTORY_TURNS: usize = 12;
 pub(crate) const MAX_PROMPT_HISTORY_TURN_CHARS: usize = 1_200;
 pub(crate) const MAX_EFFECTIVE_QUERY_HISTORY_TURNS: usize = 3;
 pub(crate) const MAX_EFFECTIVE_QUERY_TURN_CHARS: usize = 220;
+pub(crate) const MAX_GROUNDED_ANSWER_TOOL_HISTORY_TURNS: usize = 2;
+pub(crate) const MAX_GROUNDED_ANSWER_TOOL_HISTORY_CHARS: usize = 2_000;
 pub(crate) const CANONICAL_QUERY_MODE: RuntimeQueryMode = RuntimeQueryMode::Mix;
 pub(crate) const MAX_DETAIL_TECHNICAL_FACT_REFERENCES: usize = 24;
 pub(crate) const MAX_DETAIL_PREPARED_SEGMENT_REFERENCES: usize = 48;
 pub(crate) const MAX_DETAIL_PREPARED_SEGMENT_REFERENCES_PER_REVISION: usize = 8;
-pub(crate) const MAX_ANSWER_SOURCE_LINKS: usize = 5;
 /// Minimum characters a token must have to count as a focus signal for
 /// prepared-segment ranking. Length cutoff is language-agnostic; mirrors
 /// `planner.rs::TOKEN_MIN_LEN`.
@@ -52,8 +53,10 @@ pub(crate) const PREPARED_SEGMENT_FOCUS_MIN_TOKEN_LEN: usize = 4;
 #[derive(Debug, Clone)]
 pub(crate) struct ConversationRuntimeContext {
     pub(crate) effective_query_text: String,
+    pub(crate) query_planning_history_text: Option<String>,
     pub(crate) prompt_history_text: Option<String>,
     pub(crate) prompt_history_messages: Vec<crate::integrations::llm::ChatMessage>,
+    pub(crate) grounded_answer_tool_history: Vec<ExternalConversationTurn>,
     pub(crate) coreference_entities: Vec<String>,
 }
 

@@ -48,7 +48,7 @@ fn sample_settings() -> Settings {
         ui_bootstrap_vision_model_name: None,
         ui_session_ttl_hours: 720,
         upload_max_size_mb: 50,
-        recognition_default_raster_image_engine: "docling".into(),
+        recognition_default_raster_image_engine: "vision".into(),
         startup_authority_mode: "not_required".into(),
         dependency_postgres_mode: "external".into(),
         dependency_redis_mode: "external".into(),
@@ -86,7 +86,6 @@ fn sample_settings() -> Settings {
         runtime_policy_reject_target_kinds: None,
         query_intent_cache_ttl_hours: 24,
         query_intent_cache_max_entries_per_library: 500,
-        query_answer_source_links_enabled: false,
         release_check_repository: "mlimarenko/IronRAG".into(),
         release_check_interval_hours: 12,
         graph_gc_hours: 24,
@@ -171,10 +170,10 @@ fn from_env_has_sane_local_defaults() {
     assert_eq!(settings.release_check_interval_hours, 12);
     assert_eq!(settings.graph_gc_hours, 24);
     assert_eq!(settings.runtime_agent_max_parallel_actions, 4);
-    assert_eq!(settings.recognition_default_raster_image_engine, "docling");
+    assert_eq!(settings.recognition_default_raster_image_engine, "vision");
     assert_eq!(
         settings.default_recognition_policy().raster_image_engine,
-        RecognitionEngine::Docling
+        RecognitionEngine::Vision
     );
     assert_eq!(
         settings.runtime_trace_payload_budget_bytes,
@@ -203,12 +202,14 @@ fn from_env_has_sane_local_defaults() {
 
 #[test]
 fn recognition_default_raster_image_engine_overrides_default() {
-    let settings =
-        settings_from_env_entries(&[("IRONRAG_RECOGNITION_DEFAULT_RASTER_IMAGE_ENGINE", "vision")]);
+    let settings = settings_from_env_entries(&[(
+        "IRONRAG_RECOGNITION_DEFAULT_RASTER_IMAGE_ENGINE",
+        "docling",
+    )]);
 
     assert_eq!(
         settings.default_recognition_policy().raster_image_engine,
-        RecognitionEngine::Vision
+        RecognitionEngine::Docling
     );
 }
 

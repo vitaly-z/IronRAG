@@ -133,8 +133,13 @@ pub fn is_structurally_unstable_fragment(text: &str) -> bool {
 
     let unstable_token_count =
         tokens.iter().filter(|token| token_is_structurally_unstable(token)).count();
+    let short_fragment_noise_count =
+        tokens.iter().filter(|token| token_is_short_fragment_noise(token)).count();
     let digit_or_script_noise_count =
         tokens.iter().filter(|token| token_has_digit_or_script_noise(token)).count();
+    if short_fragment_noise_count > 0 {
+        return true;
+    }
     if digit_or_script_noise_count > 0 {
         return true;
     }
@@ -203,6 +208,38 @@ fn token_is_structurally_unstable(token: &str) -> bool {
         || embedded_digit_word
         || script_switches >= 2
         || (digits > 0 && lowercase == 0 && uppercase >= 5)
+}
+
+fn token_is_short_fragment_noise(token: &str) -> bool {
+    let token = clean_token(token);
+    let chars = token.chars().collect::<Vec<_>>();
+    if chars.len() < 2 || chars.len() > 8 || token_has_strong_code_context_marker(token) {
+        return false;
+    }
+
+    let letters = chars.iter().filter(|ch| ch.is_alphabetic()).count();
+    if letters < 2 {
+        return false;
+    }
+
+    let uppercase = chars.iter().filter(|ch| ch.is_uppercase()).count();
+    let lowercase = chars.iter().filter(|ch| ch.is_lowercase()).count();
+    let case_transitions = chars
+        .windows(2)
+        .filter(|pair| {
+            let left = pair[0];
+            let right = pair[1];
+            (left.is_lowercase() && right.is_uppercase())
+                || (left.is_uppercase() && right.is_lowercase())
+        })
+        .count();
+    let script_switches = chars
+        .windows(2)
+        .filter_map(|pair| Some((letter_script_class(pair[0])?, letter_script_class(pair[1])?)))
+        .filter(|(left, right)| left != right)
+        .count();
+
+    script_switches >= 1 || (uppercase >= 2 && lowercase >= 2 && case_transitions >= 3)
 }
 
 fn token_has_digit_or_script_noise(token: &str) -> bool {
@@ -436,8 +473,14 @@ mod tests {
         assert!(is_structurally_unstable_fragment("qWeR7tYuI"));
         assert!(is_structurally_unstable_fragment("abCDEfGHij klMNOqRStu"));
         assert!(is_structurally_unstable_fragment("7.3abCDefGH"));
+        assert!(is_structurally_unstable_fragment("CTpoKe"));
+        assert!(is_structurally_unstable_fragment("Enμα"));
+        assert!(is_structurally_unstable_fragment("∑nμα"));
+        assert!(is_structurally_unstable_fragment("μe"));
         assert!(!is_structurally_unstable_fragment("getUserById"));
         assert!(!is_structurally_unstable_fragment("renderHTMLNode"));
         assert!(!is_structurally_unstable_fragment("parseHTTPResponse"));
+        assert!(!is_structurally_unstable_fragment("NODE_ALPHA-42"));
+        assert!(!is_structurally_unstable_fragment("ALPHA_TIMEOUT_MS=4500"));
     }
 }

@@ -305,6 +305,15 @@ fn auto_heavy_revision_pipeline_parallelism_for_limits(
         .clamp(1, HEAVY_PIPELINE_AUTO_MAX_PARALLELISM)
 }
 
+fn vision_billing_usage_items(usage_json: &serde_json::Value) -> Vec<serde_json::Value> {
+    usage_json
+        .get("embedded_picture_ocr_usage")
+        .and_then(serde_json::Value::as_array)
+        .filter(|items| !items.is_empty())
+        .map(|items| items.to_vec())
+        .unwrap_or_else(|| vec![usage_json.clone()])
+}
+
 fn map_stage_error(
     error: anyhow::Error,
     user_cancel_requested: &AtomicBool,
@@ -1118,27 +1127,30 @@ async fn run_canonical_ingest_pipeline(
 
     let extract_content_elapsed_ms = Some(extract_content_start.elapsed().as_millis() as i64);
 
-    // Capture vision billing if LLM was used for content extraction
-    if extracted_content.provider_kind.is_some() {
-        if let Err(e) = state
-            .canonical_services
-            .billing
-            .capture_ingest_attempt(
-                state,
-                crate::services::ops::billing::CaptureIngestAttemptBillingCommand {
-                    workspace_id: job.workspace_id,
-                    library_id: job.library_id,
-                    attempt_id,
-                    binding_id: None,
-                    provider_kind: extracted_content.provider_kind.clone().unwrap_or_default(),
-                    model_name: extracted_content.model_name.clone().unwrap_or_default(),
-                    call_kind: "vision_extract".to_string(),
-                    usage_json: extracted_content.usage_json.clone(),
-                },
-            )
-            .await
-        {
-            warn!(%worker_id, job_id = %job.id, ?e, "vision billing capture failed");
+    // Capture vision billing if LLM was used for content extraction.
+    if let Some(provider_kind) = extracted_content.provider_kind.clone() {
+        let model_name = extracted_content.model_name.clone().unwrap_or_default();
+        for usage_json in vision_billing_usage_items(&extracted_content.usage_json) {
+            if let Err(e) = state
+                .canonical_services
+                .billing
+                .capture_ingest_attempt(
+                    state,
+                    crate::services::ops::billing::CaptureIngestAttemptBillingCommand {
+                        workspace_id: job.workspace_id,
+                        library_id: job.library_id,
+                        attempt_id,
+                        binding_id: None,
+                        provider_kind: provider_kind.clone(),
+                        model_name: model_name.clone(),
+                        call_kind: "vision_extract".to_string(),
+                        usage_json,
+                    },
+                )
+                .await
+            {
+                warn!(%worker_id, job_id = %job.id, ?e, "vision billing capture failed");
+            }
         }
     }
 
@@ -2068,5 +2080,32 @@ mod tests {
         assert_eq!(auto_heavy_revision_pipeline_parallelism_for_limits(8, Some(mib(8192)), 1), 2);
         assert_eq!(auto_heavy_revision_pipeline_parallelism_for_limits(8, None, 4), 1);
         assert_eq!(auto_heavy_revision_pipeline_parallelism_for_limits(0, Some(mib(8192)), 4), 1);
+    }
+
+    #[test]
+    fn vision_billing_usage_items_expand_embedded_picture_calls() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 30,
+            "completion_tokens": 6,
+            "embedded_picture_ocr_usage": [
+                {"prompt_tokens": 10, "completion_tokens": 2},
+                {"prompt_tokens": 20, "completion_tokens": 4}
+            ]
+        });
+
+        let items = vision_billing_usage_items(&usage);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["prompt_tokens"], serde_json::json!(10));
+        assert_eq!(items[1]["completion_tokens"], serde_json::json!(4));
+    }
+
+    #[test]
+    fn vision_billing_usage_items_keep_single_image_usage() {
+        let usage = serde_json::json!({"prompt_tokens": 10, "completion_tokens": 2});
+
+        let items = vision_billing_usage_items(&usage);
+
+        assert_eq!(items, vec![usage]);
     }
 }

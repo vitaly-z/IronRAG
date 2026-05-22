@@ -1,18 +1,19 @@
 import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
-import { Activity, Brain, DollarSign, Key, ListOrdered, Settings, Terminal } from 'lucide-react';
+import { Activity, Brain, Database, DollarSign, Key, ListOrdered, Settings, Terminal } from 'lucide-react';
 import { useApp } from '@/shared/contexts/app-context';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/shared/components/ui/tabs';
 import AiConfigurationPanel from '@/features/admin/components/AiConfigurationPanel';
 import { AccessTab } from '@/features/admin/components/AccessTab';
 import { McpTab } from '@/features/admin/components/McpTab';
 import { IngestQueueTab } from '@/features/admin/components/IngestQueueTab';
+import { LibrariesTab } from '@/features/admin/components/LibrariesTab';
 import { OperationsTab } from '@/features/admin/components/OperationsTab';
 import { PricingTab } from '@/features/admin/components/PricingTab';
 import { SettingsTab } from '@/features/admin/components/SettingsTab';
 
-const TAB_VALUES = ['access', 'mcp', 'operations', 'queue', 'ai', 'pricing', 'settings'] as const;
+const TAB_VALUES = ['access', 'libraries', 'mcp', 'operations', 'queue', 'ai', 'pricing', 'settings'] as const;
 type AdminTab = (typeof TAB_VALUES)[number];
 
 function parseTab(value: string | null): AdminTab {
@@ -38,6 +39,7 @@ export default function AdminPage() {
 
   const tabDescriptors = [
     { value: 'access' as const, label: t('admin.access'), icon: Key },
+    { value: 'libraries' as const, label: t('admin.libraries.label'), icon: Database },
     { value: 'mcp' as const, label: t('admin.mcp.label'), icon: Terminal },
     { value: 'operations' as const, label: t('admin.operations'), icon: Activity },
     { value: 'queue' as const, label: t('admin.ingestQueue'), icon: ListOrdered },
@@ -92,6 +94,10 @@ export default function AdminPage() {
               activeWorkspaceId={activeWorkspace?.id}
               active={activeTab === 'access'}
             />
+          </TabsContent>
+
+          <TabsContent value="libraries" className="mt-0 flex-1 min-h-0 overflow-hidden p-0 animate-fade-in">
+            <LibrariesTab active={activeTab === 'libraries'} />
           </TabsContent>
 
           <TabsContent value="mcp" className="mt-0 flex-1 min-h-0 overflow-auto p-6 animate-fade-in">

@@ -72,6 +72,52 @@ fn verify_answer_rejects_nonempty_answer_without_canonical_evidence() {
 }
 
 #[test]
+fn verify_answer_allows_user_supplied_scope_literals() {
+    let verification = verify_answer_against_canonical_evidence(
+        "Which `alpha-*` modules exist?",
+        "For `alpha-*`, the grounded context mentions Alpha Sync.",
+        &QueryIntentProfile::default(),
+        &CanonicalAnswerEvidence {
+            bundle: None,
+            chunk_rows: Vec::new(),
+            structured_blocks: Vec::new(),
+            technical_facts: Vec::new(),
+        },
+        &[runtime_chunk("The grounded context mentions Alpha Sync.")],
+        "The grounded context mentions Alpha Sync.",
+        &AssistantGroundingEvidence::default(),
+    );
+
+    assert_eq!(verification.state, QueryVerificationState::Verified);
+    assert!(verification.warnings.iter().all(|warning| warning.code != "unsupported_literal"));
+}
+
+#[test]
+fn verify_answer_does_not_ground_non_wildcard_literals_from_question() {
+    let verification = verify_answer_against_canonical_evidence(
+        "Is `/not-grounded` configured?",
+        "The configured endpoint is `/not-grounded`.",
+        &QueryIntentProfile::default(),
+        &CanonicalAnswerEvidence {
+            bundle: None,
+            chunk_rows: Vec::new(),
+            structured_blocks: Vec::new(),
+            technical_facts: Vec::new(),
+        },
+        &[runtime_chunk("The docs mention a stable endpoint but do not name it.")],
+        "The docs mention a stable endpoint but do not name it.",
+        &AssistantGroundingEvidence::default(),
+    );
+
+    assert_eq!(verification.state, QueryVerificationState::InsufficientEvidence);
+    assert!(
+        verification.warnings.iter().any(|warning| warning.code == "unsupported_literal"),
+        "{:?}",
+        verification.warnings
+    );
+}
+
+#[test]
 fn verify_answer_accepts_method_path_literal_when_method_and_path_are_grounded() {
     let verification = verify_answer_against_canonical_evidence(
         "Which endpoints are needed?",
@@ -905,6 +951,7 @@ fn build_structured_query_diagnostics_emits_typed_response_shape() {
             node_id: Uuid::now_v7(),
             label: "IronRAG".to_string(),
             node_type: "entity".to_string(),
+            summary: None,
             score: Some(0.91),
         }],
         relationships: vec![RuntimeMatchedRelationship {

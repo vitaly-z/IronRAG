@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import AdminPage from "@/features/admin/AdminPage";
+import { TooltipProvider } from "@/shared/components/ui/tooltip";
 
 const {
   useAppMock,
@@ -12,10 +13,14 @@ const {
   dashboardApiMock,
   librarySnapshotApiMock,
   queryApiMock,
+  catalogMock,
+  opsMock,
   toastErrorMock,
+  toastSuccessMock,
 } = vi.hoisted(() => ({
   useAppMock: vi.fn(),
   toastErrorMock: vi.fn(),
+  toastSuccessMock: vi.fn(),
   adminApiMock: {
     listTokens: vi.fn(),
     listWorkspaces: vi.fn(),
@@ -43,9 +48,16 @@ const {
   librarySnapshotApiMock: {
     export: vi.fn(),
     import: vi.fn(),
+    downloadExport: vi.fn(),
   },
   queryApiMock: {
     getAssistantSystemPrompt: vi.fn(),
+  },
+  catalogMock: {
+    deleteCatalogLibrary: vi.fn(),
+  },
+  opsMock: {
+    getAsyncOperation: vi.fn(),
   },
 }));
 
@@ -56,8 +68,9 @@ vi.mock("@/shared/contexts/app-context", () => ({
 vi.mock("sonner", () => ({
   toast: {
     error: toastErrorMock,
-    success: vi.fn(),
+    success: toastSuccessMock,
     warning: vi.fn(),
+    loading: vi.fn(() => "toast-1"),
   },
 }));
 
@@ -66,6 +79,10 @@ vi.mock("@/shared/api", () => ({
   dashboardApi: dashboardApiMock,
   librarySnapshotApi: librarySnapshotApiMock,
   queryApi: queryApiMock,
+  Catalog: catalogMock,
+  Ops: opsMock,
+  unwrap: (value: { data?: unknown }) => value.data ?? value,
+  ASYNC_OPERATION_TERMINAL_STATES: new Set(["ready", "failed", "canceled", "superseded"]),
   // McpTab + OperationsTab consume the generated TanStack queryOptions
   // instead of queryApi/dashboardApi/adminApi directly. Each stub returns a
   // hand-shaped queryOptions whose queryFn delegates to the existing
@@ -137,6 +154,38 @@ vi.mock("@/shared/api", () => ({
       queryKey: ["mockedListCatalogLibraries", input.path.workspaceId],
       queryFn: async () => adminApiMock.listLibraries(input.path.workspaceId),
     }),
+    listCatalogWorkspacesQueryKey: () => ["mockedListCatalogWorkspaces"],
+    listCatalogLibrariesQueryKey: (input: { path: { workspaceId: string } }) => [
+      "mockedListCatalogLibraries",
+      input.path.workspaceId,
+    ],
+    getWorkspaceCostSummaryOptions: (input: { query: { workspaceId: string } }) => ({
+      queryKey: ["mockedWorkspaceCostSummary", input.query.workspaceId],
+      queryFn: async () => ({
+        totalCost: "1.25",
+        currencyCode: "USD",
+        libraryCount: 2,
+        documentCount: 7,
+        providerCallCount: 11,
+      }),
+    }),
+    getWorkspaceCostSummaryQueryKey: (input: { query: { workspaceId: string } }) => [
+      "mockedWorkspaceCostSummary",
+      input.query.workspaceId,
+    ],
+    getLibraryCostSummaryOptions: (input: { query: { libraryId: string } }) => ({
+      queryKey: ["mockedLibraryCostSummary", input.query.libraryId],
+      queryFn: async () => ({
+        totalCost: input.query.libraryId === "library-2" ? "0.75" : "0.50",
+        currencyCode: "USD",
+        documentCount: input.query.libraryId === "library-2" ? 4 : 3,
+        providerCallCount: input.query.libraryId === "library-2" ? 6 : 5,
+      }),
+    }),
+    getLibraryCostSummaryQueryKey: (input: { query: { libraryId: string } }) => [
+      "mockedLibraryCostSummary",
+      input.query.libraryId,
+    ],
   },
   adminModelCatalogOptions: (
     params: Parameters<typeof adminApiMock.listModels>[0] = {},
@@ -203,6 +252,11 @@ describe("AdminPage integration", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+    Element.prototype.hasPointerCapture = vi.fn(() => false);
+    Element.prototype.releasePointerCapture = vi.fn();
+    Element.prototype.setPointerCapture = vi.fn();
+    window.localStorage.clear();
     container = document.createElement("div");
     document.body.appendChild(container);
     root = null;
@@ -212,9 +266,12 @@ describe("AdminPage integration", () => {
       activeLibrary: { id: "library-1", name: "Library 1" },
       workspaces: [
         { id: "ws-1", name: "Workspace 1", createdAt: "2026-05-14T00:00:00Z" },
+        { id: "ws-2", name: "Workspace 2", createdAt: "2026-05-14T00:00:00Z" },
       ],
       setActiveWorkspace: vi.fn(),
       setActiveLibrary: vi.fn(),
+      selectWorkspaceLibrary: vi.fn(() => true),
+      refreshSession: vi.fn(),
       locale: "en",
       setLocale: vi.fn(),
     });
@@ -230,7 +287,7 @@ describe("AdminPage integration", () => {
       offset: 0,
     });
     adminApiMock.listIngestQueue.mockResolvedValue({
-      summary: { running: 1, queued: 1, paused: 1, total: 3 },
+      summary: { running: 1, queued: 2, paused: 1, total: 4 },
       items: [
         {
           jobId: "job-running",
@@ -287,6 +344,20 @@ describe("AdminPage integration", () => {
           failureCode: "paused_by_operator",
           failureMessage: "Processing was paused from the administration queue",
         },
+        {
+          jobId: "job-other-workspace",
+          workspaceId: "ws-2",
+          workspaceName: "Workspace 2",
+          libraryId: "library-3",
+          libraryName: "Library 3",
+          documentId: "doc-other-workspace",
+          documentName: "other-workspace.md",
+          jobKind: "canonical_ingest",
+          queueState: "queued",
+          queuePosition: 3,
+          queuedAt: "2026-05-14T10:04:00Z",
+          availableAt: "2026-05-14T10:04:00Z",
+        },
       ],
     });
     adminApiMock.moveIngestQueueJob.mockImplementation(async () =>
@@ -302,11 +373,51 @@ describe("AdminPage integration", () => {
       adminApiMock.listIngestQueue(),
     );
     adminApiMock.listWorkspaces.mockResolvedValue([
-      { id: "ws-1", displayName: "Workspace 1" },
+      { id: "ws-1", slug: "workspace-1", displayName: "Workspace 1", lifecycleState: "active" },
+      { id: "ws-2", slug: "workspace-2", displayName: "Workspace 2", lifecycleState: "active" },
     ]);
-    adminApiMock.listLibraries.mockResolvedValue([
-      { id: "library-1", displayName: "Library 1" },
-    ]);
+    adminApiMock.listLibraries.mockImplementation(async (workspaceId: string) =>
+      workspaceId === "ws-1"
+        ? [
+            {
+              id: "library-1",
+              workspaceId: "ws-1",
+              slug: "library-1",
+              displayName: "Library 1",
+              lifecycleState: "active",
+              includeDocumentHintInMcpAnswers: false,
+              ingestionReadiness: { ready: true, missingBindingPurposes: [] },
+              recognitionPolicy: {},
+              webIngestPolicy: {},
+            },
+            {
+              id: "library-2",
+              workspaceId: "ws-1",
+              slug: "library-2",
+              displayName: "Library 2",
+              lifecycleState: "active",
+              includeDocumentHintInMcpAnswers: false,
+              ingestionReadiness: { ready: false, missingBindingPurposes: ["query_answer"] },
+              recognitionPolicy: {},
+              webIngestPolicy: {},
+            },
+          ]
+        : workspaceId === "ws-2"
+          ? [
+              {
+                id: "library-3",
+                workspaceId: "ws-2",
+                slug: "library-3",
+                displayName: "Library 3",
+                lifecycleState: "active",
+                includeDocumentHintInMcpAnswers: false,
+                ingestionReadiness: { ready: true, missingBindingPurposes: [] },
+                recognitionPolicy: {},
+                webIngestPolicy: {},
+              },
+            ]
+          : [],
+    );
     adminApiMock.mintToken.mockResolvedValue({
       token: "irr_secret",
       apiToken: {
@@ -374,9 +485,11 @@ describe("AdminPage integration", () => {
       root = createRoot(container);
       root.render(
         <QueryClientProvider client={queryClient}>
-          <MemoryRouter initialEntries={[initialPath]}>
-            <AdminPage />
-          </MemoryRouter>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialPath]}>
+              <AdminPage />
+            </MemoryRouter>
+          </TooltipProvider>
         </QueryClientProvider>,
       );
     });
@@ -414,16 +527,99 @@ describe("AdminPage integration", () => {
     expect(adminApiMock.listAuditEvents).toHaveBeenCalled();
   });
 
+  it("opens the libraries tab with cross-workspace summary, filters, table, and inspector", async () => {
+    await renderPage("/admin?tab=libraries");
+
+    expect(adminApiMock.listWorkspaces).toHaveBeenCalled();
+    expect(adminApiMock.listLibraries).toHaveBeenCalledWith("ws-1");
+    expect(container.textContent).toContain("Total cost");
+    expect(container.textContent).toContain("Library 1");
+    expect(container.textContent).toContain("Library 2");
+    expect(container.textContent).toContain("Library inspector");
+    expect(container.textContent).toContain("Open documents");
+    expect(container.textContent).toContain("Ready");
+    expect(container.textContent).toContain("Blocked");
+    expect(container.querySelector('[aria-label^="Calls: Provider calls"]')).toBeTruthy();
+    expect(container.querySelector('[aria-label^="Readiness: Whether the library"]')).toBeTruthy();
+    expect(container.querySelector('[aria-label^="Lifecycle: Operational state"]')).toBeTruthy();
+    expect(container.querySelector('[aria-label="Select visible libraries"]')).toBeNull();
+    expect(container.querySelector('input[type="checkbox"]')).toBeNull();
+
+    const callsHeader = container.querySelector<HTMLButtonElement>('[aria-label^="Calls: Provider calls"]');
+    expect(callsHeader).toBeTruthy();
+    await act(async () => {
+      callsHeader?.click();
+      callsHeader?.click();
+    });
+    const firstDataRow = container.querySelector("tbody tr");
+    expect(firstDataRow?.textContent).toContain("Library 2");
+
+    const selectButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Select",
+    );
+    expect(selectButton).toBeTruthy();
+    await act(async () => {
+      selectButton?.click();
+    });
+    expect(container.querySelector('[aria-label="Select visible libraries"]')).toBeTruthy();
+    expect(container.querySelector('[aria-label="Select Library 1"]')).toBeTruthy();
+    expect(container.querySelectorAll('input[type="checkbox"]').length).toBeGreaterThan(1);
+  });
+
   it("opens the queue tab, renders active jobs, and shows the running-job inspector", async () => {
+    window.localStorage.setItem(
+      "ironrag_table_state:admin.ingestQueue",
+      JSON.stringify({ pageSize: 1000 }),
+    );
     await renderPage("/admin?tab=queue");
 
     expect(adminApiMock.listIngestQueue).toHaveBeenCalled();
     expect(container.textContent).toContain("running.pdf");
     expect(container.textContent).toContain("queued.md");
     expect(container.textContent).toContain("paused.txt");
+    expect(container.textContent).toContain("other-workspace.md");
+    expect(container.querySelector('[aria-label="Workspace filter"]')).toBeTruthy();
+    expect(container.querySelector('[aria-label="Library filter"]')).toBeTruthy();
+    expect(container.textContent).toContain("All workspaces (4)");
+    expect(container.textContent).toContain("All libraries (4)");
     expect(container.textContent).toContain("Job inspector");
     expect(container.textContent).toContain("extract_content");
     expect(container.textContent).toContain("Reading source");
+    expect(container.querySelector('[aria-label="Select visible jobs"]')).toBeNull();
+
+    const pageSizeButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "1000",
+    );
+    expect(pageSizeButton).toBeTruthy();
+    expect(document.body.textContent).toContain("1000");
+
+    const selectButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Select",
+    );
+    expect(selectButton).toBeTruthy();
+    await act(async () => {
+      selectButton?.click();
+    });
+    expect(container.querySelector('[aria-label="Select visible jobs"]')).toBeTruthy();
+
+    const queuedCheckbox = container.querySelector<HTMLInputElement>(
+      '[aria-label="Select queued.md"]',
+    );
+    expect(queuedCheckbox).toBeTruthy();
+    await act(async () => {
+      queuedCheckbox?.click();
+    });
+    expect(container.textContent).toContain("1 job selected");
+
+    const bulkCancelButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Cancel 1",
+    );
+    expect(bulkCancelButton).toBeTruthy();
+    await act(async () => {
+      bulkCancelButton?.click();
+    });
+    await flushUi();
+    expect(adminApiMock.cancelIngestQueueJob).toHaveBeenCalledWith("job-queued");
   });
 
   it("sends queue reorder, pause, and resume commands from the queue tab", async () => {
@@ -516,6 +712,7 @@ describe("AdminPage integration", () => {
     // Sanity check that the tab list is intact so navigating by clicking
     // stays supported even though the other tests drive via URL.
     expect(findTabTrigger("Access")).toBeTruthy();
+    expect(findTabTrigger("Libraries")).toBeTruthy();
     expect(findTabTrigger("Operations")).toBeTruthy();
     expect(findTabTrigger("Queue")).toBeTruthy();
     expect(findTabTrigger("Pricing")).toBeTruthy();

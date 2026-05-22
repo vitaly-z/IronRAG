@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::domains::query_ir::QueryIR;
+use crate::domains::query_ir::{QueryAct, QueryIR};
 
 use super::question_intent::{QuestionIntent, classify_query_ir_intents};
 use super::{
@@ -12,6 +12,10 @@ pub(crate) fn build_focused_document_answer(
     query_ir: &QueryIR,
     chunks: &[RuntimeMatchedChunk],
 ) -> Option<String> {
+    if matches!(query_ir.act, QueryAct::ConfigureHow) {
+        return None;
+    }
+
     let document_chunks = focused_or_single_document_chunks(question, chunks)?;
     let intents = classify_query_ir_intents(query_ir);
     let intent = [

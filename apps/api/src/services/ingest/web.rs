@@ -1370,6 +1370,56 @@ fn source_file_name_from_url(final_url: &str, content_type: Option<&str>) -> Str
         .unwrap_or_else(|| fallback.to_string())
 }
 
+pub(super) fn is_direct_image_web_resource(final_url: &str, content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(normalized_mime_type)
+        .is_some_and(|mime_type| mime_type.starts_with("image/"))
+        || url_extension(final_url).is_some_and(|extension| {
+            matches!(
+                extension.as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "bmp"
+                    | "webp"
+                    | "svg"
+                    | "tif"
+                    | "tiff"
+                    | "heic"
+                    | "heif"
+            )
+        })
+}
+
+fn normalized_mime_type(content_type: &str) -> Option<String> {
+    let mime_type = content_type.split(';').next()?.trim().to_ascii_lowercase();
+    (!mime_type.is_empty()).then_some(mime_type)
+}
+
+fn url_extension(final_url: &str) -> Option<String> {
+    reqwest::Url::parse(final_url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+                .and_then(|segment| segment.rsplit_once('.').map(|(_, extension)| extension))
+                .map(str::trim)
+                .filter(|extension| !extension.is_empty())
+                .map(str::to_ascii_lowercase)
+        })
+        .or_else(|| {
+            final_url
+                .split(['?', '#'])
+                .next()
+                .and_then(|path| path.rsplit('/').next())
+                .and_then(|segment| segment.rsplit_once('.').map(|(_, extension)| extension))
+                .map(str::trim)
+                .filter(|extension| !extension.is_empty())
+                .map(str::to_ascii_lowercase)
+        })
+}
+
 fn spreadsheet_mime_type(source_format: &str) -> &'static str {
     match source_format {
         "csv" => "text/csv",
@@ -1391,4 +1441,29 @@ fn fallback_title_from_url(final_url: &str) -> Option<String> {
             .map(ToString::to_string);
         path_title.or_else(|| url.host_str().map(ToString::to_string))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_direct_image_web_resource;
+
+    #[test]
+    fn direct_image_web_resources_are_not_document_materialization_targets() {
+        assert!(is_direct_image_web_resource(
+            "https://docs.example.test/assets/diagram.PNG?cache=1",
+            None,
+        ));
+        assert!(is_direct_image_web_resource(
+            "https://docs.example.test/download?id=42",
+            Some("image/webp; charset=binary"),
+        ));
+        assert!(!is_direct_image_web_resource(
+            "https://docs.example.test/guide.pdf",
+            Some("application/pdf"),
+        ));
+        assert!(!is_direct_image_web_resource(
+            "https://docs.example.test/page",
+            Some("text/html; charset=utf-8"),
+        ));
+    }
 }

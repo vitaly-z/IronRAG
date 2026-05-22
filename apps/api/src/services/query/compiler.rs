@@ -1032,10 +1032,11 @@ user-assistant turns, not to positions, ranges, neighboring units, or anchors in
 documents being searched. `act = follow_up` is typical when the question cannot stand on its own.\n\
 6. `target_types` are canonical ontology tags. Use built-in tags exactly as written when they fit: \
 endpoint, url, path, wsdl, base_url, port, parameter, http_method, protocol, config_key, \
-error_code, env_var, version, procedure, metric, table_row, table_summary, table_average, \
-table_frequency, document, primary_heading, secondary_heading, formats_under_test, concept, \
-relationship. For graph facts, use runtime node-type tags: person, organization, location, event, \
-artifact, natural, process, concept, attribute, entity. \
+configuration_file, filesystem_path, software_module, package, error_code, env_var, version, \
+procedure, metric, table_row, table_summary, table_average, table_frequency, document, \
+primary_heading, secondary_heading, formats_under_test, concept, relationship. For graph facts, \
+use runtime node-type tags: person, organization, location, event, artifact, natural, process, \
+concept, attribute, entity, software_module. \
 Endpoint-like tags (`endpoint`, `url`, `path`, `wsdl`, `base_url`) identify exact network or \
 interface identifiers only; do not use them for timing, severity, status, count, metric, or \
 outcome attributes unless the user asks for the identifier itself. You may invent a new singular \

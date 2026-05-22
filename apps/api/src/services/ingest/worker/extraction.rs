@@ -622,7 +622,7 @@ fn merge_pdf_unit_outputs(
 ) -> ExtractionOutput {
     let mut content = String::new();
     let mut warnings = Vec::new();
-    let mut usage_json = serde_json::json!({});
+    let mut usage_items = Vec::new();
     let mut provider_kind = None;
     let mut model_name = None;
 
@@ -638,10 +638,11 @@ fn merge_pdf_unit_outputs(
         if model_name.is_none() {
             model_name = output.model_name;
         }
-        if usage_json == serde_json::json!({}) {
-            usage_json = output.usage_json;
+        if output.usage_json != serde_json::json!({}) {
+            usage_items.push(output.usage_json);
         }
     }
+    let usage_json = merge_pdf_unit_usage_json(usage_items);
 
     let layout = build_text_layout_from_content(content.trim());
     let line_count = i32::try_from(layout.structure_hints.lines.len()).unwrap_or(i32::MAX);
@@ -670,6 +671,29 @@ fn merge_pdf_unit_outputs(
         usage_json,
         extracted_images: Vec::new(),
     }
+}
+
+fn merge_pdf_unit_usage_json(usages: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut embedded_picture_usages = Vec::new();
+    let mut standalone_usages = Vec::new();
+
+    for usage in usages {
+        match usage.get("embedded_picture_ocr_usage").and_then(serde_json::Value::as_array) {
+            Some(items) if !items.is_empty() => {
+                embedded_picture_usages.extend(items.iter().cloned());
+            }
+            _ => standalone_usages.push(usage),
+        }
+    }
+
+    if !embedded_picture_usages.is_empty() {
+        embedded_picture_usages.extend(standalone_usages);
+        return crate::shared::extraction::file_extract::aggregate_vision_picture_usage_json(
+            embedded_picture_usages,
+        );
+    }
+
+    standalone_usages.into_iter().next().unwrap_or_else(|| serde_json::json!({}))
 }
 
 fn json_or_null<T: serde::Serialize>(value: &T) -> serde_json::Value {
@@ -815,5 +839,48 @@ mod tests {
         assert_eq!(output.usage_json, serde_json::json!({"tokens": 7}));
         assert!(output.extracted_images.is_empty());
         assert_eq!(output.structure_hints.lines.len(), 3);
+    }
+
+    #[test]
+    fn merge_pdf_unit_outputs_preserves_all_embedded_picture_usage() {
+        let output = merge_pdf_unit_outputs(
+            vec![
+                PdfExtractUnitMergeFragment {
+                    content_text: "Alpha section".to_string(),
+                    warnings: Vec::new(),
+                    provider_kind: Some("provider".to_string()),
+                    model_name: Some("model".to_string()),
+                    usage_json: serde_json::json!({
+                        "embedded_picture_ocr_usage": [
+                            {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                            {"prompt_tokens": 20, "completion_tokens": 4, "total_tokens": 24}
+                        ],
+                    }),
+                },
+                PdfExtractUnitMergeFragment {
+                    content_text: "Beta section".to_string(),
+                    warnings: Vec::new(),
+                    provider_kind: Some("provider".to_string()),
+                    model_name: Some("model".to_string()),
+                    usage_json: serde_json::json!({
+                        "embedded_picture_ocr_usage": [
+                            {"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36}
+                        ],
+                    }),
+                },
+            ],
+            2,
+            "input.pdf",
+            "application/pdf",
+        );
+
+        assert_eq!(output.usage_json["embedded_picture_ocr_call_count"], serde_json::json!(3));
+        assert_eq!(output.usage_json["prompt_tokens"], serde_json::json!(60));
+        assert_eq!(output.usage_json["completion_tokens"], serde_json::json!(12));
+        assert_eq!(output.usage_json["total_tokens"], serde_json::json!(72));
+        assert_eq!(
+            output.usage_json["embedded_picture_ocr_usage"].as_array().map(Vec::len),
+            Some(3)
+        );
     }
 }

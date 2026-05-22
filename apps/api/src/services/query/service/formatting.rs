@@ -29,9 +29,9 @@ use crate::{
 };
 
 use super::{
-    MAX_ANSWER_SOURCE_LINKS, MAX_DETAIL_PREPARED_SEGMENT_REFERENCES,
-    MAX_DETAIL_PREPARED_SEGMENT_REFERENCES_PER_REVISION, PREPARED_SEGMENT_FOCUS_MIN_TOKEN_LEN,
-    PreparedSegmentRevisionInfo, RankedBundleReference, turn::query_runtime_stage_label,
+    MAX_DETAIL_PREPARED_SEGMENT_REFERENCES, MAX_DETAIL_PREPARED_SEGMENT_REFERENCES_PER_REVISION,
+    PREPARED_SEGMENT_FOCUS_MIN_TOKEN_LEN, PreparedSegmentRevisionInfo, RankedBundleReference,
+    turn::query_runtime_stage_label,
 };
 
 fn execution_id_of(bundle: &KnowledgeContextBundleReferenceSetRow) -> Uuid {
@@ -200,66 +200,6 @@ pub(crate) fn build_assistant_document_references(
             }
         })
         .collect()
-}
-
-pub(crate) fn append_answer_source_links(
-    mut answer: String,
-    references: &[PreparedSegmentReference],
-) -> String {
-    let source_section = render_answer_source_links(references);
-    if let Some(source_section) = source_section {
-        if !answer.trim().is_empty() {
-            answer.push_str("\n\n---\n");
-        }
-        answer.push_str(&source_section);
-    }
-    answer
-}
-
-pub(crate) fn render_answer_source_links(
-    references: &[PreparedSegmentReference],
-) -> Option<String> {
-    let mut seen = BTreeSet::<String>::new();
-    let mut lines = Vec::new();
-
-    for reference in references {
-        let href = match reference
-            .document_hint
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
-        {
-            Some(href) => href,
-            None => continue,
-        };
-        if !seen.insert(href.to_string()) {
-            continue;
-        }
-        let label = answer_source_link_label(reference, href);
-        lines.push(format!("- [{label}](<{href}>)"));
-        if lines.len() >= MAX_ANSWER_SOURCE_LINKS {
-            break;
-        }
-    }
-
-    (!lines.is_empty()).then(|| format!("Sources\n{}", lines.join("\n")))
-}
-
-fn answer_source_link_label(reference: &PreparedSegmentReference, fallback_href: &str) -> String {
-    reference
-        .document_title
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            reference.heading_trail.last().map(String::as_str).and_then(|value| {
-                let trimmed = value.trim();
-                (!trimmed.is_empty()).then_some(trimmed)
-            })
-        })
-        .unwrap_or(fallback_href)
-        .replace(['[', ']'], "")
-        .replace('\n', " ")
 }
 
 pub(crate) fn prepared_segment_focus_tokens(query_text: &str) -> BTreeSet<String> {

@@ -190,15 +190,10 @@ export const queryApi = {
   createTurnStream: async (
     sessionId: string,
     contentText: string,
+    recoveryMessageStartIndex: number,
     onActivity?: AssistantTurnActivityHandler,
   ) => {
     let sawActivity = false;
-    let recoveryMessageStartIndex: number | null;
-    try {
-      recoveryMessageStartIndex = (await queryApi.getSession(sessionId)).messages.length;
-    } catch {
-      recoveryMessageStartIndex = null;
-    }
     const handleActivity: AssistantTurnActivityHandler = (event) => {
       sawActivity = true;
       onActivity?.(event);
@@ -217,7 +212,6 @@ export const queryApi = {
       return await readAssistantTurnStream(response, handleActivity);
     } catch (error: unknown) {
       if (
-        recoveryMessageStartIndex === null ||
         !sawActivity ||
         !isRecoverableAssistantStreamError(error)
       ) {

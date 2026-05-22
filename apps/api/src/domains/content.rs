@@ -141,9 +141,11 @@ pub struct ContentMutationItem {
     pub message: Option<String>,
 }
 
+pub const READABLE_TEXT_STATES: &[&str] = &["readable", "ready", "text_readable"];
+
 #[must_use]
 pub fn revision_text_state_is_readable(text_state: &str) -> bool {
-    matches!(text_state.trim(), "readable" | "ready" | "text_readable")
+    READABLE_TEXT_STATES.contains(&text_state.trim())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -231,6 +233,8 @@ mod tests {
         assert!(revision_text_state_is_readable("readable"));
         assert!(revision_text_state_is_readable("ready"));
         assert!(revision_text_state_is_readable("text_readable"));
+        assert!(!revision_text_state_is_readable("vector_ready"));
+        assert!(!revision_text_state_is_readable("graph_ready"));
         assert!(!revision_text_state_is_readable("processing"));
     }
 }

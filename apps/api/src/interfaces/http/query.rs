@@ -12,7 +12,7 @@ use chrono::Utc;
 use futures::{FutureExt as _, stream};
 use ironrag_contracts;
 use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, panic::AssertUnwindSafe, time::Duration};
+use std::{collections::HashMap, convert::Infallible, panic::AssertUnwindSafe, time::Duration};
 use tokio::sync::mpsc::Sender;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
@@ -356,7 +356,7 @@ pub async fn get_session(
 ) -> Result<Json<ironrag_contracts::assistant::AssistantHydratedConversation>, ApiError> {
     let _ = load_query_session_and_authorize(&auth, &state, session_id, POLICY_QUERY_READ).await?;
     let detail = state.canonical_services.query.get_conversation(&state, session_id).await?;
-    Ok(Json(map_session_detail(detail)))
+    Ok(Json(map_session_detail(&state, detail).await?))
 }
 
 #[utoipa::path(
@@ -860,55 +860,163 @@ fn map_session_list_item_with_turn_count(
     }
 }
 
-fn map_session_detail(
+async fn map_session_detail(
+    state: &AppState,
     detail: QueryConversationDetail,
-) -> ironrag_contracts::assistant::AssistantHydratedConversation {
-    ironrag_contracts::assistant::AssistantHydratedConversation {
-        session: map_session_list_item_with_turn_count(detail.conversation, detail.turns.len()),
-        messages: detail.turns.into_iter().map(map_turn_to_message).collect(),
+) -> Result<ironrag_contracts::assistant::AssistantHydratedConversation, ApiError> {
+    let QueryConversationDetail { conversation, turns, executions: _ } = detail;
+    let workspace_id = conversation.workspace_id;
+    let library_id = conversation.library_id;
+    let turn_count = turns.len();
+    let mut evidence_by_turn_id =
+        hydrate_session_message_evidence(state, &turns, workspace_id, library_id).await?;
+    Ok(ironrag_contracts::assistant::AssistantHydratedConversation {
+        session: map_session_list_item_with_turn_count(conversation, turn_count),
+        messages: turns
+            .into_iter()
+            .map(|turn| {
+                let evidence = evidence_by_turn_id.remove(&turn.id);
+                map_turn_to_message(turn, evidence)
+            })
+            .collect(),
+    })
+}
+
+async fn hydrate_session_message_evidence(
+    state: &AppState,
+    turns: &[QueryTurn],
+    workspace_id: Uuid,
+    library_id: Uuid,
+) -> Result<HashMap<Uuid, ironrag_contracts::assistant::AssistantEvidenceBundle>, ApiError> {
+    let mut evidence_by_turn_id = HashMap::new();
+    for turn in turns {
+        if !matches!(turn.turn_kind, crate::domains::query::QueryTurnKind::Assistant) {
+            continue;
+        }
+        let Some(execution_id) = turn.execution_id else {
+            continue;
+        };
+        let detail = state.canonical_services.query.get_execution(state, execution_id).await?;
+        if detail.execution.workspace_id != workspace_id
+            || detail.execution.library_id != library_id
+        {
+            return Err(ApiError::internal_with_log(
+                format!(
+                    "query turn {} points to execution {} outside workspace/library scope",
+                    turn.id, execution_id
+                ),
+                "query session evidence ownership mismatch",
+            ));
+        }
+        evidence_by_turn_id.insert(turn.id, map_execution_detail_to_evidence(detail));
     }
+    Ok(evidence_by_turn_id)
 }
 
 fn map_execution_detail(
     detail: QueryExecutionDetail,
 ) -> ironrag_contracts::assistant::AssistantExecutionDetail {
+    let QueryExecutionDetail {
+        execution,
+        runtime_summary,
+        runtime_stage_summaries,
+        request_turn,
+        response_turn,
+        chunk_references,
+        prepared_segment_references,
+        technical_fact_references,
+        graph_node_references,
+        graph_edge_references,
+        verification_state,
+        verification_warnings,
+    } = detail;
+    let context_bundle_id = execution.context_bundle_id;
+    let execution = map_execution(execution);
+    let request_turn = request_turn.map(map_turn);
+    let response_turn = response_turn.map(map_turn);
+    let evidence = map_execution_evidence_parts(
+        runtime_summary,
+        runtime_stage_summaries,
+        chunk_references,
+        prepared_segment_references,
+        technical_fact_references,
+        graph_node_references,
+        graph_edge_references,
+        verification_state,
+        verification_warnings,
+    );
     ironrag_contracts::assistant::AssistantExecutionDetail {
-        context_bundle_id: detail.execution.context_bundle_id,
-        execution: map_execution(detail.execution),
-        runtime_summary: map_runtime_summary(detail.runtime_summary),
-        runtime_stage_summaries: detail
-            .runtime_stage_summaries
-            .into_iter()
-            .map(map_runtime_stage_summary)
-            .collect(),
-        request_turn: detail.request_turn.map(map_turn),
-        response_turn: detail.response_turn.map(map_turn),
-        chunk_references: detail.chunk_references.into_iter().map(map_chunk_reference).collect(),
-        prepared_segment_references: detail
-            .prepared_segment_references
+        context_bundle_id,
+        execution,
+        runtime_summary: evidence.runtime_summary,
+        runtime_stage_summaries: evidence.runtime_stage_summaries,
+        request_turn,
+        response_turn,
+        chunk_references: evidence.chunk_references,
+        prepared_segment_references: evidence.prepared_segment_references,
+        technical_fact_references: evidence.technical_fact_references,
+        entity_references: evidence.entity_references,
+        relation_references: evidence.relation_references,
+        verification_state: evidence.verification_state,
+        verification_warnings: evidence.verification_warnings,
+    }
+}
+
+fn map_execution_detail_to_evidence(
+    detail: QueryExecutionDetail,
+) -> ironrag_contracts::assistant::AssistantEvidenceBundle {
+    map_execution_evidence_parts(
+        detail.runtime_summary,
+        detail.runtime_stage_summaries,
+        detail.chunk_references,
+        detail.prepared_segment_references,
+        detail.technical_fact_references,
+        detail.graph_node_references,
+        detail.graph_edge_references,
+        detail.verification_state,
+        detail.verification_warnings,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_execution_evidence_parts(
+    runtime_summary: RuntimeExecutionSummary,
+    runtime_stage_summaries: Vec<QueryRuntimeStageSummary>,
+    chunk_references: Vec<QueryChunkReference>,
+    prepared_segment_references: Vec<PreparedSegmentReference>,
+    technical_fact_references: Vec<TechnicalFactReference>,
+    graph_node_references: Vec<QueryGraphNodeReference>,
+    graph_edge_references: Vec<QueryGraphEdgeReference>,
+    verification_state: QueryVerificationState,
+    verification_warnings: Vec<QueryVerificationWarning>,
+) -> ironrag_contracts::assistant::AssistantEvidenceBundle {
+    ironrag_contracts::assistant::AssistantEvidenceBundle {
+        chunk_references: chunk_references.into_iter().map(map_chunk_reference).collect(),
+        prepared_segment_references: prepared_segment_references
             .into_iter()
             .map(map_prepared_segment_reference)
             .collect(),
-        technical_fact_references: detail
-            .technical_fact_references
+        technical_fact_references: technical_fact_references
             .into_iter()
             .map(map_technical_fact_reference)
             .collect(),
-        entity_references: detail
-            .graph_node_references
+        entity_references: graph_node_references
             .into_iter()
             .map(map_graph_node_reference)
             .collect(),
-        relation_references: detail
-            .graph_edge_references
+        relation_references: graph_edge_references
             .into_iter()
             .map(map_graph_edge_reference)
             .collect(),
-        verification_state: map_verification_state(detail.verification_state),
-        verification_warnings: detail
-            .verification_warnings
+        verification_state: map_verification_state(verification_state),
+        verification_warnings: verification_warnings
             .into_iter()
             .map(map_verification_warning)
+            .collect(),
+        runtime_summary: map_runtime_summary(runtime_summary),
+        runtime_stage_summaries: runtime_stage_summaries
+            .into_iter()
+            .map(map_runtime_stage_summary)
             .collect(),
     }
 }
@@ -959,6 +1067,7 @@ pub(crate) fn map_turn_execution_response(
 
 fn map_turn_to_message(
     turn: QueryTurn,
+    evidence: Option<ironrag_contracts::assistant::AssistantEvidenceBundle>,
 ) -> ironrag_contracts::assistant::AssistantConversationMessage {
     ironrag_contracts::assistant::AssistantConversationMessage {
         id: turn.id,
@@ -966,7 +1075,7 @@ fn map_turn_to_message(
         content: turn.content_text,
         timestamp: turn.created_at,
         execution_id: turn.execution_id,
-        evidence: None,
+        evidence,
     }
 }
 
@@ -1281,6 +1390,69 @@ mod tests {
             }
         }
         assert!(saw_failure);
+    }
+
+    #[test]
+    fn map_turn_to_message_preserves_hydrated_evidence() {
+        let now = Utc::now();
+        let execution_id = Uuid::new_v4();
+        let evidence = ironrag_contracts::assistant::AssistantEvidenceBundle {
+            chunk_references: Vec::new(),
+            prepared_segment_references: Vec::new(),
+            technical_fact_references: Vec::new(),
+            entity_references: Vec::new(),
+            relation_references: Vec::new(),
+            verification_state: ironrag_contracts::assistant::AssistantVerificationState::Verified,
+            verification_warnings: Vec::new(),
+            runtime_summary: ironrag_contracts::assistant::AssistantRuntimeSummary {
+                runtime_execution_id: Uuid::new_v4(),
+                lifecycle_state: "completed".to_string(),
+                active_stage: None,
+                turn_budget: 4,
+                turn_count: 1,
+                parallel_action_limit: 2,
+                failure_code: None,
+                failure_summary_redacted: None,
+                policy_summary: ironrag_contracts::assistant::AssistantPolicySummary {
+                    allow_count: 0,
+                    reject_count: 0,
+                    terminate_count: 0,
+                    recent_decisions: Vec::new(),
+                },
+                accepted_at: now,
+                completed_at: Some(now),
+            },
+            runtime_stage_summaries: vec![
+                ironrag_contracts::assistant::AssistantRuntimeStageSummary {
+                    stage_kind: "retrieve".to_string(),
+                    stage_label: "Retrieve".to_string(),
+                },
+            ],
+        };
+
+        let message = map_turn_to_message(
+            QueryTurn {
+                id: Uuid::new_v4(),
+                conversation_id: Uuid::new_v4(),
+                turn_index: 1,
+                turn_kind: crate::domains::query::QueryTurnKind::Assistant,
+                author_principal_id: None,
+                content_text: "answer".to_string(),
+                execution_id: Some(execution_id),
+                created_at: now,
+            },
+            Some(evidence),
+        );
+
+        let hydrated_evidence =
+            message.evidence.expect("hydrated session messages must retain assistant evidence");
+        assert_eq!(message.execution_id, Some(execution_id));
+        assert_eq!(
+            hydrated_evidence.verification_state,
+            ironrag_contracts::assistant::AssistantVerificationState::Verified
+        );
+        assert_eq!(hydrated_evidence.runtime_stage_summaries.len(), 1);
+        assert_eq!(hydrated_evidence.runtime_stage_summaries[0].stage_kind, "retrieve");
     }
 
     #[test]

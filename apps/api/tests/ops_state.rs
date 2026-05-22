@@ -28,10 +28,8 @@ use ironrag_backend::{
     },
     services::{
         catalog_service::{CreateLibraryCommand, CreateWorkspaceCommand},
-        knowledge::service::{
-            CreateKnowledgeDocumentCommand, CreateKnowledgeRevisionCommand,
-            PromoteKnowledgeDocumentCommand, RefreshKnowledgeLibraryGenerationCommand,
-        },
+        content::service::{CreateDocumentCommand, CreateRevisionCommand, PromoteHeadCommand},
+        knowledge::service::CreateKnowledgeRevisionCommand,
         ops::service::OpsService,
     },
 };
@@ -234,25 +232,45 @@ impl OpsStateFixture {
             .await
             .context("failed to create ops_state library")?;
 
-        let document_id = Uuid::now_v7();
-        let revision_id = Uuid::now_v7();
-        state
+        let document = state
             .canonical_services
-            .knowledge
-            .create_document_shell(
+            .content
+            .create_document(
                 &state,
-                CreateKnowledgeDocumentCommand {
-                    document_id,
+                CreateDocumentCommand {
                     workspace_id: workspace.id,
                     library_id: library.id,
-                    external_key: format!("ops-state-doc-{suffix}"),
+                    external_key: Some(format!("ops-state-doc-{suffix}")),
                     file_name: None,
-                    title: Some("Ops State Fixture".to_string()),
-                    document_state: "active".to_string(),
+                    created_by_principal_id: None,
                 },
             )
             .await
-            .context("failed to create ops_state document shell")?;
+            .context("failed to create ops_state content document")?;
+        let document_id = document.id;
+        let content_revision = state
+            .canonical_services
+            .content
+            .create_revision(
+                &state,
+                CreateRevisionCommand {
+                    document_id,
+                    content_source_kind: "upload".to_string(),
+                    checksum: format!("checksum-{document_id}"),
+                    mime_type: "text/plain".to_string(),
+                    byte_size: 128,
+                    title: Some("Ops State Fixture".to_string()),
+                    language_code: None,
+                    source_uri: Some(format!("memory://ops-state/source/{document_id}")),
+                    document_hint: None,
+                    storage_key: Some(format!("memory://ops-state/{document_id}")),
+                    created_by_principal_id: None,
+                },
+            )
+            .await
+            .context("failed to create ops_state content revision")?;
+        let revision_id = content_revision.id;
+        let generation_id = Uuid::now_v7();
         state
             .canonical_services
             .knowledge
@@ -291,39 +309,19 @@ impl OpsStateFixture {
             .context("failed to write ops_state revision")?;
         state
             .canonical_services
-            .knowledge
-            .promote_document(
+            .content
+            .promote_document_head(
                 &state,
-                PromoteKnowledgeDocumentCommand {
+                PromoteHeadCommand {
                     document_id,
-                    document_state: "active".to_string(),
                     active_revision_id: Some(revision_id),
                     readable_revision_id: Some(revision_id),
-                    latest_revision_no: Some(1),
-                    deleted_at: None,
+                    latest_mutation_id: None,
+                    latest_successful_attempt_id: None,
                 },
             )
             .await
             .context("failed to promote ops_state document")?;
-
-        let generation_id = Uuid::now_v7();
-        state
-            .canonical_services
-            .knowledge
-            .refresh_library_generation(
-                &state,
-                RefreshKnowledgeLibraryGenerationCommand {
-                    generation_id,
-                    workspace_id: workspace.id,
-                    library_id: library.id,
-                    active_text_generation: 7,
-                    active_vector_generation: 4,
-                    active_graph_generation: 2,
-                    degraded_state: "rebuilding".to_string(),
-                },
-            )
-            .await
-            .context("failed to refresh ops_state library generation")?;
 
         let _queued_job = ingest_repository::create_ingest_job(
             &state.persistence.postgres,
@@ -411,8 +409,8 @@ impl OpsStateFixture {
                 mutation_id: None,
                 connector_id: None,
                 async_operation_id: None,
-                knowledge_document_id: Some(self.document_id),
-                knowledge_revision_id: Some(self.revision_id),
+                knowledge_document_id: None,
+                knowledge_revision_id: None,
                 job_kind: "reembed".to_string(),
                 queue_state: "failed".to_string(),
                 priority: 80,
@@ -624,6 +622,29 @@ impl OpsStateFixture {
         )
         .await
         .context("failed to resolve ops_state bundle assembly execution")?;
+        let runtime_executions = runtime_repository::list_runtime_executions_by_owner(
+            &self.state.persistence.postgres,
+            RuntimeExecutionOwnerKind::QueryExecution.as_str(),
+            execution_id,
+        )
+        .await
+        .context("failed to load ops_state runtime execution for resolution")?;
+        for runtime_execution in runtime_executions {
+            runtime_repository::update_runtime_execution(
+                &self.state.persistence.postgres,
+                runtime_execution.id,
+                &runtime_repository::UpdateRuntimeExecution {
+                    lifecycle_state: RuntimeLifecycleState::Completed.as_str(),
+                    active_stage: None,
+                    turn_count: runtime_execution.turn_count,
+                    failure_code: None,
+                    failure_summary_redacted: None,
+                    completed_at: Some(Utc::now()),
+                },
+            )
+            .await
+            .context("failed to resolve ops_state runtime execution")?;
+        }
 
         Ok(())
     }
@@ -681,15 +702,15 @@ async fn canonical_ops_library_state_uses_postgres_workload_and_arango_generatio
         assert_eq!(snapshot.state.library_id, fixture.library_id);
         assert_eq!(snapshot.state.queue_depth, 1);
         assert_eq!(snapshot.state.running_attempts, 1);
-        assert_eq!(snapshot.state.readable_document_count, 1);
+        assert_eq!(snapshot.state.readable_document_count, 0);
         assert_eq!(snapshot.state.failed_document_count, 0);
         assert_eq!(snapshot.state.degraded_state, "rebuilding");
-        assert_eq!(snapshot.state.latest_knowledge_generation_id, Some(fixture.generation_id));
-        assert_eq!(snapshot.state.knowledge_generation_state.as_deref(), Some("graph_ready"));
         assert_eq!(snapshot.knowledge_generations.len(), 1);
-        assert_eq!(snapshot.knowledge_generations[0].id, fixture.generation_id);
+        let generation = &snapshot.knowledge_generations[0];
+        assert_eq!(snapshot.state.latest_knowledge_generation_id, Some(generation.id));
+        assert_eq!(snapshot.state.knowledge_generation_state.as_deref(), Some("text_readable"));
         assert_eq!(snapshot.knowledge_generations[0].library_id, fixture.library_id);
-        assert_eq!(snapshot.knowledge_generations[0].generation_state, "graph_ready");
+        assert_eq!(snapshot.knowledge_generations[0].generation_state, "text_readable");
 
         Ok(())
     }
@@ -747,7 +768,7 @@ async fn canonical_ops_warnings_cover_stale_and_failed_rebuild_signals() -> Resu
             .await
             .context("failed to reload resolved ops library warnings")?;
 
-        assert_eq!(resolved_snapshot.state.degraded_state, "graph_ready");
+        assert_eq!(resolved_snapshot.state.degraded_state, "healthy");
         assert!(resolved_warnings.is_empty());
 
         Ok(())

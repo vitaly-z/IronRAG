@@ -1,4 +1,4 @@
-use crate::domains::query_ir::{LiteralKind, QueryIR};
+use crate::domains::query_ir::{LiteralKind, QueryIR, literal_text_is_identifier_shaped};
 
 use super::question_intent::query_ir_has_focused_document_answer_intent;
 pub(super) use super::technical_literal_extractors::{
@@ -74,7 +74,13 @@ pub(super) fn detect_technical_literal_intent_from_query_ir(
                 intent.wants_urls = true;
                 intent.wants_prefixes = true;
             }
-            "parameter" | "config_key" => intent.wants_parameters = true,
+            "parameter" | "config_key" | "software_module" | "package" => {
+                intent.wants_parameters = true;
+            }
+            "configuration_file" | "filesystem_path" => {
+                intent.wants_paths = true;
+                intent.wants_parameters = true;
+            }
             "http_method" => intent.wants_methods = true,
             _ => {}
         }
@@ -83,8 +89,13 @@ pub(super) fn detect_technical_literal_intent_from_query_ir(
         match literal.kind {
             LiteralKind::Url => intent.wants_urls = true,
             LiteralKind::Path => intent.wants_paths = true,
-            LiteralKind::Identifier => intent.wants_parameters = true,
-            LiteralKind::Version | LiteralKind::NumericCode | LiteralKind::Other => {}
+            LiteralKind::Identifier if literal_text_is_identifier_shaped(&literal.text) => {
+                intent.wants_parameters = true;
+            }
+            LiteralKind::Identifier
+            | LiteralKind::Version
+            | LiteralKind::NumericCode
+            | LiteralKind::Other => {}
         }
     }
     if !intent.any() && query_ir.is_exact_literal_technical() {

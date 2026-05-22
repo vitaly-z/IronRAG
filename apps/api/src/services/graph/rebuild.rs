@@ -10,7 +10,9 @@ use uuid::Uuid;
 use crate::{
     app::state::AppState,
     domains::ops::{ASYNC_OP_STATUS_READY, GRAPH_STATUS_READY},
-    infra::repositories::{self, ChunkRow, DocumentRow, content_repository},
+    infra::repositories::{
+        self, ChunkRow, DocumentRow, RuntimeGraphSnapshotRow, content_repository,
+    },
     services::{
         graph::error::GraphServiceError,
         graph::extract::{
@@ -48,6 +50,13 @@ pub async fn rebuild_library_graph(
     .context("failed to reload runtime graph extraction records for rebuild")?;
 
     if extractions.is_empty() {
+        if let Some(error) = empty_rebuild_conflict(
+            library_id,
+            snapshot.as_ref(),
+            "no graph extraction records matched the current extraction version",
+        ) {
+            return Err(error);
+        }
         return ensure_empty_graph_snapshot(state, library_id, projection_version).await;
     }
 
@@ -186,6 +195,13 @@ pub async fn rebuild_library_graph(
     .context("failed to load rebuilt graph edges")?;
 
     if merged_nodes.is_empty() && merged_edges.is_empty() {
+        if let Some(error) = empty_rebuild_conflict(
+            library_id,
+            snapshot.as_ref(),
+            "the rebuilt graph produced no admitted nodes or edges",
+        ) {
+            return Err(error);
+        }
         return ensure_empty_graph_snapshot(state, library_id, projection_version).await;
     }
 
@@ -577,6 +593,22 @@ fn is_graph_reconcile_chunk_text_eligible(text: &str) -> bool {
     is_graph_extraction_text_eligible(text)
 }
 
+fn empty_rebuild_conflict(
+    library_id: Uuid,
+    snapshot: Option<&RuntimeGraphSnapshotRow>,
+    reason: &str,
+) -> Option<GraphServiceError> {
+    let snapshot = snapshot
+        .filter(|snapshot| snapshot.graph_status == GRAPH_STATUS_READY)
+        .filter(|snapshot| snapshot.node_count > 0 || snapshot.edge_count > 0)?;
+    Some(GraphServiceError::StateConflict {
+        message: format!(
+            "runtime graph rebuild for library {library_id} would publish an empty projection because {reason}, but active projection {} is ready with {} nodes and {} edges; rebuild source material is inconsistent and the active projection was left unchanged",
+            snapshot.projection_version, snapshot.node_count, snapshot.edge_count
+        ),
+    })
+}
+
 fn repaired_graph_extraction_candidates(
     normalized_output_json: serde_json::Value,
 ) -> GraphExtractionCandidateSet {
@@ -747,6 +779,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_rebuild_conflicts_with_live_snapshot() {
+        let library_id = Uuid::now_v7();
+        let snapshot = snapshot_row(library_id, GRAPH_STATUS_READY, 7, 12, 34);
+
+        let error = empty_rebuild_conflict(library_id, Some(&snapshot), "no source")
+            .expect("live graph must reject empty rebuild");
+
+        assert!(matches!(error, GraphServiceError::StateConflict { .. }));
+        assert!(error.to_string().contains("projection 7"));
+        assert!(error.to_string().contains("left unchanged"));
+    }
+
+    #[test]
+    fn empty_rebuild_allows_empty_or_absent_snapshot() {
+        let library_id = Uuid::now_v7();
+        let empty_snapshot = snapshot_row(library_id, "empty", 3, 0, 0);
+
+        assert!(empty_rebuild_conflict(library_id, None, "no source").is_none());
+        assert!(empty_rebuild_conflict(library_id, Some(&empty_snapshot), "no source").is_none());
+    }
+
+    #[test]
     fn graph_reconcile_rejects_low_confidence_current_chunk_text() {
         let text = concat!(
             "overview status alpha beta gamma. ",
@@ -766,5 +820,27 @@ mod tests {
         );
 
         assert!(is_graph_reconcile_chunk_text_eligible(text));
+    }
+
+    fn snapshot_row(
+        library_id: Uuid,
+        graph_status: &str,
+        projection_version: i64,
+        node_count: i32,
+        edge_count: i32,
+    ) -> RuntimeGraphSnapshotRow {
+        RuntimeGraphSnapshotRow {
+            library_id,
+            graph_status: graph_status.to_string(),
+            projection_version,
+            topology_generation: 1,
+            node_count,
+            edge_count,
+            provenance_coverage_percent: Some(100.0),
+            last_built_at: None,
+            last_error_message: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
     }
 }

@@ -216,12 +216,12 @@ pub struct McpDocumentHit {
     pub excerpt_start_offset: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excerpt_end_offset: Option<usize>,
-    /// Character offset of the best-matching chunk inside the full
-    /// normalized document. Callers should pass this back to
-    /// `read_document` as `startOffset` so the very first read window
-    /// already lands on real content instead of the document's table
-    /// of contents / front matter. `None` means the source chunks
-    /// lack span info (older data) or no chunk matched.
+    /// Character offset for the first `read_document` window that should
+    /// contain the best-matching chunk inside the full normalized document.
+    /// Callers should pass this back to `read_document` as `startOffset`
+    /// so the very first read window already lands on real content instead
+    /// of the document's table of contents / front matter. `None` means
+    /// the source chunks lack span info (older data) or no chunk matched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_start_offset: Option<usize>,
     pub readability_state: McpReadabilityState,

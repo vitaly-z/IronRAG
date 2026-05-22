@@ -17,7 +17,6 @@ import collections
 import json
 import os
 import pathlib
-import re
 import statistics
 import subprocess
 import sys
@@ -32,9 +31,9 @@ from urllib import error as urllib_error
 DEFAULT_BASE_URL = "http://127.0.0.1:19000"
 DEFAULT_LOGIN = "admin"
 PROBE_PASSWORD_ENV = "IRONRAG_PROBE_PASSWORD"  # pragma: allowlist secret
-DEFAULT_ENTITY_QUERY = "Orion"
-DEFAULT_ASSISTANT_QUESTION = "What does this library say about Orion?"
-DEFAULT_DOCUMENT_QUERY = DEFAULT_ASSISTANT_QUESTION
+DEFAULT_ENTITY_QUERY: str | None = None
+DEFAULT_ASSISTANT_QUESTION: str | None = None
+DEFAULT_DOCUMENT_QUERY: str | None = None
 DEFAULT_DOCUMENT_LIMIT = 5
 DEFAULT_READ_LENGTH = 4000
 DEFAULT_ASSISTANT_TOP_K = 8
@@ -50,6 +49,7 @@ DEFAULT_READ_MIN_REFERENCES = 1
 DEFAULT_ASSISTANT_MIN_REFERENCES = 1
 DEFAULT_ASSISTANT_EXPECTED_VERIFICATION = "verified"
 DEFAULT_ASSISTANT_MAX_FIRST_FRAME_MS = 5000
+DEFAULT_MIN_ANSWER_OVERLAP_RATIO: float | None = None
 MCP_ANSWER_ROUTE = "/v1/mcp"
 MCP_DIAGNOSTICS_ROUTE = "/v1/mcp/diagnostics"
 
@@ -60,6 +60,12 @@ class CurlSample:
     time_total_s: float
     size_download_bytes: int
     payload: Any
+
+
+@dataclass(frozen=True)
+class LibraryCatalogContext:
+    workspace_id: str
+    catalog_ref: str
 
 
 @dataclass(frozen=True)
@@ -77,6 +83,7 @@ class McpQualitySummary:
     duplicate_entity_label_count: int
     duplicate_relation_signature_count: int
     top_entity_label: str | None
+    probe_entity_label: str | None
     visible_entity_labels_normalized: tuple[str, ...]
 
     @property
@@ -199,9 +206,6 @@ class GateCheck:
     detail: str
 
 
-NON_ALNUM_RE = re.compile(r"[^0-9a-zа-яё]+", re.IGNORECASE)
-
-
 class CurlSession:
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -306,25 +310,7 @@ class CurlSession:
         )
 
 
-def discover_workspace_id(session: CurlSession, library_id: str) -> str:
-    workspaces = session.request_json("GET", "/v1/catalog/workspaces").payload
-    if not isinstance(workspaces, list):
-        raise RuntimeError("catalog workspaces probe returned a non-list payload")
-    for workspace in workspaces:
-        workspace_id = workspace.get("id")
-        if not workspace_id:
-            continue
-        libraries = session.request_json(
-            "GET", f"/v1/catalog/workspaces/{workspace_id}/libraries"
-        ).payload
-        if not isinstance(libraries, list):
-            continue
-        if any(library.get("id") == library_id for library in libraries):
-            return str(workspace_id)
-    raise RuntimeError(f"failed to discover workspaceId for library {library_id}")
-
-
-def discover_library_catalog_ref(session: CurlSession, library_id: str) -> str:
+def discover_library_catalog_context(session: CurlSession, library_id: str) -> LibraryCatalogContext:
     library = session.request_json("GET", f"/v1/catalog/libraries/{library_id}")
     if library.status_code != 200:
         raise RuntimeError(f"get catalog library returned HTTP {library.status_code}")
@@ -346,7 +332,10 @@ def discover_library_catalog_ref(session: CurlSession, library_id: str) -> str:
     if not isinstance(workspace_slug, str):
         raise RuntimeError("catalog workspace payload missing slug")
 
-    return f"{workspace_slug}/{library_slug}"
+    return LibraryCatalogContext(
+        workspace_id=workspace_id,
+        catalog_ref=f"{workspace_slug}/{library_slug}",
+    )
 
 
 def create_query_session(session: CurlSession, workspace_id: str, library_id: str) -> str:
@@ -409,14 +398,53 @@ def build_document_search_arguments(library_ref: str, query: str, limit: int) ->
 def normalize_quality_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
-    lowered = value.casefold()
-    collapsed = NON_ALNUM_RE.sub(" ", lowered)
-    return " ".join(collapsed.split())
+    return " ".join(tokenize_quality_text(value))
+
+
+def tokenize_quality_text(value: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    current: list[str] = []
+    for char in value.casefold():
+        if char.isalnum():
+            current.append(char)
+        elif current:
+            tokens.append("".join(current))
+            current.clear()
+    if current:
+        tokens.append("".join(current))
+    return tuple(tokens)
+
+
+def significant_answer_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in tokenize_quality_text(value)
+        if len(token) >= 2 or any(char.isdigit() for char in token)
+    }
+
+
+def answer_token_overlap_ratio(left: str, right: str) -> float | None:
+    left_tokens = significant_answer_tokens(left)
+    right_tokens = significant_answer_tokens(right)
+    if not left_tokens or not right_tokens:
+        return None
+    return (2.0 * len(left_tokens & right_tokens)) / (len(left_tokens) + len(right_tokens))
 
 
 def count_duplicate_keys(keys: list[tuple[Any, ...] | str]) -> int:
     counter = collections.Counter(key for key in keys if key)
     return sum(1 for occurrences in counter.values() if occurrences > 1)
+
+
+def is_probe_entity_label(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    label = value.strip()
+    if not label:
+        return False
+    if label.casefold() in {"true", "false", "null"}:
+        return False
+    return any(char.isalpha() for char in label)
 
 
 def summarize_graph_quality(payload: dict[str, Any]) -> McpQualitySummary:
@@ -500,6 +528,10 @@ def summarize_graph_quality(payload: dict[str, Any]) -> McpQualitySummary:
         ]
     )
     top_entity_label = entities[0].get("label") if entities else None
+    probe_entity_label = next(
+        (entity.get("label") for entity in entities if is_probe_entity_label(entity.get("label"))),
+        None,
+    )
     visible_entity_labels_normalized = tuple(
         normalized_label
         for normalized_label in (
@@ -522,6 +554,7 @@ def summarize_graph_quality(payload: dict[str, Any]) -> McpQualitySummary:
         duplicate_entity_label_count=duplicate_entity_label_count,
         duplicate_relation_signature_count=duplicate_relation_signature_count,
         top_entity_label=top_entity_label if isinstance(top_entity_label, str) else None,
+        probe_entity_label=probe_entity_label if isinstance(probe_entity_label, str) else None,
         visible_entity_labels_normalized=visible_entity_labels_normalized,
     )
 
@@ -995,6 +1028,21 @@ def parse_csv_terms(value: str) -> list[str]:
     return [term.strip() for term in value.split(",") if term.strip()]
 
 
+def resolve_probe_queries(
+    *,
+    entity_query: str | None,
+    document_query: str | None,
+    question: str | None,
+    graph_quality: McpQualitySummary,
+) -> tuple[str, str, str]:
+    resolved_entity_query = (
+        entity_query or graph_quality.probe_entity_label or graph_quality.top_entity_label or "library"
+    )
+    resolved_question = question or f"What does this library say about {resolved_entity_query}?"
+    resolved_document_query = document_query or resolved_question
+    return resolved_entity_query, resolved_document_query, resolved_question
+
+
 def contains_all_terms(text: str, required_terms: list[str]) -> bool:
     text_folded = text.casefold()
     return all(term.casefold() in text_folded for term in required_terms)
@@ -1036,6 +1084,7 @@ def build_gate_checks(
     max_completed_ms: int | None,
     tool_samples: list[tuple[str, CurlSample]],
     max_first_frame_ms: int | None = None,
+    min_answer_overlap_ratio: float | None = DEFAULT_MIN_ANSWER_OVERLAP_RATIO,
 ) -> list[GateCheck]:
     checks: list[GateCheck] = []
 
@@ -1547,6 +1596,16 @@ def build_gate_checks(
         )
         if assistant_summaries:
             ui_summary = assistant_summaries[0]
+            answer_overlap = answer_token_overlap_ratio(
+                ui_summary.answer_text, grounded_answer_summary.answer_text
+            )
+            overlap_passes = (
+                min_answer_overlap_ratio is None
+                or (
+                    answer_overlap is not None
+                    and answer_overlap >= min_answer_overlap_ratio
+                )
+            )
             checks.append(
                 GateCheck(
                     label="assistant.run_1.mcp_answer_quality_parity",
@@ -1555,13 +1614,16 @@ def build_gate_checks(
                         if ui_summary.verification_state == grounded_answer_summary.verifier_level
                         and ui_summary.total_reference_count >= assistant_min_references
                         and len(grounded_answer_summary.references) >= assistant_min_references
+                        and overlap_passes
                         else "fail"
                     ),
                     detail=(
                         f"ui_verifier={ui_summary.verification_state or 'n/a'} "
                         f"mcp_verifier={grounded_answer_summary.verifier_level or 'n/a'} "
                         f"ui_references={ui_summary.total_reference_count} "
-                        f"mcp_references={len(grounded_answer_summary.references)}"
+                        f"mcp_references={len(grounded_answer_summary.references)} "
+                        f"answer_overlap={answer_overlap if answer_overlap is not None else 'n/a'} "
+                        f"min_overlap={min_answer_overlap_ratio if min_answer_overlap_ratio is not None else 'disabled'}"
                     ),
                 )
             )
@@ -1603,6 +1665,9 @@ def render_report(
     base_url: str,
     library_id: str,
     workspace_id: str,
+    entity_query: str,
+    document_query: str,
+    question: str,
     tools_list: CurlSample,
     entity_search: CurlSample,
     entity_search_summary: EntitySearchSummary,
@@ -1636,6 +1701,9 @@ def render_report(
 - Base URL: `{base_url}`
 - Library ID: `{library_id}`
 - Workspace ID: `{workspace_id}`
+- Entity query: `{entity_query}`
+- Document query: `{document_query}`
+- Assistant question: `{question}`
 
 ## MCP probes
 
@@ -1666,6 +1734,7 @@ def render_report(
 | duplicate entity labels | {graph_quality.duplicate_entity_label_count} |
 | duplicate relation signatures | {graph_quality.duplicate_relation_signature_count} |
 | top entity label | {graph_quality.top_entity_label or "n/a"} |
+| probe entity label | {graph_quality.probe_entity_label or "n/a"} |
 
 ### `list_relations` quality checks
 
@@ -1780,12 +1849,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--library-id", required=True)
     parser.add_argument("--workspace-id")
     parser.add_argument("--mcp-token", default=os.environ.get("IRONRAG_MCP_TOKEN"))
-    parser.add_argument("--entity-query", default=DEFAULT_ENTITY_QUERY)
-    parser.add_argument("--document-query", default=DEFAULT_DOCUMENT_QUERY)
+    parser.add_argument(
+        "--entity-query",
+        default=DEFAULT_ENTITY_QUERY,
+        help="Entity search probe query. Defaults to the top entity from graph topology.",
+    )
+    parser.add_argument(
+        "--document-query",
+        default=DEFAULT_DOCUMENT_QUERY,
+        help="Document search probe query. Defaults to the assistant question.",
+    )
     parser.add_argument("--document-limit", type=int, default=DEFAULT_DOCUMENT_LIMIT)
     parser.add_argument("--graph-limit", type=int, default=50)
     parser.add_argument("--read-length", type=int, default=DEFAULT_READ_LENGTH)
-    parser.add_argument("--question", default=DEFAULT_ASSISTANT_QUESTION)
+    parser.add_argument(
+        "--question",
+        default=DEFAULT_ASSISTANT_QUESTION,
+        help="Assistant and grounded_answer probe question. Defaults to the top graph entity.",
+    )
     parser.add_argument("--assistant-top-k", type=int, default=DEFAULT_ASSISTANT_TOP_K)
     parser.add_argument("--assistant-runs", type=int, default=2)
     parser.add_argument("--graph-min-entities", type=int, default=DEFAULT_GRAPH_MIN_ENTITIES)
@@ -1811,6 +1892,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--assistant-require-all", default="")
     parser.add_argument("--assistant-forbid-any", default="")
     parser.add_argument("--expected-search-top-label")
+    parser.add_argument(
+        "--min-answer-overlap-ratio",
+        type=float,
+        default=DEFAULT_MIN_ANSWER_OVERLAP_RATIO,
+        help=(
+            "Optional UI/MCP answer text overlap gate. Disabled by default because "
+            "the UI may validly synthesize or summarize a matching tool answer."
+        ),
+    )
     parser.add_argument("--max-tool-latency-ms", type=int)
     parser.add_argument("--max-completed-ms", type=int)
     parser.add_argument("--max-first-frame-ms", type=int, default=DEFAULT_ASSISTANT_MAX_FIRST_FRAME_MS)
@@ -1831,8 +1921,9 @@ def main(argv: list[str]) -> int:
     session = CurlSession(args.base_url)
     try:
         session.login(args.login, resolve_probe_password())
-        workspace_id = args.workspace_id or discover_workspace_id(session, args.library_id)
-        library_catalog_ref = discover_library_catalog_ref(session, args.library_id)
+        library_catalog_context = discover_library_catalog_context(session, args.library_id)
+        workspace_id = args.workspace_id or library_catalog_context.workspace_id
+        library_catalog_ref = library_catalog_context.catalog_ref
 
         tools_list = session.request_json(
             "POST",
@@ -1849,11 +1940,29 @@ def main(argv: list[str]) -> int:
         )
         ensure_jsonrpc_result(tools_list, "tools/list")
 
+        graph_topology = probe_mcp_tool(
+            session,
+            bearer_token=args.mcp_token,
+            tool_name="get_graph_topology",
+            arguments={"library": library_catalog_ref, "limit": args.graph_limit},
+        )
+        topology_result = ensure_jsonrpc_result(graph_topology, "get_graph_topology")
+        if topology_result.get("isError"):
+            raise RuntimeError(f"get_graph_topology returned tool error: {topology_result!r}")
+        graph_quality = summarize_graph_quality(topology_result.get("structuredContent") or {})
+
+        entity_query, document_query, question = resolve_probe_queries(
+            entity_query=args.entity_query,
+            document_query=args.document_query,
+            question=args.question,
+            graph_quality=graph_quality,
+        )
+
         entity_search = probe_mcp_tool(
             session,
             bearer_token=args.mcp_token,
             tool_name="search_entities",
-            arguments={"library": library_catalog_ref, "query": args.entity_query, "limit": 10},
+            arguments={"library": library_catalog_ref, "query": entity_query, "limit": 10},
         )
         entity_search_result = ensure_jsonrpc_result(entity_search, "search_entities")
         if entity_search_result.get("isError"):
@@ -1867,7 +1976,7 @@ def main(argv: list[str]) -> int:
             bearer_token=args.mcp_token,
             tool_name="search_documents",
             arguments=build_document_search_arguments(
-                library_catalog_ref, args.document_query, args.document_limit
+                library_catalog_ref, document_query, args.document_limit
             ),
         )
         document_search_result = ensure_jsonrpc_result(document_search, "search_documents")
@@ -1903,17 +2012,6 @@ def main(argv: list[str]) -> int:
                 document_read_result.get("structuredContent") or {}
             )
 
-        graph_topology = probe_mcp_tool(
-            session,
-            bearer_token=args.mcp_token,
-            tool_name="get_graph_topology",
-            arguments={"library": library_catalog_ref, "limit": args.graph_limit},
-        )
-        topology_result = ensure_jsonrpc_result(graph_topology, "get_graph_topology")
-        if topology_result.get("isError"):
-            raise RuntimeError(f"get_graph_topology returned tool error: {topology_result!r}")
-        graph_quality = summarize_graph_quality(topology_result.get("structuredContent") or {})
-
         list_relations = probe_mcp_tool(
             session,
             bearer_token=args.mcp_token,
@@ -1946,7 +2044,7 @@ def main(argv: list[str]) -> int:
             tool_name="grounded_answer",
             arguments={
                 "library": library_catalog_ref,
-                "query": args.question,
+                "query": question,
                 "topK": args.assistant_top_k,
             },
             route=MCP_ANSWER_ROUTE,
@@ -1965,7 +2063,7 @@ def main(argv: list[str]) -> int:
                 execute_assistant_turn(
                     session,
                     query_session_id,
-                    args.question,
+                    question,
                     top_k=args.assistant_top_k,
                     timeout_seconds=args.timeout_seconds,
                 )
@@ -2061,6 +2159,7 @@ def main(argv: list[str]) -> int:
             assistant_require_all=parse_csv_terms(args.assistant_require_all),
             assistant_forbid_any=parse_csv_terms(args.assistant_forbid_any),
             expected_search_top_label=args.expected_search_top_label,
+            min_answer_overlap_ratio=args.min_answer_overlap_ratio,
             max_tool_latency_ms=args.max_tool_latency_ms,
             max_completed_ms=args.max_completed_ms,
             tool_samples=[
@@ -2091,6 +2190,9 @@ def main(argv: list[str]) -> int:
             base_url=args.base_url,
             library_id=args.library_id,
             workspace_id=workspace_id,
+            entity_query=entity_query,
+            document_query=document_query,
+            question=question,
             tools_list=tools_list,
             entity_search=entity_search,
             entity_search_summary=entity_search_summary,

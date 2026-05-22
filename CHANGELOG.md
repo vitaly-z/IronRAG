@@ -1,10 +1,143 @@
 # Changelog
 
+## 0.4.19 — 2026-05-22
+
+### Connectors
+
+- Added the production [Confluence connector](https://github.com/mlimarenko/IronRAG.Confluence) for syncing pages and attachments into IronRAG with periodic polling and webhook intake, alongside the existing BookStack connector line.
+
+### Admin
+
+- The ingest queue now uses the shared document-style pagination footer with
+  the same 50/100/250/1000 row-size choices and adds an explicit selection
+  mode for bulk pause, resume, cancel, and clear-selection actions.
+- The ingest queue now has workspace and library filters; changing scope resets
+  pagination and row selection so bulk actions only apply to the visible scope.
+- Added a Libraries administration tab with cross-workspace library summaries,
+  document-style filters, pagination, inspector actions, bulk backup/delete
+  actions, and direct navigation to the selected library's documents.
+- Libraries bulk selection now follows the documents table pattern: checkboxes
+  appear only after entering selection mode, and pagination uses numbered page
+  controls with ellipses and the same page-size choices as documents.
+- The Libraries administration table now explains each column through localized
+  hover/focus tooltips, including the difference between readiness and lifecycle
+  state.
+- Libraries administration sorting now covers every data column, including
+  provider calls, readiness, and lifecycle state.
+- Workspace switching now selects the first library in the newly selected
+  workspace when the previously active library does not belong to it.
+
+### Web ingest
+
+- Recursive web ingest now captures meaningful image resources from HTML
+  documentation pages, including responsive and lazy-loaded images, while
+  filtering page chrome, hidden markup, script/style text, and tiny/decorative
+  assets before OCR ingestion. HTML text extraction also skips structurally
+  hidden class/style content and unresolved template-only fragments without
+  dropping ordinary prose about template syntax, and recursive discovery now
+  ignores edit-action links that point at page-authoring chrome. Title-only
+  HTML pages no longer produce retrievable text unless the page body yields
+  visible content.
+- Recursive web ingest now treats directly discovered image resources as
+  embedded page assets instead of materializing them as separate document rows;
+  standalone image uploads remain supported through the file upload path.
+- Raster OCR now prefers the configured Vision binding for standalone images
+  and embedded document figures, while Docling remains the structured parser for
+  PDF/DOCX/PPTX and the fallback image OCR path when no Vision binding exists.
+
+### Rollout checks
+
+- MCP-agent rollout checks now fail closed when catalog discovery, shell
+  readiness, or direct binding API responses have malformed JSON shapes or
+  invalid UUID identifiers, instead of silently skipping affected libraries.
+- Assistant benchmark gates now validate question files, library identifiers,
+  latency counters, success counters, and failure counters before spending API
+  work or reporting a rollout as passing.
+
+### Assistant
+
+- Removed backend source-footer mutation from assistant answers. Retrieved
+  evidence links now stay on the structured evidence surface and the UI renders
+  them separately from model-authored answer text.
+- MCP document search now bounds suggested read offsets against the readable
+  revision length, so following `suggestedStartOffset` with `read_document`
+  cannot produce an empty first window when chunk spans point at the document
+  tail.
+- Structured source-context expansion now treats query-focused companion chunks
+  as local neighbor anchors, no longer requires a source-profile chunk before
+  loading neighbors, and widens the preceding setup window for typed procedural
+  questions, so configuration answers keep adjacent examples and setup blocks
+  in context without corpus-specific routing.
+- Procedural single-document answers now retain the expanded structured source
+  context through final assembly even when the caller uses a small default
+  retrieval budget, so configuration instructions keep file paths, sections,
+  examples, and parameter descriptions together without increasing broad-query
+  fan-out.
+- Wildcard graph-inventory answers now reserve a larger share of the existing
+  context window for matching graph nodes before sampled document excerpts, so
+  broad list questions can surface more known entities without corpus-specific
+  routing or extra retrieval fan-out.
+- Short focused setup questions now treat a rare clipped target token as related
+  to longer canonical graph labels and technical chunks, keeping configuration
+  retrieval anchored to the requested entity without language-specific aliases,
+  corpus-specific rules, or additional retrieval fan-out.
+- Graph evidence lookup now gives priority to explicit QueryIR entity/document
+  targets before filling the bounded target set from the broader retrieval
+  bundle, so focused procedural questions can pull the matched source document's
+  tables and configuration snippets instead of being crowded out by generic
+  graph context.
+- Single-document procedural retrieval now treats `document_focus` as the
+  primary graph/document anchor and keeps requested value facets from becoming
+  competing target profiles, so setup questions stay on the named source while
+  still retrieving the requested files, sections, parameters, and examples.
+- Document-scoped comparison and procedural questions now prepend the focused
+  source to typed facet probes before graph and lexical retrieval, keeping
+  variant/setting comparisons anchored to the requested source instead of
+  drifting into generic facet nodes while falling back to explicit entities
+  when the focused graph profile is absent.
+- Focused-document heading extraction now abstains for typed procedural
+  configuration questions, preventing deterministic preflight from replacing a
+  grounded setup answer with only a section heading.
+- Latest-version inventory retrieval now honors the typed QueryIR source-slice
+  count before falling back to numeric literals, so latest-N answers keep the
+  requested number of version documents without keyword routing or
+  corpus-specific rules.
+- Graph-backed inventory questions now keep explicit entity matches ahead of
+  broad expansion nodes, support literal prefix wildcard lookups, and preserve a
+  larger entity budget for list-style answers without increasing the initial
+  retrieval fan-out.
+- Follow-up grounded answers now preserve dense code-literal inventories from
+  the prior assistant turn before truncating history, reuse the parent retrieval
+  budget for those dense list follow-ups, surface graph-node summaries as
+  answer evidence, route wildcard identifier inventories through the canonical
+  answer tool instead of document listings, and keep internal scope wrappers out
+  of model-authored answers with a stricter no-continuation-offer boundary.
+- Broad comparison answers now preserve module, package, configuration-file,
+  and filesystem-path intent through QueryIR compilation and retrieved-document
+  briefs, keeping exact technical identifiers near introductory prose in the
+  final grounded context without corpus-specific routing or extra retrieval
+  fan-out.
+
+### Documents
+
+- The document editor now loads a canonical editor-markdown representation
+  instead of rebuilding editable content from prepared retrieval segments.
+  Markdown documents open in the rich editor with image/link/table support, and
+  PDF documents use the stored source as a read-only viewer frame.
+- The document editor toolbar now exposes icon actions for common Markdown
+  formatting, links, images, tables, and history while preventing unchanged
+  documents from being saved and reprocessed.
+- Docling-backed PDF extraction now preserves escaped technical identifiers in
+  prepared text and keeps short OCR fragments out of graph labels without
+  dropping code-like identifiers or measurement/formula labels.
+- Batched PDF extraction now preserves Vision OCR usage from every page range,
+  so embedded-image parsing and document billing stay aligned.
+
 ## 0.4.18 — 2026-05-19
 
 ### Outbound HTTP security
 
-- Added one canonical outbound public-HTTP resolver for webhook delivery.
+- Added one standard outbound public-HTTP resolver for webhook delivery.
   Webhook targets are now resolved and policy-checked before delivery,
   redirects are not followed, private and loopback address ranges are
   rejected, and response excerpts are bounded before persistence.

@@ -4,8 +4,8 @@ use super::*;
 use serde_json::json;
 
 use crate::domains::query_ir::{
-    DocumentHint, EntityMention, EntityRole, LiteralKind, LiteralSpan, QueryAct, QueryIR,
-    QueryLanguage, QueryScope, TemporalConstraint,
+    ComparisonSpec, DocumentHint, EntityMention, EntityRole, LiteralKind, LiteralSpan, QueryAct,
+    QueryIR, QueryLanguage, QueryScope, TemporalConstraint,
 };
 use crate::infra::arangodb::{
     document_store::{

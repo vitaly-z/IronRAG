@@ -90,12 +90,12 @@ pub(crate) struct McpDocumentAccumulator {
     pub(crate) excerpt_start_offset: Option<usize>,
     pub(crate) excerpt_end_offset: Option<usize>,
     /// Character offset of the top-scoring chunk inside the full
-    /// normalized revision text. Populated from `chunk.span_start`
-    /// when `merge_chunk_span_anchor` is called with a higher score
-    /// than we've previously recorded — so the document-level hit
-    /// ends up pointing at the best chunk's start offset.
+    /// normalized revision text. Populated from `chunk.span_start`,
+    /// bounded so the first `read_document` window contains content
+    /// even when chunk spans drift to the final character boundary.
     pub(crate) suggested_start_offset: Option<usize>,
     pub(crate) suggested_start_offset_score: f64,
+    pub(crate) content_char_count: Option<usize>,
     pub(crate) chunk_references: HashMap<Uuid, RankedSearchReference>,
 }
 
@@ -120,6 +120,7 @@ impl McpDocumentAccumulator {
             excerpt_end_offset: None,
             suggested_start_offset: Some(0),
             suggested_start_offset_score: row.metadata_score,
+            content_char_count: None,
             chunk_references: HashMap::new(),
         }
     }
@@ -146,16 +147,25 @@ impl McpDocumentAccumulator {
             excerpt_end_offset: None,
             suggested_start_offset: None,
             suggested_start_offset_score: f64::MIN,
+            content_char_count: revision
+                .normalized_text
+                .as_ref()
+                .map(|value| value.chars().count()),
             chunk_references: HashMap::new(),
         }
     }
 
     /// Record the start offset of a candidate chunk. Keeps the offset
-    /// whose score is the highest we've seen so far — the idea is
-    /// that the top chunk's `span_start` points right at the paragraph
-    /// the user is actually asking about, so handing it to the agent
-    /// as `suggestedStartOffset` skips the PDF table of contents.
-    pub(crate) fn merge_chunk_span_anchor(&mut self, span_start: Option<i32>, score: f64) {
+    /// whose score is the highest we've seen so far. The exposed offset
+    /// is a read-window anchor rather than an unchecked raw span: it
+    /// starts at the chunk when possible, but backs up near document
+    /// tails so a first `read_document` call returns useful content.
+    pub(crate) fn merge_chunk_span_anchor(
+        &mut self,
+        span_start: Option<i32>,
+        score: f64,
+        read_window_chars: usize,
+    ) {
         let Some(start) = span_start else {
             return;
         };
@@ -165,7 +175,11 @@ impl McpDocumentAccumulator {
         if score <= self.suggested_start_offset_score {
             return;
         }
-        self.suggested_start_offset = Some(start as usize);
+        self.suggested_start_offset = Some(window_safe_start_offset(
+            start as usize,
+            self.content_char_count,
+            read_window_chars,
+        ));
         self.suggested_start_offset_score = score;
     }
 
@@ -224,5 +238,47 @@ impl McpDocumentAccumulator {
                 inclusion_reason: reference.inclusion_reason,
             })
             .collect()
+    }
+}
+
+pub(crate) fn window_safe_start_offset(
+    requested_start: usize,
+    total_content_chars: Option<usize>,
+    read_window_chars: usize,
+) -> usize {
+    let Some(total_content_chars) = total_content_chars else {
+        return requested_start;
+    };
+    if total_content_chars == 0 {
+        return 0;
+    }
+    let window_chars = read_window_chars.max(1).min(total_content_chars);
+    let latest_useful_start = total_content_chars.saturating_sub(window_chars);
+    requested_start.min(latest_useful_start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_safe_start_offset;
+
+    #[test]
+    fn window_safe_start_keeps_middle_chunk_anchor() {
+        assert_eq!(window_safe_start_offset(200, Some(1_000), 300), 200);
+    }
+
+    #[test]
+    fn window_safe_start_backs_up_for_tail_chunk_anchor() {
+        assert_eq!(window_safe_start_offset(900, Some(1_000), 300), 700);
+    }
+
+    #[test]
+    fn window_safe_start_returns_zero_when_document_fits_window() {
+        assert_eq!(window_safe_start_offset(900, Some(1_000), 2_000), 0);
+    }
+
+    #[test]
+    fn window_safe_start_tolerates_unknown_or_empty_content_length() {
+        assert_eq!(window_safe_start_offset(900, None, 300), 900);
+        assert_eq!(window_safe_start_offset(900, Some(0), 300), 0);
     }
 }

@@ -141,7 +141,7 @@ impl LibraryRecognitionPolicy {
 }
 
 const fn default_raster_image_engine() -> RecognitionEngine {
-    RecognitionEngine::Docling
+    RecognitionEngine::Vision
 }
 
 #[cfg(test)]
@@ -149,10 +149,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_policy_uses_docling_for_static_raster_images() {
+    fn default_policy_uses_vision_for_static_raster_images() {
         assert_eq!(
             LibraryRecognitionPolicy::default().raster_image_engine,
-            RecognitionEngine::Docling
+            RecognitionEngine::Vision
         );
     }
 

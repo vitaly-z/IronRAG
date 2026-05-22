@@ -3,6 +3,7 @@ import type { TFunction } from 'i18next';
 import { Loader2 } from 'lucide-react';
 import { useEditor, type Editor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
+import Image from '@tiptap/extension-image';
 import { Table } from '@tiptap/extension-table';
 import TableCell from '@tiptap/extension-table-cell';
 import TableHeader from '@tiptap/extension-table-header';
@@ -32,16 +33,37 @@ type DocumentEditorShellProps = {
   readOnly?: boolean;
   saving: boolean;
   sourceFormat?: string;
+  sourceHref?: string;
   t: TFunction;
 };
 
 const editorExtensions = [
-  StarterKit,
+  StarterKit.configure({
+    link: {
+      autolink: false,
+      linkOnPaste: false,
+      openOnClick: false,
+      HTMLAttributes: {
+        rel: 'noopener noreferrer nofollow',
+        target: '_blank',
+      },
+    },
+  }),
+  Image.configure({
+    allowBase64: true,
+    HTMLAttributes: {
+      class: 'document-editor-image',
+    },
+  }),
   Table.configure({ resizable: true }),
   TableRow,
   TableHeader,
   TableCell,
-  Markdown,
+  Markdown.configure({
+    markedOptions: {
+      gfm: true,
+    },
+  }),
 ];
 const RAW_TEXT_EDITOR_MIN_LENGTH = 512 * 1024;
 
@@ -56,6 +78,7 @@ export function DocumentEditorShell({
   readOnly = false,
   saving,
   sourceFormat,
+  sourceHref,
   t,
 }: DocumentEditorShellProps) {
   const rawTextEditor = shouldUseRawTextEditor(markdown, sourceFormat);
@@ -65,6 +88,7 @@ export function DocumentEditorShell({
   );
   const [baseline, setBaseline] = useState<DirtyStateBaseline | null>(null);
   const [currentMarkdown, setCurrentMarkdown] = useState('');
+  const [lineWrapEnabled, setLineWrapEnabled] = useState(true);
 
   const editor = useEditor(
     {
@@ -75,7 +99,7 @@ export function DocumentEditorShell({
       editable: !readOnly && !rawTextEditor && !loading && !saving,
       editorProps: {
         attributes: {
-          class: `document-editor-prosemirror document-editor-prosemirror--${surfaceMode} min-h-[68vh] px-5 py-5 outline-none sm:px-7 sm:py-6 lg:px-8 lg:py-7`,
+          class: `document-editor-prosemirror document-editor-prosemirror--${surfaceMode} ${lineWrapEnabled ? 'document-editor-prosemirror--wrap' : 'document-editor-prosemirror--nowrap'} min-h-[68vh] px-5 py-5 outline-none sm:px-7 sm:py-6 lg:px-8 lg:py-7`,
           spellcheck: surfaceMode === 'prose' ? 'true' : 'false',
           autocapitalize: 'off',
           autocomplete: 'off',
@@ -94,6 +118,16 @@ export function DocumentEditorShell({
     },
     [loading, markdown, rawTextEditor, readOnly, surfaceMode],
   );
+
+  useEffect(() => {
+    const editorRoot = editor?.view?.dom;
+    if (!editorRoot) {
+      return;
+    }
+
+    editorRoot.classList.toggle('document-editor-prosemirror--wrap', lineWrapEnabled);
+    editorRoot.classList.toggle('document-editor-prosemirror--nowrap', !lineWrapEnabled);
+  }, [editor, lineWrapEnabled]);
 
   useEffect(() => {
     if (!editor) {
@@ -152,6 +186,11 @@ export function DocumentEditorShell({
   }, [editor, loading, open, rawTextEditor]);
 
   const isDirty = !readOnly && !loading && !saving && isEditorContentDirty(baseline, currentMarkdown);
+  const saveDisabled = loading ||
+    saving ||
+    !isDirty ||
+    (rawTextEditor ? false : !editor) ||
+    Boolean(error && !currentMarkdown);
   const statusState = readOnly ? 'readOnly' : saving ? 'saving' : error ? 'error' : isDirty ? 'dirty' : 'clean';
   const statusLabel = (() => {
     switch (statusState) {
@@ -209,7 +248,7 @@ export function DocumentEditorShell({
           <Button variant="outline" onClick={handleRequestClose} disabled={saving}>
             {t('documents.cancel')}
           </Button>
-          <Button onClick={handleSave} disabled={loading || saving || !editor || Boolean(error && !currentMarkdown)}>
+          <Button onClick={handleSave} disabled={saveDisabled}>
             {saving ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -261,6 +300,8 @@ export function DocumentEditorShell({
               <DocumentEditorToolbar
                 editor={editor}
                 isDirty={isDirty}
+                lineWrapEnabled={lineWrapEnabled}
+                onLineWrapChange={setLineWrapEnabled}
                 saving={saving}
                 sourceFormat={sourceFormat}
                 statusLabel={statusLabel}
@@ -283,10 +324,12 @@ export function DocumentEditorShell({
           error={error}
           loading={loading}
           onRawTextChange={setCurrentMarkdown}
+          lineWrapEnabled={lineWrapEnabled}
           rawTextEditor={rawTextEditor}
           readOnly={readOnly}
           saving={saving}
           sourceFormat={sourceFormat}
+          sourceHref={sourceHref}
           statusLabel={statusLabel}
           surfaceMode={surfaceMode}
           t={t}

@@ -230,7 +230,7 @@ pub async fn create_library(
         slug,
         display_name,
         description,
-        serde_json::json!({ "rasterImageEngine": "docling" }),
+        serde_json::json!({ "rasterImageEngine": "vision" }),
         created_by_principal_id,
     )
     .await

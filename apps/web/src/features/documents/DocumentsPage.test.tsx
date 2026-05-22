@@ -19,6 +19,7 @@ const {
     list: vi.fn(),
     get: vi.fn(),
     getSourceText: vi.fn(),
+    getEditorSourceText: vi.fn(),
     upload: vi.fn(),
     delete: vi.fn(),
     reprocess: vi.fn(),
@@ -238,6 +239,7 @@ describe('DocumentsPage', () => {
     ]);
     documentsApiMock.getTechnicalFacts.mockResolvedValue([]);
     documentsApiMock.getSourceText.mockResolvedValue('def run():\n\treturn 42\n');
+    documentsApiMock.getEditorSourceText.mockResolvedValue('## Sheet1\n\n| Item | Qty |\n| --- | --- |\n| Widget | 7 |');
     documentsApiMock.edit.mockResolvedValue({ documentId: 'doc-1' });
     documentsApiMock.listWebRuns.mockResolvedValue([]);
     documentsApiMock.listWebRunPages.mockResolvedValue([]);
@@ -355,7 +357,7 @@ describe('DocumentsPage', () => {
 
     await flushUi();
 
-    expect(documentsApiMock.getAllPreparedSegments).toHaveBeenCalledWith('doc-1');
+    expect(documentsApiMock.getEditorSourceText).toHaveBeenCalledWith('doc-1');
     expect(container.querySelector('[data-testid="document-editor-shell"]')).toBeTruthy();
   });
 
@@ -591,7 +593,7 @@ describe('DocumentsPage', () => {
     expect(documentsApiMock.getAllPreparedSegments).not.toHaveBeenCalled();
   });
 
-  it('falls back to all prepared pages for plain text documents without stored source access', async () => {
+  it('loads the editor source representation for plain text documents without stored source access', async () => {
     documentsApiMock.list.mockResolvedValue(
       listPage([
         {
@@ -628,7 +630,8 @@ describe('DocumentsPage', () => {
     await flushUi();
 
     expect(documentsApiMock.getSourceText).not.toHaveBeenCalled();
-    expect(documentsApiMock.getAllPreparedSegments).toHaveBeenCalledWith('doc-chat');
+    expect(documentsApiMock.getEditorSourceText).toHaveBeenCalledWith('doc-chat');
+    expect(documentsApiMock.getAllPreparedSegments).not.toHaveBeenCalled();
   });
 
   it('shows web page as the document type for web-ingested documents', async () => {

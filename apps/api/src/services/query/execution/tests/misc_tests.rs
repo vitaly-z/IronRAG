@@ -125,10 +125,16 @@ fn build_lexical_queries_uses_query_ir_focus_spans_before_broad_keywords() {
     let queries = build_lexical_queries(question, &plan, &focus_queries, Some(&query_ir));
 
     assert_eq!(queries[0], question);
-    assert_eq!(queries[1], "scan folder through RareProtocol RareProtocol daemon");
-    assert_eq!(queries[2], "scan folder through RareProtocol");
-    assert_eq!(queries[3], "RareProtocol daemon");
-    assert!(!queries.contains(&"RareProtocol scan-folder setup commands".to_string()));
+    assert!(
+        queries
+            .get(1)
+            .is_some_and(|query| query.starts_with("RareProtocol scan-folder setup commands ")),
+        "procedural single-document queries should anchor typed focus to document focus: {queries:?}"
+    );
+    assert!(queries.contains(&"scan folder through RareProtocol RareProtocol daemon".to_string()));
+    assert!(queries.contains(&"scan folder through RareProtocol".to_string()));
+    assert!(queries.contains(&"RareProtocol daemon".to_string()));
+    assert!(queries.contains(&"RareProtocol scan-folder setup commands".to_string()));
     assert!(queries.contains(&"configure scan folder settings".to_string()));
 }
 
@@ -307,6 +313,152 @@ fn query_ir_focus_queries_start_with_adjacent_typed_compounds() {
 }
 
 #[test]
+fn query_ir_focus_queries_do_not_compound_primary_entities_with_modifiers() {
+    let query_ir = QueryIR {
+        act: QueryAct::Enumerate,
+        scope: QueryScope::SingleDocument,
+        language: QueryLanguage::Auto,
+        target_types: vec!["concept".to_string()],
+        target_entities: vec![
+            EntityMention { label: "checkout connectors".to_string(), role: EntityRole::Object },
+            EntityMention {
+                label: "custom gateway extension".to_string(),
+                role: EntityRole::Object,
+            },
+            EntityMention { label: "lead capture forms".to_string(), role: EntityRole::Modifier },
+            EntityMention { label: "customer database".to_string(), role: EntityRole::Modifier },
+        ],
+        literal_constraints: Vec::new(),
+        temporal_constraints: Vec::new(),
+        comparison: None,
+        document_focus: Some(DocumentHint { hint: "Alpha Suite".to_string() }),
+        conversation_refs: Vec::new(),
+        needs_clarification: None,
+        source_slice: None,
+        confidence: 0.9,
+    };
+
+    let focus_queries = query_ir_lexical_focus_queries(&query_ir);
+
+    assert_eq!(
+        focus_queries.first().map(String::as_str),
+        Some("checkout connectors custom gateway extension")
+    );
+    assert!(
+        focus_queries.iter().take(3).any(|query| query.contains("custom gateway extension")),
+        "primary object evidence must stay inside the bounded graph-evidence probe set: {focus_queries:?}"
+    );
+    assert!(
+        focus_queries
+            .iter()
+            .take(3)
+            .all(|query| !query.contains("lead capture") && !query.contains("customer database")),
+        "modifier constraints must not displace primary object probes: {focus_queries:?}"
+    );
+}
+
+#[test]
+fn query_ir_focus_queries_anchor_focused_compare_facets_to_document_focus() {
+    let query_ir = QueryIR {
+        act: QueryAct::Compare,
+        scope: QueryScope::SingleDocument,
+        language: QueryLanguage::Auto,
+        target_types: vec!["document".to_string(), "concept".to_string()],
+        target_entities: vec![
+            EntityMention { label: "module options".to_string(), role: EntityRole::Subject },
+            EntityMention { label: "operation rules".to_string(), role: EntityRole::Subject },
+            EntityMention { label: "limit matrix".to_string(), role: EntityRole::Subject },
+        ],
+        literal_constraints: Vec::new(),
+        temporal_constraints: Vec::new(),
+        comparison: Some(ComparisonSpec {
+            a: Some("available variants".to_string()),
+            b: None,
+            dimension: "facet coverage".to_string(),
+        }),
+        document_focus: Some(DocumentHint { hint: "Alpha Suite".to_string() }),
+        conversation_refs: Vec::new(),
+        needs_clarification: None,
+        source_slice: None,
+        confidence: 0.86,
+    };
+
+    let focus_queries = query_ir_lexical_focus_queries(&query_ir);
+
+    assert!(
+        focus_queries.iter().take(3).all(|query| query.starts_with("Alpha Suite ")),
+        "focused compare probes must keep dimensions attached to the document focus: {focus_queries:?}"
+    );
+    assert!(
+        focus_queries.iter().any(|query| query == "Alpha Suite"),
+        "standalone document focus must remain available for source-document retrieval: {focus_queries:?}"
+    );
+}
+
+#[test]
+fn graph_evidence_db_probes_keep_primary_object_before_modifier_tail() {
+    let plan = RuntimeQueryPlan {
+        requested_mode: RuntimeQueryMode::Hybrid,
+        planned_mode: RuntimeQueryMode::Hybrid,
+        intent_profile: QueryIntentProfile::default(),
+        keywords: vec!["checkout".to_string(), "connectors".to_string()],
+        high_level_keywords: vec!["checkout".to_string()],
+        low_level_keywords: vec!["connectors".to_string()],
+        entity_keywords: Vec::new(),
+        concept_keywords: Vec::new(),
+        top_k: 8,
+        context_budget_chars: 22_000,
+        hyde_recommended: false,
+    };
+    let query_ir = QueryIR {
+        act: QueryAct::Enumerate,
+        scope: QueryScope::SingleDocument,
+        language: QueryLanguage::Auto,
+        target_types: vec!["concept".to_string()],
+        target_entities: vec![
+            EntityMention { label: "checkout connectors".to_string(), role: EntityRole::Object },
+            EntityMention {
+                label: "custom gateway extension".to_string(),
+                role: EntityRole::Object,
+            },
+            EntityMention { label: "lead capture forms".to_string(), role: EntityRole::Modifier },
+            EntityMention { label: "customer database".to_string(), role: EntityRole::Modifier },
+        ],
+        literal_constraints: Vec::new(),
+        temporal_constraints: Vec::new(),
+        comparison: None,
+        document_focus: Some(DocumentHint { hint: "Alpha Suite".to_string() }),
+        conversation_refs: Vec::new(),
+        needs_clarification: None,
+        source_slice: None,
+        confidence: 0.9,
+    };
+
+    let focus_queries = query_ir_lexical_focus_queries(&query_ir);
+    let text_queries = build_graph_evidence_text_queries(
+        "Which Alpha Suite checkout connectors are available, excluding form and database integrations?",
+        &plan,
+        &focus_queries,
+        Some(&query_ir),
+    );
+    let db_queries = graph_evidence_db_text_queries(&text_queries);
+
+    assert!(
+        db_queries.iter().any(|query| query == "custom gateway extension"),
+        "primary object must survive bounded graph-evidence DB probes: {db_queries:?}"
+    );
+    assert!(
+        db_queries.iter().any(|query| query == "checkout connectors"),
+        "standalone primary object probe must survive modifier-heavy IR: {db_queries:?}"
+    );
+    assert!(
+        db_queries.iter().position(|query| query == "lead capture forms")
+            > db_queries.iter().position(|query| query == "checkout connectors"),
+        "modifier probe must not outrank primary object probe: {db_queries:?}"
+    );
+}
+
+#[test]
 fn query_ir_focus_queries_order_compounds_by_structural_specificity() {
     let query_ir = QueryIR {
         act: QueryAct::RetrieveValue,
@@ -406,12 +558,14 @@ fn apply_rerank_outcome_reorders_bundle_before_final_truncation() {
                 node_id: entity_a,
                 label: "Alpha".to_string(),
                 node_type: "entity".to_string(),
+                summary: None,
                 score: Some(0.9),
             },
             RuntimeMatchedEntity {
                 node_id: entity_b,
                 label: "Budget".to_string(),
                 node_type: "entity".to_string(),
+                summary: None,
                 score: Some(0.4),
             },
         ],

@@ -11,11 +11,15 @@ use crate::{
     app::state::AppState,
     infra::{
         arangodb::graph_store::{
-            GraphViewEdgeWrite, GraphViewNodeWrite, GraphViewWriteError, sanitize_graph_view_writes,
+            GraphViewData, GraphViewEdgeWrite, GraphViewNodeWrite, GraphViewWriteError,
+            sanitize_graph_view_writes,
         },
         repositories::{self, RuntimeGraphSnapshotRow},
     },
-    services::graph::{error::GraphServiceError, summary::GraphSummaryRefreshRequest},
+    services::graph::{
+        error::GraphServiceError, quality_guard::GraphQualityGuardService,
+        summary::GraphSummaryRefreshRequest,
+    },
     services::knowledge::graph_stream::prewarm_graph_topology_cache,
     shared::json_coercion::from_value_or_default,
 };
@@ -37,6 +41,16 @@ pub struct GraphProjectionOutcome {
     pub node_count: usize,
     pub edge_count: usize,
     pub graph_status: String,
+}
+
+#[derive(Debug)]
+struct ProjectionWrites {
+    nodes: Vec<GraphViewNodeWrite>,
+    edges: Vec<GraphViewEdgeWrite>,
+    remove_node_ids: Vec<Uuid>,
+    remove_edge_ids: Vec<Uuid>,
+    canonical_pruned_node_ids: Vec<Uuid>,
+    canonical_pruned_edge_ids: Vec<Uuid>,
 }
 
 impl GraphProjectionOutcome {
@@ -205,51 +219,21 @@ pub async fn project_canonical_graph(
     // cancel poll tasks while the CPU work happens on the blocking
     // thread pool. The move-in transfers ownership of the freshly
     // loaded rows; the move-out returns the sanitized writes.
+    let projection_quality_guard = state.bulk_ingest_hardening_services.graph_quality_guard.clone();
     let sanitize_task = tokio::task::spawn_blocking(move || {
-        let node_writes = nodes
-            .iter()
-            .map(|node| GraphViewNodeWrite {
-                node_id: node.id,
-                canonical_key: node.canonical_key.clone(),
-                label: node.label.clone(),
-                node_type: node.node_type.clone(),
-                support_count: node.support_count,
-                summary: node.summary.clone(),
-                aliases: from_value_or_default(
-                    "runtime_graph_node.aliases_json",
-                    &node.aliases_json,
-                ),
-                metadata_json: node.metadata_json.clone(),
-            })
-            .collect::<Vec<_>>();
-        let edge_writes = edges
-            .iter()
-            .map(|edge| GraphViewEdgeWrite {
-                edge_id: edge.id,
-                from_node_id: edge.from_node_id,
-                to_node_id: edge.to_node_id,
-                relation_type: edge.relation_type.clone(),
-                canonical_key: edge.canonical_key.clone(),
-                support_count: edge.support_count,
-                summary: edge.summary.clone(),
-                weight: edge.weight,
-                metadata_json: edge.metadata_json.clone(),
-            })
-            .collect::<Vec<_>>();
-        let (node_writes, edge_writes, _skipped_edge_count) =
-            sanitize_graph_view_writes(&node_writes, &edge_writes);
-        (nodes, edges, node_writes, edge_writes)
+        projection_writes_from_rows(&projection_quality_guard, &nodes, &edges)
     });
-    let (nodes, edges, node_writes, edge_writes) =
+    let projection_writes =
         sanitize_task.await.context("graph projection sanitize task panicked")?;
+    prune_disallowed_projection_rows(state, scope, &projection_writes).await?;
 
     if let Err(error) =
         execute_projection_write_with_guard(state, scope, "library_projection", || {
             state.arango_graph_store.replace_library_projection(
                 scope.library_id,
                 scope.projection_version,
-                &node_writes,
-                &edge_writes,
+                &projection_writes.nodes,
+                &projection_writes.edges,
             )
         })
         .await
@@ -260,9 +244,12 @@ pub async fn project_canonical_graph(
             scope.library_id,
             "failed",
             scope.projection_version,
-            i32::try_from(nodes.len()).unwrap_or(i32::MAX),
-            i32::try_from(edges.len()).unwrap_or(i32::MAX),
-            Some(provenance_coverage_percent(&nodes, &edges)),
+            i32::try_from(projection_writes.nodes.len()).unwrap_or(i32::MAX),
+            i32::try_from(projection_writes.edges.len()).unwrap_or(i32::MAX),
+            Some(provenance_coverage_percent_from_counts(
+                projection_writes.nodes.len(),
+                projection_writes.edges.len(),
+            )),
             Some(&failure_message),
         )
         .await
@@ -275,9 +262,12 @@ pub async fn project_canonical_graph(
         scope.library_id,
         "ready",
         scope.projection_version,
-        i32::try_from(nodes.len()).unwrap_or(i32::MAX),
-        i32::try_from(edges.len()).unwrap_or(i32::MAX),
-        Some(provenance_coverage_percent(&nodes, &edges)),
+        i32::try_from(projection_writes.nodes.len()).unwrap_or(i32::MAX),
+        i32::try_from(projection_writes.edges.len()).unwrap_or(i32::MAX),
+        Some(provenance_coverage_percent_from_counts(
+            projection_writes.nodes.len(),
+            projection_writes.edges.len(),
+        )),
         None,
     )
     .await
@@ -293,10 +283,115 @@ pub async fn project_canonical_graph(
 
     Ok(GraphProjectionOutcome {
         projection_version: scope.projection_version,
-        node_count: node_writes.len(),
-        edge_count: edge_writes.len(),
+        node_count: projection_writes.nodes.len(),
+        edge_count: projection_writes.edges.len(),
         graph_status: "ready".to_string(),
     })
+}
+
+fn projection_writes_from_rows(
+    quality_guard: &GraphQualityGuardService,
+    nodes: &[repositories::RuntimeGraphNodeRow],
+    edges: &[repositories::RuntimeGraphEdgeRow],
+) -> ProjectionWrites {
+    let node_writes = nodes
+        .iter()
+        .map(|node| GraphViewNodeWrite {
+            node_id: node.id,
+            canonical_key: node.canonical_key.clone(),
+            label: node.label.clone(),
+            node_type: node.node_type.clone(),
+            support_count: node.support_count,
+            summary: node.summary.clone(),
+            aliases: from_value_or_default("runtime_graph_node.aliases_json", &node.aliases_json),
+            metadata_json: node.metadata_json.clone(),
+        })
+        .collect::<Vec<_>>();
+    let input_node_ids = node_writes.iter().map(|node| node.node_id).collect::<BTreeSet<_>>();
+    let canonical_pruned_node_ids = node_writes
+        .iter()
+        .filter(|node| !quality_guard.allows_node(&node.node_type, &node.label))
+        .map(|node| node.node_id)
+        .collect::<BTreeSet<_>>();
+    let edge_writes = edges
+        .iter()
+        .map(|edge| GraphViewEdgeWrite {
+            edge_id: edge.id,
+            from_node_id: edge.from_node_id,
+            to_node_id: edge.to_node_id,
+            relation_type: edge.relation_type.clone(),
+            canonical_key: edge.canonical_key.clone(),
+            support_count: edge.support_count,
+            summary: edge.summary.clone(),
+            weight: edge.weight,
+            metadata_json: edge.metadata_json.clone(),
+        })
+        .collect::<Vec<_>>();
+    let input_edge_ids = edge_writes.iter().map(|edge| edge.edge_id).collect::<BTreeSet<_>>();
+    let canonical_pruned_edge_ids = edge_writes
+        .iter()
+        .filter(|edge| {
+            canonical_pruned_node_ids.contains(&edge.from_node_id)
+                || canonical_pruned_node_ids.contains(&edge.to_node_id)
+        })
+        .map(|edge| edge.edge_id)
+        .collect::<Vec<_>>();
+    let filtered =
+        quality_guard.filter_projection(&GraphViewData { nodes: node_writes, edges: edge_writes });
+    let (nodes, edges, _skipped_edge_count) =
+        sanitize_graph_view_writes(&filtered.nodes, &filtered.edges);
+    let retained_node_ids = nodes.iter().map(|node| node.node_id).collect::<BTreeSet<_>>();
+    let retained_edge_ids = edges.iter().map(|edge| edge.edge_id).collect::<BTreeSet<_>>();
+    let remove_node_ids =
+        input_node_ids.difference(&retained_node_ids).copied().collect::<Vec<_>>();
+    let remove_edge_ids =
+        input_edge_ids.difference(&retained_edge_ids).copied().collect::<Vec<_>>();
+    ProjectionWrites {
+        nodes,
+        edges,
+        remove_node_ids,
+        remove_edge_ids,
+        canonical_pruned_node_ids: canonical_pruned_node_ids.into_iter().collect(),
+        canonical_pruned_edge_ids,
+    }
+}
+
+async fn prune_disallowed_projection_rows(
+    state: &AppState,
+    scope: &GraphProjectionScope,
+    projection_writes: &ProjectionWrites,
+) -> Result<(), GraphServiceError> {
+    if projection_writes.canonical_pruned_node_ids.is_empty()
+        && projection_writes.canonical_pruned_edge_ids.is_empty()
+    {
+        return Ok(());
+    }
+
+    repositories::delete_runtime_graph_edges_by_ids(
+        &state.persistence.postgres,
+        scope.library_id,
+        scope.projection_version,
+        &projection_writes.canonical_pruned_edge_ids,
+    )
+    .await
+    .context("failed to prune disallowed graph projection edges")?;
+    repositories::delete_runtime_graph_nodes_by_ids(
+        &state.persistence.postgres,
+        scope.library_id,
+        scope.projection_version,
+        &projection_writes.canonical_pruned_node_ids,
+    )
+    .await
+    .context("failed to prune disallowed graph projection nodes")?;
+    repositories::delete_runtime_graph_canonical_summaries_for_orphan_targets(
+        &state.persistence.postgres,
+        scope.library_id,
+        &projection_writes.canonical_pruned_node_ids,
+        &projection_writes.canonical_pruned_edge_ids,
+    )
+    .await
+    .context("failed to prune disallowed graph projection summaries")?;
+    Ok(())
 }
 
 /// Dispatches a detached task that rebuilds the NDJSON topology under
@@ -413,52 +508,52 @@ async fn project_targeted_canonical_graph(
     // Same rationale as in `project_canonical_graph`: hand the
     // synchronous clone/sort/sanitize hot path to `spawn_blocking` so
     // the heartbeat loop keeps getting scheduled during reconcile.
+    let projection_quality_guard = state.bulk_ingest_hardening_services.graph_quality_guard.clone();
     let targeted_sanitize_task = tokio::task::spawn_blocking(move || {
-        let node_writes = refreshed_nodes
-            .iter()
-            .map(|node| GraphViewNodeWrite {
-                node_id: node.id,
-                canonical_key: node.canonical_key.clone(),
-                label: node.label.clone(),
-                node_type: node.node_type.clone(),
-                support_count: node.support_count,
-                summary: node.summary.clone(),
-                aliases: from_value_or_default(
-                    "runtime_graph_node.aliases_json",
-                    &node.aliases_json,
-                ),
-                metadata_json: node.metadata_json.clone(),
-            })
-            .collect::<Vec<_>>();
-        let edge_writes = refreshed_edges
-            .iter()
-            .map(|edge| GraphViewEdgeWrite {
-                edge_id: edge.id,
-                from_node_id: edge.from_node_id,
-                to_node_id: edge.to_node_id,
-                relation_type: edge.relation_type.clone(),
-                canonical_key: edge.canonical_key.clone(),
-                support_count: edge.support_count,
-                summary: edge.summary.clone(),
-                weight: edge.weight,
-                metadata_json: edge.metadata_json.clone(),
-            })
-            .collect::<Vec<_>>();
-        let (node_writes, edge_writes, _skipped_edge_count) =
-            sanitize_graph_view_writes(&node_writes, &edge_writes);
-        (node_writes, edge_writes)
+        projection_writes_from_rows(&projection_quality_guard, &refreshed_nodes, &refreshed_edges)
     });
-    let (node_writes, edge_writes) =
+    let mut projection_writes =
         targeted_sanitize_task.await.context("targeted graph projection sanitize task panicked")?;
+    let canonical_pruned_incident_edge_ids = repositories::list_runtime_graph_edge_ids_by_node_ids(
+        &state.persistence.postgres,
+        scope.library_id,
+        scope.projection_version,
+        &projection_writes.canonical_pruned_node_ids,
+    )
+    .await
+    .context("failed to load incident graph edges for targeted projection prune")?;
+    projection_writes
+        .canonical_pruned_edge_ids
+        .extend(canonical_pruned_incident_edge_ids.iter().copied());
+    projection_writes.canonical_pruned_edge_ids.sort_unstable();
+    projection_writes.canonical_pruned_edge_ids.dedup();
+    prune_disallowed_projection_rows(state, scope, &projection_writes).await?;
+
+    let remove_node_ids = scope
+        .targeted_node_ids
+        .iter()
+        .copied()
+        .chain(projection_writes.remove_node_ids.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let remove_edge_ids = targeted_edge_ids
+        .iter()
+        .copied()
+        .chain(projection_writes.remove_edge_ids.iter().copied())
+        .chain(canonical_pruned_incident_edge_ids)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
 
     execute_projection_write_with_guard(state, scope, "targeted_projection", || {
         state.arango_graph_store.refresh_library_projection_targets(
             scope.library_id,
             scope.projection_version,
-            &scope.targeted_node_ids,
-            &targeted_edge_ids,
-            &node_writes,
-            &edge_writes,
+            &remove_node_ids,
+            &remove_edge_ids,
+            &projection_writes.nodes,
+            &projection_writes.edges,
         )
     })
     .await
@@ -624,7 +719,11 @@ fn provenance_coverage_percent(
     nodes: &[repositories::RuntimeGraphNodeRow],
     edges: &[repositories::RuntimeGraphEdgeRow],
 ) -> f64 {
-    if nodes.is_empty() && edges.is_empty() { 0.0 } else { 100.0 }
+    provenance_coverage_percent_from_counts(nodes.len(), edges.len())
+}
+
+fn provenance_coverage_percent_from_counts(node_count: usize, edge_count: usize) -> f64 {
+    if node_count == 0 && edge_count == 0 { 0.0 } else { 100.0 }
 }
 
 #[cfg(test)]
@@ -727,5 +826,105 @@ mod tests {
         };
 
         assert_eq!(summary_target_count_from_snapshot(Some(&snapshot)), 8);
+    }
+
+    #[test]
+    fn projection_writes_apply_quality_guard_before_graph_store_write() {
+        let library_id = Uuid::now_v7();
+        let document_id = Uuid::now_v7();
+        let entity_id = Uuid::now_v7();
+        let literal_id = Uuid::now_v7();
+        let quality_guard = GraphQualityGuardService::new(true, true);
+        let nodes = vec![
+            runtime_node(library_id, document_id, "document:alpha", "Alpha Doc", "document"),
+            runtime_node(library_id, entity_id, "entity:alpha", "Alpha Entity", "entity"),
+            runtime_node(library_id, literal_id, "attribute:false", "false", "attribute"),
+        ];
+        let edges = vec![
+            runtime_edge(
+                library_id,
+                document_id,
+                entity_id,
+                "document:alpha--mentions--entity:alpha",
+            ),
+            runtime_edge(
+                library_id,
+                document_id,
+                literal_id,
+                "document:alpha--mentions--attribute:false",
+            ),
+        ];
+
+        let projection_writes = projection_writes_from_rows(&quality_guard, &nodes, &edges);
+
+        assert_eq!(projection_writes.nodes.len(), 2);
+        assert!(projection_writes.nodes.iter().all(|node| node.node_id != literal_id));
+        assert_eq!(projection_writes.edges.len(), 1);
+        assert_eq!(projection_writes.edges[0].to_node_id, entity_id);
+        assert_eq!(projection_writes.remove_node_ids, vec![literal_id]);
+        assert_eq!(projection_writes.remove_edge_ids.len(), 1);
+        assert_eq!(projection_writes.canonical_pruned_node_ids, vec![literal_id]);
+        assert_eq!(projection_writes.canonical_pruned_edge_ids.len(), 1);
+    }
+
+    #[test]
+    fn projection_writes_do_not_canonically_prune_view_only_orphans() {
+        let library_id = Uuid::now_v7();
+        let orphan_id = Uuid::now_v7();
+        let quality_guard = GraphQualityGuardService::new(true, true);
+        let nodes = vec![runtime_node(library_id, orphan_id, "entity:orphan", "Orphan", "entity")];
+
+        let projection_writes = projection_writes_from_rows(&quality_guard, &nodes, &[]);
+
+        assert!(projection_writes.nodes.is_empty());
+        assert_eq!(projection_writes.remove_node_ids, vec![orphan_id]);
+        assert!(projection_writes.canonical_pruned_node_ids.is_empty());
+        assert!(projection_writes.canonical_pruned_edge_ids.is_empty());
+    }
+
+    fn runtime_node(
+        library_id: Uuid,
+        id: Uuid,
+        canonical_key: &str,
+        label: &str,
+        node_type: &str,
+    ) -> repositories::RuntimeGraphNodeRow {
+        repositories::RuntimeGraphNodeRow {
+            id,
+            library_id,
+            canonical_key: canonical_key.to_string(),
+            label: label.to_string(),
+            node_type: node_type.to_string(),
+            aliases_json: serde_json::json!([]),
+            summary: None,
+            metadata_json: serde_json::json!({}),
+            support_count: 1,
+            projection_version: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn runtime_edge(
+        library_id: Uuid,
+        from_node_id: Uuid,
+        to_node_id: Uuid,
+        canonical_key: &str,
+    ) -> repositories::RuntimeGraphEdgeRow {
+        repositories::RuntimeGraphEdgeRow {
+            id: Uuid::now_v7(),
+            library_id,
+            from_node_id,
+            to_node_id,
+            relation_type: "mentions".to_string(),
+            canonical_key: canonical_key.to_string(),
+            summary: None,
+            weight: None,
+            support_count: 1,
+            metadata_json: serde_json::json!({}),
+            projection_version: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
     }
 }

@@ -259,9 +259,12 @@ pub async fn get_library_state(
     Path(library_id): Path<Uuid>,
 ) -> Result<Json<OpsLibraryStateResponse>, ApiError> {
     let _ = load_library_and_authorize(&auth, &state, library_id, POLICY_USAGE_READ).await?;
-    let snapshot =
-        state.canonical_services.ops.get_library_state_snapshot(&state, library_id).await?;
-    let warnings = state.canonical_services.ops.list_library_warnings(&state, library_id).await?;
+    let snapshot_with_warnings = state
+        .canonical_services
+        .ops
+        .get_library_state_snapshot_with_warnings(&state, library_id)
+        .await?;
+    let snapshot = snapshot_with_warnings.snapshot;
     Ok(Json(OpsLibraryStateResponse {
         state: map_ops_library_state(&snapshot.state),
         knowledge_generations: snapshot
@@ -269,7 +272,7 @@ pub async fn get_library_state(
             .iter()
             .map(map_knowledge_generation)
             .collect(),
-        warnings: warnings.iter().map(map_ops_warning).collect(),
+        warnings: snapshot_with_warnings.warnings.iter().map(map_ops_warning).collect(),
     }))
 }
 
@@ -530,8 +533,7 @@ pub async fn get_library_dashboard(
         document_metrics,
         recent_web_runs,
         knowledge_summary,
-        ops_snapshot,
-        ops_warnings,
+        ops_snapshot_with_warnings,
     ) = tokio::try_join!(
         state.canonical_services.content.list_documents_page(&state, recent_page_command),
         async {
@@ -544,9 +546,10 @@ pub async fn get_library_dashboard(
         },
         state.canonical_services.web_ingest.list_runs(&state, library_id, 6),
         state.canonical_services.knowledge.get_library_summary(&state, library_id),
-        state.canonical_services.ops.get_library_state_snapshot(&state, library_id),
-        state.canonical_services.ops.list_library_warnings(&state, library_id),
+        state.canonical_services.ops.get_library_state_snapshot_with_warnings(&state, library_id),
     )?;
+    let ops_warnings = ops_snapshot_with_warnings.warnings;
+    let ops_snapshot = ops_snapshot_with_warnings.snapshot;
 
     let recent_documents: Vec<DocumentSummary> =
         recent_page.items.into_iter().map(map_list_entry_to_dashboard_summary).collect();
